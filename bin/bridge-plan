@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""bridge-plan — before a peer runs: which playbook, what session depth, what the run needs, what it will return.
+
+    bridge-plan "<request>" [-k kind] [-n name] [-p peers] [-d DIR]   classify → playbook card → session card / command
+    bridge-plan kinds                                                the playbooks (~/.agent-bridge/playbooks/*.md)
+    bridge-plan agree <name>                                         check a session card: exit 0 = no TODO left, else exit 3
+    bridge-plan learn [--backfill] [--days N]                        what the ledger says per kind, with suggestions
+    bridge-plan mark <panel|run-log> [-r role] --kept N --rejected M  after verifying a peer's findings: what survived
+
+Session depth (frontmatter `level:` of each playbook — not a third agreement level; edit the file to change a default):
+    routine    run with the playbook defaults; no session card
+    confirm    the card is the plan (prefilled, no TODO); one word from the user starts it
+    negotiate  write panel/<name>/agreement.md or work/<name>/agreement.md first; the run refuses while a TODO remains
+
+Session cards live under panel/ or work/ (never conv/). Learning loop: ledger rows → `learn` suggestions; humans edit playbooks.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bridgelib import ledger  # noqa: E402
+from bridgelib import grill as grill_plan  # noqa: E402
+from bridgelib.core import (  # noqa: E402
+    BRIDGE, find_session_card, session_card_form_home, session_card_path,
+)
+
+def doc_roots() -> list[Path]:
+    """Markdown trees scanned by `learn` for `peer review:` rows. Set `BRIDGE_DOC_ROOTS` (os.pathsep)."""
+    return [Path(p).expanduser() for p in os.environ.get("BRIDGE_DOC_ROOTS", "").split(os.pathsep) if p.strip()]
+
+
+def slug(s: str) -> str:
+    s = re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+    return s[:40] or time.strftime("plan-%Y%m%d-%H%M%S")
+
+
+def missing_inputs(book: dict, request: str) -> list[str]:
+    """Inputs the playbook wants that the request text does not visibly carry (heuristic, names the gap to fill)."""
+    gaps = []
+    low = request.lower()
+    checks = {
+        "repo": (r"-d |/users/|~/|/home/", "repo root path"),
+        "ref": (r"\b[0-9a-f]{7,40}\b|origin/|feature/|release/|branch", "branch or SHA to read"),
+        "mr": (r"![0-9]{3,4}|merge request|\bmr\b", "MR id"),
+        "files": (r"\.(java|ts|tsx|md|yaml|yml|json|py)\b", "file names to quote"),
+        "section": (r"§|section|\bv0\.\d+", "section list"),
+        "options": (r"option|\bA\b.*\bB\b|ทางเลือก", "the options on the table"),
+        "decider": (r"decid|ตัดสิน|owner", "who decides"),
+        "invariant": (r"invariant|must hold|guarantee|ต้องไม่|ต้องมี|รับประกัน", "the invariant that must hold"),
+    }
+    want = {
+        "review-change": ["repo", "ref", "mr"], "spec-vs-code": ["repo", "ref"], "defect-root-cause": ["repo", "files"],
+        "design-decision": ["files", "options", "invariant", "decider"], "doc-readiness": ["section"],
+        "implement": ["files", "repo"],
+    }.get(book["name"], [])
+    for w in want:
+        rx, label = checks[w]
+        if not re.search(rx, low):
+            gaps.append(label)
+    return gaps
+
+
+def agreement_text(name: str, book: dict, request: str, peers: str, gaps: list[str],
+                   card: Path, level: str, grill: dict | None = None) -> str:
+    """Session card body. negotiate keeps open fields (literal TODO); confirm is prefilled with none."""
+    grill = grill or grill_plan.recommend(book, gaps, request, level)
+    if level == "negotiate":
+        open_ = "TODO"
+        edit_line = f"edit every TODO, then `bridge-plan agree {name}`"
+        goal = f"{open_}: what is being decided or produced"
+        options = f"{open_}: list them; the peers must not silently invent another"
+        must_hold = (f"{open_}: what the system must still guarantee to the business whatever option wins "
+                     f"(e.g. money taken ⇒ an order exists) — or `none`")
+        done =f"{open_}: the observable result that closes this (a decision row · a merged table · a test that passes)"
+        decides = f"{open_} (the user, unless named otherwise)"
+        out_of_scope = f"{open_}: what the peers must leave alone"
+        budget = book.get("budget", open_)
+        output = book.get("output", open_)
+    else:
+        # confirm — prefilled; the human gate is one word, not a TODO scan
+        edit_line = "prefilled as the plan; reply with one word to start (edit only if wrong)"
+        goal = f"Run playbook `{book['name']}` for the request below."
+        options = "(none for confirm depth — the printed card is the plan)"
+        must_hold = "(none stated — add any business guarantee the peers must not trade away)"
+        done =book.get("output") or "the playbook output shape is met"
+        decides = "the user (one word starts the run)"
+        out_of_scope = "anything outside the printed inputs / output / budget"
+        budget = book.get("budget") or "(see playbook)"
+        output = book.get("output") or "(see playbook)"
+    return f"""# Agreement `{name}` — playbook {book['name']} ({level})
+
+Written {time.strftime('%Y-%m-%d %H:%M')} by bridge-plan; {edit_line}.
+A panel or run started with `--agreement {card}` embeds this file in the shared case, so every
+role argues the same question and returns the same shape.
+
+## Goal (one sentence)
+{goal}
+
+## Request as given
+{request.strip()}
+
+## Options on the table
+{options}
+
+## Must hold (business guarantees — no option may trade these for fewer lines)
+{must_hold}
+
+## Done when
+{done}
+
+## Output shape
+{output}
+
+## Participants
+- decides: {decides}
+- main agent: frames, verifies every file:line, writes the decision row; runs grilling when Grill plan says who=main-agent
+- peers ({peers}): {book.get('panel_roles') or book.get('peers')} — gather and argue, never decide
+- data leaving the machine: {'yes — cursor' if 'cursor' in peers else 'no (claude / company-licensed copilot)'}
+
+## Inputs still missing from the request
+{chr(10).join('- ' + g for g in gaps) if gaps else '- none spotted'}
+
+## Budget
+{budget}
+
+{grill_plan.card_section(grill)}
+## Out of scope
+{out_of_scope}
+"""
+
+
+
+def plan(o) -> int:
+    books = ledger.load_playbooks()
+    if not books:
+        print("bridge-plan: no playbooks under ~/.agent-bridge/playbooks/", file=sys.stderr)
+        return 2
+    ranked = ledger.classify(o.request, books)
+    kind = o.kind or (ranked[0][0] if ranked else None)
+    if not kind:
+        print("bridge-plan: no playbook matched — name one with -k: " + ", ".join(books), file=sys.stderr)
+        return 3
+    if kind not in books:
+        print(f"bridge-plan: unknown kind {kind}; see `bridge-plan kinds`", file=sys.stderr)
+        return 2
+    book = books[kind]
+    alt = [f"{n} ({c})" for n, c in ranked[1:3] if n != kind]
+    level = book.get("level", "confirm")
+    adjud = kind == "review-change" and re.search(r"adjudicat|review findings|open review threads|which findings", o.request, re.I)
+    if adjud and book.get("level_when_adjudicating"):
+        level = book["level_when_adjudicating"]
+    peers = o.peers or book.get("peers", "claude")
+    name = o.name or slug(o.request[:60])
+    gaps = missing_inputs(book, o.request)
+    gplan = grill_plan.recommend(book, gaps, o.request, level)
+    form = book.get("form", "direct")
+    card = None
+    if form == "panel" or (adjud and book.get("panel_roles")):
+        form = "panel"
+        roles = book.get("panel_roles", "")
+        card = session_card_path("panel", name)
+        cmd = (f"bridge-panel run {name} -p {peers} -r {roles} -d {o.dir} -t 420"
+               + (f" --agreement {card}" if level != "routine" else "") + ' "<problem>"')
+        via = f'Agent(subagent_type="peer-panel", prompt="name={name} peers={peers} roles={roles} dir={o.dir} — <problem>")'
+    elif form == "fix-flow":
+        card = session_card_path("fix-flow", name)
+        cmd = (f"bridge-fix run {name} -d {o.dir} -p {peers} "
+               f'"<symptom · expected vs actual · files · verify>"   # stops at decide; then bridge-fix decide {name} …')
+        via = f'Agent(subagent_type="peer-fix", prompt="name={name} dir={o.dir} peers={peers} — <problem>")'
+    elif form == "pipeline":
+        card = session_card_path("pipeline", name)
+        cmd = (f"bridge-work run {name} -d {o.dir} -p {peers} --files '<globs>' --verify '<cmd>' \"<task>\""
+               "   # without --files + --verify it stops with a session card under work/<name>/")
+        via = f'Agent(subagent_type="peer-work", prompt="name={name} dir={o.dir} peers={peers} files=<globs> verify=<cmd> — <task>")'
+    else:
+        peer = peers.split(",")[0]
+        cmd = f"ask-agent {peer} -m {book.get('mode', 'ask')} -d {o.dir} -t 420 --kind {kind} \"<prompt>\""
+        via = f'Agent(subagent_type="peer-ask", prompt="peer={peer} mode={book.get("mode", "ask")} dir={o.dir} timeout=420 — <prompt>")'
+    print(f"playbook   {kind} — {book.get('summary', '')}")
+    if alt:
+        print(f"also fits  {', '.join(alt)}  (override with -k)")
+    print(f"level      {level.upper()}  — session depth; " + {
+        "routine": "run with the defaults below; no session card",
+        "confirm": "this card is the plan (prefilled); reply with one word to start it",
+        "negotiate": "fill the session card first; the run refuses while a TODO remains"}[level])
+    print(f"who        {form}: {book.get('panel_roles') if form == 'panel' or adjud else book.get('peers')} on {peers}"
+          f"{'  (data leaves the machine — cursor)' if 'cursor' in peers else ''}")
+    print(f"inputs     {book.get('inputs', '')}")
+    if gaps:
+        print(f"  missing  {' · '.join(gaps)}")
+    print(f"output     {book.get('output', '')}")
+    print(f"budget     {book.get('budget', '')}")
+    print(f"command    {cmd}")
+    print(f"from claude {via}")
+    if form == "fix-flow":
+        print(f"agreement  written by bridge-fix at decide → {card} — rule with `bridge-fix decide {name}`")
+    elif level != "routine" and session_card_form_home(form):
+        assert card is not None
+        card.parent.mkdir(parents=True, exist_ok=True)
+        if card.exists() and not o.force:
+            print(f"agreement  {card} (exists — not overwritten; --force to redo)")
+            on_disk = grill_plan.parse_card(card.read_text())
+            if on_disk:
+                gplan = on_disk
+        else:
+            card.write_text(agreement_text(name, book, o.request, peers, gaps, card, level, gplan))
+            suffix = ("  ← fill every TODO, then `bridge-plan agree " + name + "`" if level == "negotiate"
+                      else "  (prefilled; edit if the plan above is wrong)")
+            print(f"agreement  {card}{suffix}")
+    elif level != "routine":
+        print("agreement  (none — form:direct never writes a session card; depth is informational only)")
+    print(grill_plan.print_line(gplan))
+    if gplan.get("do") in ("yes", "optional") and gplan.get("who") == "main-agent":
+        note = "" if gplan.get("status") == "TODO" else " (advisory — does not block agree)"
+        print(f"grill-next  load skill `grilling` (or /grill-me) — when={gplan['when']}, "
+              f"max_rounds={gplan.get('max_rounds', 2)}; look facts up or ask a peer, put only decisions to the user, "
+              f"log every Q with a verifiable answer under ## Grill log, then set status to done{note}")
+    elif gplan.get("who") == "panel-leader":
+        print("grill-next  panel leader may recommend after-findings grill questions in the report; "
+              "main agent runs grilling only if the user accepts")
+    return 0
+
+
+
+def agree(o) -> int:
+    f = find_session_card(o.name)
+    if f is None:
+        print(f"bridge-plan: no session card named {o.name!r} under panel/ or work/ (or agreements.archived/)",
+              file=sys.stderr)
+        return 2
+    body = f.read_text()
+    todos = grill_plan.open_field_todos(body)
+    blocked = grill_plan.grill_blocks_agree(body)
+    if blocked:
+        todos.append(blocked)
+    if todos:
+        print(f"bridge-plan: {len(todos)} TODO field(s) left in {f}:")
+        for t in todos:
+            print("  " + t[:120])
+        return 3
+    print(f"bridge-plan: agreement {o.name} is complete — pass --agreement {f} to the run")
+    return 0
+
+
+def kinds(o) -> int:
+    for n, b in ledger.load_playbooks().items():
+        print(f"{n:18} {b.get('level', '?'):9} {b.get('form', '?'):6} {b.get('peers', ''):22} {b.get('summary', '')}")
+    return 0
+
+
+def citations() -> dict[str, int]:
+    """`peer review: panel <name>` / `peer review: <peer>` rows in the docs — the only quality signal the ledger has."""
+    out: dict[str, int] = {}
+    for root in doc_roots():
+        if not root.is_dir():
+            continue
+        r = subprocess.run(["rg", "-o", "-I", "--no-heading", "-g", "*.md",
+                            r"peer review:\s*(panel\s+[\w.-]+|claude|cursor|copilot|ask-\w+)", str(root)],
+                           capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            key = re.sub(r"^peer review:\s*", "", line.strip())
+            out[key] = out.get(key, 0) + 1
+    return out
+
+
+def role_of(r: dict) -> str | None:
+    """Panel role of a run row: backfilled rows carry `role`; live rows name it in the conv (`panel-<name>-<role>[-<peer>]`)."""
+    if r.get("role"):
+        return r["role"]
+    conv, panel = r.get("conv") or "", r.get("panel")
+    if not panel or not conv.startswith(f"panel-{panel}-"):
+        return None
+    return re.sub(r"-(claude|cursor|copilot)$", "", conv[len(f"panel-{panel}-"):])
+
+
+def mark(o) -> int:
+    """Record how many of a peer's findings survived the caller's verification — the quality signal run rows lack."""
+    if o.kept < 0 or o.rejected < 0 or o.kept + o.rejected == 0:
+        print("bridge-plan: --kept and --rejected are counts ≥ 0, not both 0", file=sys.stderr)
+        return 2
+    rows = ledger.rows()
+    panel = next((r for r in reversed(rows) if r.get("type") == "panel" and r.get("name") == o.target), None)
+    if panel:
+        answered = panel.get("answered") or {}
+        if o.role and answered and o.role not in answered:
+            print(f"bridge-plan: role {o.role!r} did not answer panel {o.target!r} (answered: {', '.join(answered)})",
+                  file=sys.stderr)
+            return 2
+        row = {"panel": o.target, "kind": panel.get("kind"), "role": o.role, "peer": answered.get(o.role)}
+    else:
+        stem = Path(o.target).name.removesuffix(".json")
+        run = next((r for r in reversed(rows) if r.get("type") == "run" and r.get("log")
+                    and Path(r["log"]).name.removesuffix(".json") == stem), None)
+        if not run:
+            print(f"bridge-plan: {o.target!r} is neither a panel name nor a run log in the ledger "
+                  "(pass the log= path from the [bridge] line)", file=sys.stderr)
+            return 2
+        row = {"run": stem, "kind": run.get("kind"), "panel": run.get("panel"), "role": o.role or role_of(run),
+               "peer": run.get("peer")}
+    ledger.record({"type": "verdict", **row, "kept": o.kept, "rejected": o.rejected, "note": o.note or None})
+    who = row["role"] or row["peer"] or "panel"
+    print(f"bridge-plan: recorded {o.kept} kept / {o.rejected} rejected for {who} ({o.target})")
+    return 0
+
+
+def learn(o) -> int:
+    if o.backfill:
+        n_runs, n_panels = ledger.backfill()
+        print(f"bridge-plan: ledger rebuilt from disk — {n_runs} runs, {n_panels} panels\n")
+    rows = ledger.rows()
+    cutoff = time.time() - o.days * 86400
+    rows = [r for r in rows if r.get("ts", 0) >= cutoff]
+    if not rows:
+        print("bridge-plan: ledger empty — run `bridge-plan learn --backfill` once")
+        return 0
+    books = ledger.load_playbooks()
+    cites = citations()
+    print(f"ledger: {len(rows)} rows in the last {o.days} days ({ledger.LEDGER})\n")
+    print("runs = direct runs of that kind (panel workers are counted under their panel); cited = `peer review: panel <name>` "
+          "rows in specs/memory for the kind's panels; direct-run citations cannot be attributed to a kind\n")
+    print(f"{'kind':18} {'runs':>4} {'ok%':>4} {'panels':>6} {'abort':>5} {'med min':>7} {'med $':>6}  cited  peers/roles")
+    suggestions: list[str] = []
+    for kind in list(books) + ["other"]:
+        rs = [r for r in rows if r.get("kind") == kind and r["type"] == "run" and not r.get("panel")]
+        ps = [r for r in rows if r.get("kind") == kind and r["type"] == "panel"]
+        if not rs and not ps:
+            continue
+        ok = sum(1 for r in rs if r.get("rc") == 0)
+        aborts = sum(1 for r in ps if r.get("rc") not in (0, None))
+        durs = [r["duration_s"] / 60 for r in rs if r.get("duration_s")]
+        costs = [r["cost"] for r in rs if r.get("cost")]
+        peers = {}
+        for r in rs:
+            peers[r.get("peer")] = peers.get(r.get("peer"), 0) + 1
+        role_use: dict[str, list[int]] = {}
+        for p in ps:
+            for role in set(p.get("roles", [])) | set(p.get("failed", [])):
+                role_use.setdefault(role, [0, 0])
+                role_use[role][1] += 1
+                if role in p.get("roles", []):
+                    role_use[role][0] += 1
+        cited = sum(n for k, n in cites.items() if k.startswith("panel ") and any(k == f"panel {p['name']}" for p in ps))
+        print(f"{kind:18} {len(rs):4} {round(100 * ok / len(rs)) if rs else 0:3}% {len(ps):6} {aborts:5} "
+              f"{statistics.median(durs) if durs else 0:7.1f} {statistics.median(costs) if costs else 0:6.2f}  {cited:5}  "
+              + " ".join(f"{p}={n}" for p, n in peers.items())
+              + ("  roles: " + " ".join(f"{r}={a}/{t}" for r, (a, t) in role_use.items()) if role_use else ""))
+        for role, (a, t) in role_use.items():
+            if t >= 3 and a / t < 0.7:
+                suggestions.append(f"{kind}: role {role} answered {a}/{t} panels — give it a fallback_peer or drop it from panel_roles")
+        if ps and aborts / len(ps) > 0.3:
+            suggestions.append(f"{kind}: {aborts}/{len(ps)} panels aborted — require a case file / smaller role set (see playbook body)")
+        if ps and cited == 0 and len(ps) >= 3 and kind != "review-change":
+            suggestions.append(f"{kind}: {len(ps)} panels, none cited as `peer review: panel …` — check whether a direct run would do")
+        if len(rs) >= 5 and ok / len(rs) < 0.8:
+            suggestions.append(f"{kind}: only {ok}/{len(rs)} direct runs ended rc=0 — look at the .err lines before running more")
+    ws = [r for r in rows if r.get("type") == "work"]
+    if ws:
+        ready = sum(1 for r in ws if r.get("ok"))
+        wd = [r["duration_s"] / 60 for r in ws if r.get("duration_s")]
+        print(f"\nbridge-work: {len(ws)} runs, {ready} ready for review, median {statistics.median(wd) if wd else 0:.1f} min, "
+              f"rounds: " + " ".join(f"{r.get('name')}={r.get('rounds')}" for r in ws[-6:]))
+        by_skill: dict[str, list[int]] = {}
+        for r in ws:
+            sk = r.get("skill") or "none"
+            by_skill.setdefault(sk, [0, 0])
+            by_skill[sk][1] += 1
+            if r.get("ok"):
+                by_skill[sk][0] += 1
+        if by_skill:
+            print("  skills: " + " ".join(f"{k}={a}/{t}" for k, (a, t) in sorted(by_skill.items())))
+        if len(ws) >= 5 and ready / len(ws) < 0.6:
+            suggestions.append(f"implement: only {ready}/{len(ws)} bridge-work runs ended READY — tighten --files/--verify or the task text")
+        for sk, (a, t) in by_skill.items():
+            if t >= 3 and a / t < 0.5 and sk != "none":
+                suggestions.append(f"implement skill `{sk}`: only {a}/{t} READY — edit work-skills/{sk}.md addenda or triggers")
+    # where the money goes inside panels: cost tracks turns × context and what each run pulls in (cache_write)
+    by_role: dict[str, list[dict]] = {}
+    for r in rows:
+        if r.get("type") == "run" and r.get("panel") and r.get("cost"):
+            by_role.setdefault(role_of(r) or "(unattributed)", []).append(r)   # backfilled cross-exam rows: no conv
+    if by_role:
+        total = sum(r["cost"] for rs in by_role.values() for r in rs)
+        print(f"\npanel cost by role (claude runs, ${total:.0f} total):")
+        print(f"  {'role':20} {'runs':>4} {'total $':>8} {'med $':>6} {'med turns':>9} {'med cache_write':>15}")
+        for role, rs in sorted(by_role.items(), key=lambda x: -sum(r["cost"] for r in x[1])):
+            turns = [r["turns"] for r in rs if r.get("turns") is not None]
+            cw = [r["cache_write"] for r in rs if r.get("cache_write") is not None]
+            print(f"  {role:20} {len(rs):4} {sum(r['cost'] for r in rs):8.0f} {statistics.median(r['cost'] for r in rs):6.2f} "
+                  f"{statistics.median(turns) if turns else '-':>9} {round(statistics.median(cw)) if cw else '-':>15}")
+    verdicts = [r for r in rows if r.get("type") == "verdict"]
+    if verdicts:
+        tally: dict[str, list[int]] = {}
+        for v in verdicts:
+            key = f"role {v['role']}" if v.get("role") else f"peer {v.get('peer') or '?'}"
+            tally.setdefault(key, [0, 0])
+            tally[key][0] += v.get("kept", 0)
+            tally[key][1] += v.get("kept", 0) + v.get("rejected", 0)
+        print("\nfindings kept after verification (`bridge-plan mark`): "
+              + ", ".join(f"{k}={a}/{t} ({round(100 * a / t)}%)" for k, (a, t) in sorted(tally.items()) if t))
+        for k, (a, t) in tally.items():
+            if t >= 10 and a / t < 0.5:
+                suggestions.append(f"{k}: only {a}/{t} findings survived verification — tighten its prompt or stop using it")
+    print("\ncitations in docs: " + ", ".join(f"{k}={n}" for k, n in sorted(cites.items(), key=lambda x: -x[1])[:8]))
+    print("\nsuggestions (edit the playbook, the tool never changes it):")
+    for s in suggestions or ["- none"]:
+        print("- " + s if not s.startswith("- ") else s)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="bridge-plan", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("plan")
+    p.add_argument("request")
+    p.add_argument("-k", "--kind")
+    p.add_argument("-n", "--name")
+    p.add_argument("-p", "--peers")
+    p.add_argument("-d", "--dir", default=os.getcwd())
+    p.add_argument("--force", action="store_true")
+    sub.add_parser("kinds")
+    a = sub.add_parser("agree")
+    a.add_argument("name")
+    ln = sub.add_parser("learn")
+    ln.add_argument("--backfill", action="store_true")
+    ln.add_argument("--days", type=int, default=30)
+    mk = sub.add_parser("mark", help="record findings kept / rejected after verifying a panel or run")
+    mk.add_argument("target", help="panel name, or the log= path (or its file name) from the [bridge] line")
+    mk.add_argument("-r", "--role", help="panel role the counts belong to (default: the whole panel / the run's own role)")
+    mk.add_argument("--kept", type=int, required=True, help="findings that held up when you opened the cited file:line")
+    mk.add_argument("--rejected", type=int, required=True, help="findings that did not (wrong, stale, unreachable, unsupported)")
+    mk.add_argument("--note", help="one line: why the rejected ones failed")
+    argv = sys.argv[1:]
+    if argv and argv[0] not in ("plan", "kinds", "agree", "learn", "mark", "-h", "--help"):
+        argv = ["plan", *argv]
+    o = ap.parse_args(argv)
+    if o.cmd == "kinds":
+        return kinds(o)
+    if o.cmd == "agree":
+        return agree(o)
+    if o.cmd == "learn":
+        return learn(o)
+    if o.cmd == "mark":
+        return mark(o)
+    if o.cmd == "plan":
+        return plan(o)
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

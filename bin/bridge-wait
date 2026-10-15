@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""bridge-wait — block until a panel / work / fix run has written its done signal, or a short deadline passes.
+
+    bridge-wait panel <name> [--max SEC] [--log PATH]
+    bridge-wait work  <name> [--max SEC] [--log PATH]
+    bridge-wait fix   <name> [--max SEC] [--log PATH]
+
+One call = one capped wait. It replaces the hand-written `for … sleep 10` loops in the peer-* agents, which
+failed in three ways on 2026-09-27: a loop polling a log for `^rc=` that never appeared (2 h 45 min hang),
+a batch issued without `timeout: 600000` that the Bash tool moved to the background at 120 s (orphan loop,
+"interim" notifications to the caller), and a bare `sleep` the harness blocked outright.
+
+Exit codes (the agent branches on these, never on the text):
+    0   done      — `<dir>/<rc file>` exists; prints `done rc=N report=<path|none>`
+    75  running   — no rc yet, a bridge-<kind> process for <name> is alive; call again
+    1   dead      — no rc and no live process: the run died without its sentinel (read the log)
+    2   usage
+
+--max defaults to 100 s so the call always finishes inside the Bash tool's default 120 s timeout even when the
+agent forgets to raise it; values above 110 are clamped unless --max-unsafe is given.
+"""
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bridgelib.core import PANELS, WORK  # noqa: E402
+
+KINDS = {
+    # kind: (directory root, rc file, process-name regex, stage files in the order the run produces them)
+    "panel": (PANELS, "rc", r"bridge-panel (run|synth|fix) {name}( |$)",
+              ("case.md", "plan.json", "findings.json", "cross.json", "citations.json", "report.md")),
+    "work": (WORK, "rc", r"bridge-work run {name}( |$)", ("agreement.md", "task.md", "report.md")),
+    "fix": (WORK, "fix.rc", r"bridge-fix (run|decide) {name}( |$)", ("flow.json", "report.md")),
+}
+SAFE_MAX = 110  # Bash tool default timeout is 120 s; stay under it
+
+
+def alive(kind: str, name: str) -> bool:
+    pattern = KINDS[kind][2].format(name=name)
+    r = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+    return r.returncode == 0 and bool(r.stdout.strip())
+
+
+def stage(d: Path, files: tuple[str, ...]) -> str:
+    present = [f for f in files if (d / f).is_file()]
+    return f"stage={present[-1]}" if present else "stage=starting"
+
+
+def last_line(log: Path | None) -> str:
+    if not log or not log.is_file():
+        return ""
+    lines = [ln.strip() for ln in log.read_text(errors="replace").splitlines() if ln.strip()]
+    return f" · last: {lines[-1][:160]}" if lines else ""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="bridge-wait", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("kind", choices=sorted(KINDS))
+    ap.add_argument("name")
+    ap.add_argument("--max", type=int, default=100, help="seconds to wait in this call (default 100)")
+    ap.add_argument("--max-unsafe", action="store_true", help="allow --max above 110 s (caller has raised the Bash timeout)")
+    ap.add_argument("--log", type=Path, help="the run's redirected stdout/stderr, for the progress line")
+    ap.add_argument("--interval", type=float, default=2.0)
+    o = ap.parse_args()
+    if o.max > SAFE_MAX and not o.max_unsafe:
+        print(f"[wait] --max {o.max} clamped to {SAFE_MAX} (pass --max-unsafe with a raised Bash timeout)", file=sys.stderr)
+        o.max = SAFE_MAX
+    root, rc_name, _, files = KINDS[o.kind]
+    d = root / o.name
+    rc_file = d / rc_name
+    if o.log is None:  # what `--detach` writes
+        o.log = d / ("fix.log" if o.kind == "fix" else "run.log")
+    # bridge-fix writes its work report under work/fix-<name>/ (the flow state stays in work/<name>/)
+    report = (root / f"fix-{o.name}" / "report.md") if o.kind == "fix" else d / "report.md"
+    t0 = time.time()
+    while True:
+        if rc_file.is_file():
+            rc = rc_file.read_text().strip() or "?"
+            rep = str(report) if report.is_file() else "none"
+            print(f"done rc={rc} report={rep}")
+            return 0
+        if time.time() - t0 >= o.max:
+            break
+        time.sleep(o.interval)
+    elapsed = int(time.time() - t0)
+    if alive(o.kind, o.name):
+        print(f"running {o.kind}={o.name} · waited {elapsed}s · {stage(d, files)}{last_line(o.log)} — call bridge-wait again")
+        return 75
+    print(f"dead {o.kind}={o.name}: no {rc_name} and no live bridge-{o.kind} process · {stage(d, files)}{last_line(o.log)} "
+          f"— read the log; do not restart", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

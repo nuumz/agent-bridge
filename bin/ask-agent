@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""ask-agent — run a task on a peer coding agent from any shell (or from another agent).
+
+    ask-agent <agent> [options] "<prompt>"        agent = claude | cursor | copilot
+    ask-agent --list                              show which peers are installed / configured
+
+One adapter per CLI turns the common options (mode, model, dir, session, worktree, timeout) into
+that tool's own flags and parses its output back into: answer text + a `[bridge]` line with the peer
+session id, token use and the JSON log path under ~/.agent-bridge/runs/.
+
+Hard rules baked in (see ~/.agent-bridge/SHARED-RULES.md):
+  * read-only by default (`-m ask`); `-m write` is the only mode that may touch files;
+  * git commit / push / tag are denied on every peer that supports a deny list;
+  * one hop only: the peer receives AGENT_BRIDGE_HOP=1 and this script refuses to run when it is set.
+  * board: every run is registered in ~/.agent-bridge/board (identity `<agent>#<pid>` or `<agent>:task<N>` when
+    started by `bridge-board dispatch`) so the peer can talk on the shared board; `--no-board` opts out.
+  * quota: a peer that reports an exhausted plan is marked in ~/.agent-bridge/quota/ and every run of it fails fast
+    (exit 7, `[bridge] error:` line on stderr) for QUOTA_TTL; `--ignore-quota` overrides, `--list` shows the mark.
+
+Exit codes: 0 ok · 1 peer error · 2 usage · 3 hop guard · 4 disabled · 5 peer asked back ([[ASK]]) · 6 cursor write
+refused while a read-only run holds the deny · 7 peer out of quota · 127 binary missing · 143 killed at timeout.
+Every failure prints one `[bridge] error: <peer's own first stderr line>` before the raw dump — callers parse that line.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import boardlib  # noqa: E402
+from bridgelib.adapters import ADAPTERS, Adapter  # noqa: E402
+from bridgelib.core import PEER_TALK_RULE, DISABLED, HOP_VAR, QUOTA_TTL, quota_block, version_of  # noqa: E402
+from bridgelib.runner import (AGREE_RE, CONV_DIR, USER_AUTHOR, BoardRun, Conv, execute, print_parsed,  # noqa: E402
+                              protocol)
+
+
+def list_agents() -> int:
+    from concurrent.futures import ThreadPoolExecutor
+
+    def probe(a: Adapter) -> tuple[str | None, str, str]:
+        b = a.resolve()
+        return b, version_of(b), a.auth_hint()      # each `--version` is a node start-up: probe the peers concurrently
+
+    live = [a for a in ADAPTERS.values() if a.name not in DISABLED]
+    with ThreadPoolExecutor(max_workers=max(1, len(live))) as pool:
+        probed = dict(zip((a.name for a in live), pool.map(probe, live)))
+    print(f"{'agent':<8} {'binary':<52} {'version':<18} status")
+    for a in ADAPTERS.values():
+        if a.name in DISABLED:
+            print(f"{a.name:<8} {'DISABLED':<52} {'-':<18} {DISABLED[a.name]}")
+            continue
+        b, ver, auth = probed[a.name]
+        blocked = quota_block(a.name)
+        print(f"{a.name:<8} {(b or 'NOT INSTALLED'):<52} {ver:<18} {auth}{'  ⚠ ' + blocked if blocked else ''}")
+        print(f"{'':<8} rules mirror: {a.rules_mirror}")
+    if CONV_DIR.is_dir():
+        convs = sorted(d.name for d in CONV_DIR.iterdir() if (d / "state.json").is_file())
+        if convs:
+            print(f"\nconversations ({CONV_DIR}): {', '.join(convs)}")
+    return 0
+
+
+def dialog(o: argparse.Namespace, topic: str) -> int:
+    """Script-moderated exchange between two peers: A opens, B responds, alternate for --rounds or until both agree."""
+    names = [n.strip() for n in o.peers.split(",")]
+    if len(names) != 2 or any(n not in ADAPTERS or n in DISABLED for n in names):
+        print(f"ask-agent: --peers needs two enabled peers out of {', '.join(n for n in ADAPTERS if n not in DISABLED)}",
+              file=sys.stderr)
+        return 2
+    a_name, b_name = names
+    A, B = ADAPTERS[a_name], ADAPTERS[b_name]
+    if a_name == b_name:                    # same peer on both sides: label the sides so sessions and agreement stay apart
+        a_name, b_name = f"{a_name}-A", f"{b_name}-B"
+    conv = Conv(o.conv or f"dialog-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}", boardlib.connect() if o.board else None)
+    sessions = {a_name: conv.session_for(a_name), b_name: conv.session_for(b_name)}   # per SIDE, never per peer name
+    if conv.topic is not None and conv.state["turns"] == 0:
+        boardlib.post(conv.board, conv.topic, USER_AUTHOR,
+                      f"Dialog topic ({a_name} ↔ {b_name}, max {o.rounds} round{'s' if o.rounds != 1 else ''}): {topic}")
+    other_kind = "another instance of the same model, reading independently" if A is B else "another coding agent, a different model family"
+    intro = ("You are '{me}' in a two-agent dialogue with '{other}' (" + other_kind + "). "
+             "A script relays messages; the human reads the transcript and may inject 'Moderator (user:…):' notes — follow them. "
+             "Reply in at most 300 words in the reply body. When nothing remains to dispute, end with a line `[[AGREE]]`. "
+             + PEER_TALK_RULE + "\n\nTopic: {topic}\n\n")
+    last = {a_name: "", b_name: ""}
+    agreed = {a_name: False, b_name: False}
+    stopped = False
+    for r in range(1, o.rounds + 1):
+        for me, other, agent in ((a_name, b_name, A), (b_name, a_name, B)):
+            if last[other]:
+                msg = (intro.format(me=me, other=other, topic=topic) if r == 1 and not last[me] else "") + \
+                      f"{other} replied:\n\n{last[other]}\n\nRespond: agree, refute, or refine."
+            else:
+                msg = intro.format(me=me, other=other, topic=topic) + "Give your opening position."
+            mod = conv.moderator_notes()
+            if "[[STOP]]" in mod:
+                print(f"[bridge] dialog stopped by the moderator before {me}'s turn in round {r}", file=sys.stderr)
+                stopped = True
+                break
+            if mod:
+                msg = mod + "\n\n" + msg
+            print(f"[bridge] dialog round {r}: {me} …", file=sys.stderr)
+            rc, parsed, log = execute(agent, o, msg, sessions[me], conv, frm="moderator")   # the script relays
+            if rc != 0 or parsed is None:
+                print(f"[bridge] dialog stopped: {me} failed (rc={rc})", file=sys.stderr)
+                return rc
+            sessions[me] = parsed.session or sessions[me]
+            conv.state["sessions"][me] = sessions[me]        # a resumed dialog picks the right side's session back up
+            conv.state_path.write_text(json.dumps(conv.state, indent=2))
+            last[me] = parsed.result.strip()
+            agreed[me] = bool(AGREE_RE.search(last[me]))
+            print(f"\n--- round {r} · {me} ---\n{last[me]}\n")
+        if stopped or all(agreed.values()):
+            if not stopped:
+                print(f"[bridge] both peers agreed in round {r}", file=sys.stderr)
+            break
+    board_hint = f" board={conv.topic_name}" if conv.topic is not None else ""
+    print(f"[bridge] dialog conv={conv.name} transcript={conv.transcript}{board_hint}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="ask-agent", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("agent", nargs="?", choices=sorted(ADAPTERS) + ["dialog"],
+                    help="peer agent to run, or `dialog` for a two-peer exchange (--peers A,B)")
+    ap.add_argument("prompt", nargs="*", help="prompt / dialog topic (or pipe it on stdin)")
+    ap.add_argument("-d", "--dir", default=os.getcwd(), help="workspace dir (default: cwd)")
+    ap.add_argument("-m", "--mode", default="ask", choices=["ask", "plan", "write"],
+                    help="ask = read-only Q&A (default) | plan = read-only analysis | write = may edit files")
+    ap.add_argument("-M", "--model", default="", help="peer model id (default: the peer's own default)")
+    ap.add_argument("-t", "--timeout", type=int, default=900, help="kill after N seconds (default 900)")
+    ap.add_argument("-w", "--worktree", nargs="?", const="auto", default=None, help="run in an isolated git worktree")
+    ap.add_argument("--add-dir", action="append", default=[], help="extra workspace root (repeatable)")
+    ap.add_argument("--deny", action="append", default=[], help="extra tool to deny (peer syntax; repeatable)")
+    ap.add_argument("-c", "--continue", dest="cont", action="store_true", help="continue the peer's latest session")
+    ap.add_argument("--session", "--chat", dest="session", default="", help="resume a specific peer session id")
+    ap.add_argument("--conv", default="", help="named thread: remembers the peer session and appends a transcript")
+    ap.add_argument("--show", action="store_true", help="with --conv: print the transcript and exit")
+    ap.add_argument("-p", "--peers", default="claude,cursor", help="dialog: the two peers, e.g. claude,cursor")
+    ap.add_argument("-r", "--rounds", type=int, default=3, help="dialog: max rounds (default 3)")
+    ap.add_argument("--json", action="store_true", help="print the raw peer output instead of the parsed answer")
+    ap.add_argument("--no-recover", action="store_true", help="skip the narration-only auto-resume (Cursor)")
+    ap.add_argument("--kind", default="", help="playbook kind for the outcome ledger (default: classified from the prompt)")
+    ap.add_argument("--ignore-quota", action="store_true",
+                    help=f"run even if the peer was marked out of quota in the last {QUOTA_TTL // 60} min (exit 7 otherwise)")
+    ap.add_argument("--no-board", dest="board", action="store_false",
+                    help="do not expose the bridge board to the peer (Claude then runs in plan mode)")
+    ap.add_argument("--dry-run", action="store_true", help="print the resolved command line and exit")
+    ap.add_argument("--list", action="store_true", help="show installed peers and conversations, then exit")
+    o = ap.parse_args()
+
+    if o.list:
+        return list_agents()
+    if o.conv and o.show:
+        t = Conv(o.conv).transcript
+        print(t.read_text() if t.is_file() else f"ask-agent: no conversation named {o.conv}")
+        return 0
+    if not o.agent:
+        ap.error("agent is required (or --list)")
+
+    prompt = " ".join(o.prompt).strip()
+    if not prompt and not sys.stdin.isatty():
+        # a pipe with no writer (agent shells, `-w name` swallowing the prompt) must not block forever
+        import select
+        if select.select([sys.stdin], [], [], 5)[0]:
+            prompt = sys.stdin.read().strip()
+    if not prompt:
+        ap.error("empty prompt")
+
+    if os.environ.get(HOP_VAR):
+        print(f"ask-agent: refusing — already inside a bridged run ({HOP_VAR}={os.environ[HOP_VAR]}). "
+              "One hop only: do the work here.", file=sys.stderr)
+        return 3
+    if not Path(o.dir).is_dir():
+        print(f"ask-agent: no such dir: {o.dir}", file=sys.stderr)
+        return 2
+    o.dir = str(Path(o.dir).resolve())
+
+    if o.agent == "dialog":
+        if o.mode == "write" or o.worktree is not None:
+            print("ask-agent: dialog is read-only (ask/plan) and runs in the given dir — no -m write / -w", file=sys.stderr)
+            return 2
+        return dialog(o, prompt)
+
+    agent = ADAPTERS[o.agent]
+    if agent.name in DISABLED:
+        print(f"ask-agent: {agent.name} is disabled on this machine — {DISABLED[agent.name]}", file=sys.stderr)
+        return 4
+    if o.worktree is not None and not agent.supports_worktree:
+        print(f"ask-agent: {agent.name} has no worktree flag — create one with `git worktree add` and pass -d.",
+              file=sys.stderr)
+        return 2
+    if o.deny and not agent.supports_deny:
+        print(f"ask-agent: {agent.name} takes no --deny (its deny list lives in its own config).", file=sys.stderr)
+        return 2
+
+    conv = Conv(o.conv, boardlib.connect() if o.board else None) if o.conv else None
+    session = o.session or (conv.session_for(agent.name) if conv else None)
+    if o.dry_run:
+        o.session = session or ""
+        notes = agent.prepare(o, True)
+        print(json.dumps({"agent": agent.name, "binary": agent.resolve() or "NOT INSTALLED", "cwd": o.dir,
+                          "argv": agent.argv(o, agent.preamble(o) + prompt + protocol(conv)),
+                          "env": {HOP_VAR: "1", **BoardRun(agent, False, Path("-")).env},
+                          "prepare": notes, "conv": o.conv or None, "session": session}, ensure_ascii=False, indent=2))
+        return 0
+
+    rc, parsed, log = execute(agent, o, prompt, session, conv)
+    if parsed is None:
+        return rc
+    if o.json:
+        print(log.read_text(encoding="utf-8", errors="replace"))
+        return rc
+    ask_rc = print_parsed(agent, parsed, log, conv)
+    return rc or ask_rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

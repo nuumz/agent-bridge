@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""bridge-panel — role-based panel of peer agents with a leader that frames and synthesises.
+
+    bridge-panel run <name> -p claude,cursor [-r role,role] [-d DIR] [-t SEC] [--leader claude] [--no-cross]
+                     [--parallel N] "<problem>"
+    bridge-panel roles                 list the roles in ~/.agent-bridge/roles
+    bridge-panel show <name>           print ~/.agent-bridge/panel/<name>/report.md
+
+Pattern: orchestrator-workers + evaluator (Anthropic, "Building effective agents"): the leader decomposes the problem into
+one question per role, workers answer in parallel (each a normal `ask-agent` run with its own thread, so every turn is on
+the board), a cross-examination round lets each worker challenge the others (and answer "QUESTION FOR <role>" lines
+addressed to it), and the leader writes one report. Read-only by construction (`-m ask`); every peer run is still a
+bridged run (egress, deny lists, one hop) — the user names the allowed peers with -p.
+
+What is shared and what is not — a debate is only worth its independence:
+  SHARED   the case file (problem + numbered excerpts of the named files, built locally so every role reads the SAME
+           text at the SAME line numbers), and after the first round the machine-verified citation table + every
+           finding. Both are facts, identical for everyone, produced without a model.
+  PRIVATE  the first pass. A worker sees its own question only — not the other roles' questions, and not the leader's
+           hypothesis (`--hypothesis` opts in), so four roles cannot converge on one guess before they have looked.
+
+Degraded runs: a role whose peer fails (quota, crash) is retried once on its `fallback_peer` (role frontmatter) when
+that peer is in -p; below two answering roles the panel ABORTS with exit 4 and writes no report (`--allow-single`
+overrides) — findings.json / status.json are still saved. A failed synthesis also exits 4; `synth` re-runs it alone.
+A role's `timeout:` frontmatter raises -t for that role's runs (as-built-realist needs ~300–455 s; 420 killed it 3 times).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bridgelib import grill as grill_plan, ledger  # noqa: E402
+from bridgelib.core import PEER_TALK_RULE, detach, guarded_rc, lang_rule  # noqa: E402
+
+HOME = Path.home()
+BRIDGE = HOME / ".agent-bridge"
+ROLES = BRIDGE / "roles"
+PANELS = BRIDGE / "panel"
+ASK = BRIDGE / "bin" / "ask-agent"
+BOARD = BRIDGE / "bin" / "bridge-board"
+HOP_VAR = "AGENT_BRIDGE_HOP"
+DEFAULT_ROLES = ["root-cause", "contract-checker", "design-critic", "spec-reader"]  # spec-reader settled 4 disputes by
+                                                                                    # running the code (measured 2026-09-12)
+MAX_SHARE = 6000     # chars of one finding shown to another worker / the leader
+MAX_CASE = 14000     # chars of the shared case file
+MAX_FILE_LINES = 260  # lines quoted per file in the case file
+CITE_RE = re.compile(r"`?([\w./-]+\.[A-Za-z0-9]+):(\d+)(?:-(\d+))?`?")
+
+
+def load_roles() -> dict[str, dict]:
+    roles = {}
+    for f in sorted(ROLES.glob("*.md")):
+        text = f.read_text()
+        m = re.match(r"---\n(.*?)\n---\n(.*)", text, re.S)
+        meta = {}
+        body = text
+        if m:
+            body = m.group(2).strip()
+            for line in m.group(1).splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    meta[k.strip()] = v.strip()
+        meta.setdefault("name", f.stem)
+        meta["prompt"] = body
+        roles[meta["name"]] = meta
+    return roles
+
+
+def role_timeout(role: dict) -> int:
+    """Seconds from the role's `timeout:` frontmatter (0 = use -t) — for roles that read code on several branches."""
+    return int(role.get("timeout") or 0)
+
+
+def ask(peer: str, conv: str, prompt: str, o, model: str | None = None, mode: str = "ask",
+        timeout: int = 0) -> tuple[int, str]:
+    """One bridged run; returns (rc, answer text without the trailing [bridge] line).
+    `timeout` (a role's frontmatter) only ever raises -t for that run, never lowers it."""
+    argv = [str(ASK), peer, "-m", mode, "-t", str(max(o.timeout, timeout)), "-d", o.dir, "--conv", conv]
+    if getattr(o, "kind_resolved", ""):            # worker rows in the ledger carry the panel's kind, not their own prompt's
+        argv += ["--kind", o.kind_resolved]
+    if model:
+        argv += ["-M", model]
+    argv.append(prompt)
+    r = subprocess.run(argv, capture_output=True, text=True)
+    lines = [ln for ln in r.stdout.splitlines() if not ln.startswith("[bridge]")]
+    text = "\n".join(lines).strip()
+    if r.returncode not in (0, 5) and not text:
+        text = f"(run failed rc={r.returncode}) {run_error(r.stderr)}"
+    return r.returncode, text
+
+
+def run_error(stderr: str) -> str:
+    """The peer's own error line as ask-agent reports it (`[bridge] error: …`), never the echoed prompt/log dump."""
+    m = re.search(r"^\[bridge\] error: (.+)$", stderr, re.M)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"^ask-agent: (.+)$", stderr, re.M)
+    return m.group(1).strip() if m else stderr.strip()[-300:]
+
+
+def ask_with_fallback(role: dict, conv: str, prompt: str, o, peers: list[str], used: dict[str, str],
+                      fallbacks: dict[str, str]) -> tuple[int, str]:
+    """Run on the role's peer; when that run fails (quota, crash) and the role names a `fallback_peer` the user allowed,
+    run once more there — on the fallback's default model, since `model` ids are peer-specific."""
+    primary = used.get(role["name"]) or role["peer"]
+    model = role.get("model") if primary == role["peer"] else None
+    rc, text = ask(primary, conv, prompt, o, model or None, role.get("mode") or "ask", role_timeout(role))
+    fb = role.get("fallback_peer")
+    if rc in (0, 5) or not fb or fb == primary or fb not in peers:
+        used[role["name"]] = primary
+        return rc, text
+    reason = text[:160]
+    print(f"[panel] {role['name']}: {primary} failed ({reason}) — retrying on fallback peer {fb}", file=sys.stderr)
+    rc, text = ask(fb, f"{conv}-{fb}", prompt, o, None, role.get("mode") or "ask", role_timeout(role))
+    used[role["name"]] = fb
+    fallbacks[role["name"]] = f"{primary} → {fb} ({reason})"
+    return rc, text
+
+
+def post(topic: str, text: str, kind: str = "note") -> None:
+    if BOARD.is_file():
+        subprocess.run([str(BOARD), "post", topic, text, "-k", kind], capture_output=True, text=True)
+
+
+def case_file(workspace: str, problem: str) -> tuple[str, list[str]]:
+    """The shared record: every file named in the problem, quoted with line numbers, identical for every role.
+
+    Built locally (no model, no tokens spent discovering it) so that a citation means the same line to everyone and
+    two roles cannot disagree because they read different revisions of a file mid-edit.
+    """
+    root = Path(workspace)
+    names, seen = [], set()
+    for m in re.finditer(r"[\w./-]+\.[A-Za-z0-9]+", problem):
+        rel = m.group(0).lstrip("./")
+        if rel in seen:
+            continue
+        seen.add(rel)
+        f = root / rel
+        if f.is_file():
+            names.append(rel)
+    parts, total = [], 0
+    for rel in names:
+        try:
+            lines = (root / rel).read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        shown = lines[:MAX_FILE_LINES]
+        body = "\n".join(f"{i:>4}  {ln}" for i, ln in enumerate(shown, 1))
+        if len(lines) > len(shown):
+            body += f"\n  ...  ({len(lines) - len(shown)} more lines — open the file for the rest)"
+        block = f"#### {rel}  ({len(lines)} lines)\n```\n{body}\n```"
+        if total + len(block) > MAX_CASE:
+            parts.append(f"#### {rel} — not quoted (case file full); open it yourself")
+            continue
+        parts.append(block)
+        total += len(block)
+    if not parts:
+        return "", []
+    return ("## Shared case file — every role reads this same text\n\n"
+            "Line numbers below are the ones to cite. Read more from the workspace when you need it, but quote these "
+            "numbers so another role can check you.\n\n" + "\n\n".join(parts)), names
+
+
+def resolve_cited(root: Path, rel: str) -> tuple[Path | None, str]:
+    """A role may cite `cutoff.py:10` for `app/cutoff.py`; resolve by basename before calling a citation broken."""
+    direct = root / rel
+    if direct.is_file():
+        return direct, rel
+    hits = [f for f in root.rglob(Path(rel).name) if f.is_file() and ".git" not in f.parts][:5]
+    if len(hits) == 1:
+        return hits[0], str(hits[0].relative_to(root))
+    if len(hits) > 1:
+        return None, f"AMBIGUOUS ({len(hits)} files named {Path(rel).name})"
+    return None, "NO SUCH FILE"
+
+
+def verify_citations(workspace: str, texts: dict[str, str]) -> list[dict]:
+    """Check every `path:line` a role wrote against the workspace — the shared, model-free fact base."""
+    root = Path(workspace)
+    out: dict[tuple[str, int], dict] = {}
+    seen: dict[str, tuple[Path | None, str]] = {}
+    for role, text in texts.items():
+        for m in CITE_RE.finditer(text or ""):
+            rel, start = m.group(1).lstrip("./"), int(m.group(2))
+            if rel not in seen:
+                seen[rel] = resolve_cited(root, rel)
+            f, resolved = seen[rel]
+            # key on the RESOLVED path: `cutoff.py:4` and `app/cutoff.py:4` are one line, so the shared record
+            # must show one row (two rows read as two pieces of evidence for the same claim)
+            key = (resolved if f else rel, start)
+            rec = out.setdefault(key, {"cite": f"{resolved if f else rel}:{start}", "roles": [], "as_written": set(),
+                                       "status": "", "text": ""})
+            rec["as_written"].add(rel)
+            if role not in rec["roles"]:
+                rec["roles"].append(role)
+            if rec["status"]:
+                continue
+            if f is None:
+                rec["status"] = resolved
+                continue
+            try:
+                lines = f.read_text(errors="replace").splitlines()
+            except OSError:
+                rec["status"] = "UNREADABLE"
+                continue
+            if not 1 <= start <= len(lines):
+                rec["status"] = f"OUT OF RANGE (file has {len(lines)} lines)"
+                continue
+            rec["text"] = lines[start - 1].strip()[:160]
+            rec["status"] = "ok" if rec["text"] else "BLANK LINE (wrong anchor?)"
+    rows = []
+    for rec in out.values():
+        short = sorted(w for w in rec.pop("as_written") if not rec["cite"].startswith(w))
+        if short:
+            rec["cite"] += f"  (written as {', '.join(short)})"
+        rows.append(rec)
+    return sorted(rows, key=lambda r: (r["status"] == "ok", r["cite"]))
+
+
+def citation_table(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    bad = [r for r in rows if r["status"] != "ok"]
+    head = ("## Verified citations — checked against the files, not by a model\n\n"
+            f"{len(rows)} distinct citations, {len(bad)} that do not resolve.\n\n"
+            "| citation | cited by | line on disk / problem |\n|---|---|---|\n")
+    body = "".join(f"| `{r['cite']}` | {', '.join(r['roles'])} | "
+                   f"{'`' + r['text'] + '`' if r['status'] == 'ok' else '**' + r['status'] + '**'} |\n" for r in rows)
+    return head + body
+
+
+def tree_state(d: str) -> str:
+    """`git status --porcelain` of the workspace ('' when not a git repo) — workers are read-only by contract."""
+    r = subprocess.run(["git", "-C", d, "status", "--porcelain", "--untracked-files=all"], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def tree_delta(before: str, after: str) -> list[str]:
+    return sorted(set(after.splitlines()) - set(before.splitlines()))
+
+
+def parse_plan(text: str, roles: list[str], problem: str) -> tuple[list[dict], str]:
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S)
+    if m:
+        try:
+            plan = json.loads(m.group(1))
+            qs = [q for q in plan.get("questions", []) if q.get("role") in roles and q.get("question")]
+            if qs:
+                return qs, plan.get("hypothesis", "")
+        except json.JSONDecodeError:
+            pass
+    return [{"role": r, "question": problem, "why": "leader plan unparsable — full problem"} for r in roles], ""
+
+
+def frame_prompt(name: str, problem: str, roles: dict, chosen: list[str], leader: dict) -> str:
+    menu = "\n".join(f"- {r}: {roles[r]['summary']} (peer: {roles[r].get('peer')})" for r in chosen)
+    return (f"{leader['prompt']}\n\nPanel `{name}`. Problem from the user:\n\n{problem}\n\n"
+            f"Available roles:\n{menu}\n\n"
+            "Write ONE fenced ```json block: {\"hypothesis\": \"<your best first guess of the root cause, one sentence>\", "
+            "\"questions\": [{\"role\": \"<role>\", \"question\": \"<one specific question that role must answer, naming the "
+            "files/values to look at and what evidence would settle it>\", \"why\": \"<what this answer decides>\"}]}. "
+            "Use each listed role at most once; leave out a role that adds nothing. After the block, one line: which "
+            "answer you expect to be decisive. Write in the reply body, do not narrate.")
+
+
+def worker_prompt(name: str, role: dict, q: dict, problem: str, hypothesis: str, case: str) -> str:
+    # The other roles' questions and (by default) the leader's hypothesis are withheld: this pass must be independent,
+    # or the cross-examination that follows is four voices ratifying one guess.
+    hyp = (f"Leader's hypothesis (may be wrong — test it, do not assume it): {hypothesis}\n\n") if hypothesis else ""
+    return (f"{role['prompt']}\n\nPanel `{name}` — you are `{role['name']}`. Problem from the user:\n\n{problem}\n\n"
+            f"{case}\n\n{hyp}"
+            f"Your question: {q['question']}\nWhy it matters: {q.get('why', '')}\n\n"
+            "Other roles are answering other questions in parallel; you will see their answers in the next round. "
+            "Answer yours from the files, not from what you expect them to say.\n\n"
+            "Reply in the body with these sections: FINDING · EVIDENCE (file:line per claim) · CONFIDENCE (high/medium/low "
+            "with the reason) · ROOT-CAUSE HYPOTHESIS (or N/A) · QUESTION FOR <role>: <text> (optional, only when another "
+            "panel role must answer something before you can be sure). Do not narrate. " + PEER_TALK_RULE)
+
+
+def cross_prompt(name: str, role: dict, others: dict[str, str], directed: list[str], cites: str = "") -> str:
+    shown = "\n\n".join(f"### {r}\n{t[:MAX_SHARE]}" for r, t in others.items())
+    asked = ("\n\nQuestions addressed to you:\n- " + "\n- ".join(directed)) if directed else ""
+    cite_block = f"\n\n{cites}\nA citation marked other than `ok` is not evidence — say so when a role leaned on it.\n" if cites else ""
+    return (f"Panel `{name}`, cross-examination. Everything below is now shared: the other roles' answers and the "
+            f"machine-checked citation table. Your own conclusion is still yours to defend or change.\n\n"
+            f"{shown}{cite_block}{asked}\n\n"
+            "For each other role: CHALLENGE (with file:line showing why it is wrong or incomplete) or RATIFY (one line). "
+            "Answer every question addressed to you. Then restate your own conclusion in one paragraph, changed or not. "
+            "End with [[AGREE]] if nothing remains in dispute. Write in the reply body, do not narrate. " + PEER_TALK_RULE)
+
+
+def synth_prompt(name: str, problem: str, findings: dict[str, str], cross: dict[str, str], cites: str = "") -> str:
+    body = "\n\n".join(f"### {r} — finding\n{findings[r][:MAX_SHARE]}\n\n### {r} — cross-examination\n"
+                       f"{cross.get(r, '(none)')[:MAX_SHARE]}" for r in findings)
+    agreed = [r for r in findings if "[[AGREE]]" in (cross.get(r) or "")]
+    ledger = (f"\nEnded with [[AGREE]]: {', '.join(agreed) or 'none'}; still open: "
+              f"{', '.join(r for r in findings if r not in agreed) or 'none'}.\n") if cross else ""
+    return (f"Panel `{name}` — synthesis. Problem:\n\n{problem}\n\nAnswers:\n\n{body}\n{ledger}\n{cites}\n"
+            "The citation table above was produced by checking the files, not by a model: a claim resting on a citation "
+            "that does not resolve is UNVERIFIED no matter how many roles repeated it.\n\n"
+            + lang_rule(problem) + " "
+            "Write the report in the reply body with exactly these headings: "
+            "## Root cause (ranked; each with the citing role and file:line, and whether the panel agreed) · "
+            "## Trigger and contributing factors · ## Disputed points (who said what, what would settle it) · "
+            "## Decisions for the user (table: question · options · recommendation · if undecided) · "
+            "## Next actions (file-level, smallest change first, with the test that fails without it) · "
+            "## Confidence (one line). Cite only evidence a role actually gave; mark anything else UNVERIFIED.")
+
+
+def directed_questions(text: str) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for m in re.finditer(r"QUESTION FOR\s+`?([\w-]+)`?\s*:\s*(.+)", text):
+        out.setdefault(m.group(1).lower(), []).append(m.group(2).strip())
+    return out
+
+
+def clear_rc(name: str, *, report: bool = False) -> None:
+    """Drop a prior run's done signal. Only `run` clears report.md — fix/synth need it."""
+    d = PANELS / name
+    (d / "rc").unlink(missing_ok=True)
+    if report:
+        (d / "report.md").unlink(missing_ok=True)
+
+
+def write_rc(name: str, rc: int) -> int:
+    """Durable completion sentinel under panel/<name>/rc + last stderr line `rc=N`.
+
+    peer-panel (and any waiter) must poll this file or report.md — never an unbounded
+    `until grep ^rc=` on a redirected log that may never get the wrapper echo.
+    """
+    d = PANELS / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "rc").write_text(f"{rc}\n")
+    print(f"rc={rc}", file=sys.stderr)
+    return rc
+
+
+def run(o) -> int:
+    if os.environ.get(HOP_VAR):
+        print("bridge-panel: refusing to run inside a bridged run (one hop only)", file=sys.stderr)
+        return 3
+    roles = load_roles()
+    leader = roles.get(o.leader_role)
+    peers = [p.strip() for p in o.peers.split(",") if p.strip()]
+    chosen = [r.strip() for r in (o.roles or ",".join(DEFAULT_ROLES)).split(",") if r.strip()]
+    missing = [r for r in chosen + [o.leader_role] if r not in roles]
+    if missing:
+        print(f"bridge-panel: unknown role(s) {missing}; see `bridge-panel roles`", file=sys.stderr)
+        return 2
+    leader_peer = o.leader or leader.get("peer", "claude")
+    skipped = [r for r in chosen if roles[r].get("peer") not in peers]
+    chosen = [r for r in chosen if r not in skipped]
+    if leader_peer not in peers or not chosen:
+        print(f"bridge-panel: -p must name the leader peer ({leader_peer}) and at least one worker peer", file=sys.stderr)
+        return 2
+    if skipped:
+        print(f"[panel] skipped roles whose peer is not in -p: {skipped}", file=sys.stderr)
+    if o.parallel is None:
+        o.parallel = max(1, min(6, len(chosen)))
+
+    agreement = ""
+    if o.agreement:
+        af = Path(o.agreement)
+        if not af.is_file():
+            print(f"bridge-panel: no agreement file {af}", file=sys.stderr)
+            return 2
+        agreement = af.read_text()
+        todos = grill_plan.open_field_todos(agreement)
+        if todos:
+            print(f"bridge-panel: agreement {af.name} still has {len(todos)} TODO field(s) — fill them "
+                  f"(`bridge-plan agree {af.stem}`) before the panel runs:", file=sys.stderr)
+            for t in todos:
+                print("  " + t[:120], file=sys.stderr)
+            return 3
+        err, warn = grill_plan.gate_before_run(agreement)
+        if err:
+            print(f"bridge-panel: {err}", file=sys.stderr)
+            return 3
+        if warn:
+            print(f"WARNING: {warn}", file=sys.stderr)
+
+    out = PANELS / o.name
+    out.mkdir(parents=True, exist_ok=True)
+    topic = f"panel:{o.name}"
+    post(topic, f"Panel `{o.name}` started — leader {leader_peer}, roles {chosen}.\n\n{o.problem}")
+    kind = o.kind or (ledger.classify(o.problem)[0][0] if ledger.classify(o.problem) else "other")
+    o.kind_resolved = kind
+    t_start = time.time()
+    case, case_files = case_file(o.dir, o.problem)
+    if agreement:                      # the agreed framing is part of the shared record: same question, same output shape
+        case = f"## Agreement (agreed before this panel ran — argue this question, return this shape)\n\n{agreement}\n\n{case}"
+        case_files = ["agreement"] + case_files
+    if case:
+        (out / "case.md").write_text(case)
+        print(f"[panel] shared case file: {', '.join(case_files)} ({len(case)} chars)", file=sys.stderr)
+
+    print(f"[panel] framing with {leader_peer} …", file=sys.stderr)
+    rc, framed = ask(leader_peer, f"panel-{o.name}-leader",
+                     frame_prompt(o.name, o.problem, roles, chosen, leader) + (f"\n\n{case}" if case else ""), o)
+    plan, hypothesis = parse_plan(framed, chosen, o.problem)
+    (out / "plan.json").write_text(json.dumps({"hypothesis": hypothesis, "questions": plan, "raw": framed},
+                                              ensure_ascii=False, indent=2))
+    post(topic, "Plan:\n" + "\n".join(f"- {q['role']}: {q['question']}" for q in plan))
+
+    used: dict[str, str] = {}          # role → peer that actually answered (fallback may differ from the role's peer)
+    fallbacks: dict[str, str] = {}
+
+    def work(q):
+        role = roles[q["role"]]
+        print(f"[panel] {q['role']} ({role.get('peer')}) …", file=sys.stderr)
+        before = tree_state(o.dir)
+        rc, text = ask_with_fallback(role, f"panel-{o.name}-{q['role']}",
+                                     worker_prompt(o.name, role, q, o.problem, hypothesis if o.hypothesis else "", case),
+                                     o, peers, used, fallbacks)
+        delta = tree_delta(before, tree_state(o.dir))
+        if delta:
+            edited[q["role"]] = delta
+            print(f"[panel] WARNING {q['role']} changed the tree: {delta}", file=sys.stderr)
+        return q["role"], rc, text
+
+    edited: dict[str, list[str]] = {}
+    with ThreadPoolExecutor(max_workers=o.parallel) as ex:
+        results = list(ex.map(work, plan))
+    failed = {r: t for r, rc, t in results if rc not in (0, 5)}
+    findings = {r: t for r, rc, t in results if r not in failed}     # a crashed run is not evidence — never synthesise it
+    needs_input = {r: t for r, rc, t in results if rc == 5}
+    for r in failed:
+        print(f"[panel] {r} FAILED — excluded from the shared record: {failed[r][:160]}", file=sys.stderr)
+    (out / "findings.json").write_text(json.dumps(findings, ensure_ascii=False, indent=2))
+    (out / "status.json").write_text(json.dumps({"answered": used, "fallbacks": fallbacks, "failed": failed,
+                                                 "asked_back": list(needs_input)}, ensure_ascii=False, indent=2))
+    need = 1 if o.allow_single else 2
+    if len(findings) < need:
+        # A "panel" of one voice (or none) reads like a panel and misleads — 5 such reports shipped before 2026-09-26.
+        msg = (f"only {len(findings)} role(s) answered ({', '.join(findings) or 'none'}); need {need} — no synthesis. "
+               f"Failed: " + ("; ".join(f"{r}: {t[:160]}" for r, t in failed.items()) or "none") +
+               (". Re-run when the peer is back (`ask-agent --list` shows quota marks), or pass --allow-single "
+                "to synthesise from one role." if not o.allow_single else ""))
+        print(f"[panel] ABORT — {msg}", file=sys.stderr)
+        post(topic, f"Panel `{o.name}` aborted — {msg}")
+        (out / "report.md").unlink(missing_ok=True)      # a stale report from an earlier run must not pass as this one's
+        ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start)
+        return 4
+    cites = verify_citations(o.dir, findings)
+    (out / "citations.json").write_text(json.dumps(cites, ensure_ascii=False, indent=2))
+    unresolved = [c for c in cites if c["status"] != "ok"]
+    print(f"[panel] citations: {len(cites)} checked, {len(unresolved)} unresolved", file=sys.stderr)
+    cite_md = citation_table(cites)
+
+    cross: dict[str, str] = {}
+    if not o.no_cross and len(findings) > 1:
+        asked = {}
+        for r, t in findings.items():
+            for target, qs in directed_questions(t).items():
+                asked.setdefault(target, []).extend(f"from {r}: {q}" for q in qs)
+
+        def exam(r):
+            role = roles[r]
+            print(f"[panel] cross-examination: {r} ({used.get(r, role['peer'])}) …", file=sys.stderr)
+            others = {k: v for k, v in findings.items() if k != r}
+            before = tree_state(o.dir)
+            peer = used.get(r, role["peer"])
+            conv = f"panel-{o.name}-{r}" + (f"-{peer}" if peer != role["peer"] else "")
+            rc, text = ask(peer, conv, cross_prompt(o.name, role, others, asked.get(r, []), cite_md),
+                           o, (role.get("model") if peer == role["peer"] else None) or None, role.get("mode") or "ask",
+                           role_timeout(role))
+            if rc not in (0, 5):
+                print(f"[panel] cross-examination: {r} FAILED ({text[:160]}) — its first-pass finding stands unchallenged",
+                      file=sys.stderr)
+                text = f"(cross-examination failed: {text[:200]})"
+            delta = tree_delta(before, tree_state(o.dir))
+            if delta:
+                edited.setdefault(r, []).extend(delta)
+                print(f"[panel] WARNING {r} changed the tree during cross-examination: {delta}", file=sys.stderr)
+            return r, text
+
+        with ThreadPoolExecutor(max_workers=o.parallel) as ex:
+            cross = dict(ex.map(exam, list(findings)))
+        (out / "cross.json").write_text(json.dumps(cross, ensure_ascii=False, indent=2))
+
+    if cross:
+        cites = verify_citations(o.dir, {**findings, **{f"{r} (cross)": t for r, t in cross.items()}})
+        (out / "citations.json").write_text(json.dumps(cites, ensure_ascii=False, indent=2))
+        cite_md = citation_table(cites)
+    print(f"[panel] synthesis with {leader_peer} …", file=sys.stderr)
+    rc, report = ask(leader_peer, f"panel-{o.name}-leader", synth_prompt(o.name, o.problem, findings, cross, cite_md), o)
+    if rc not in (0, 5):
+        print(f"[panel] ABORT — synthesis failed ({report[:200]}); findings/cross are saved — "
+              f"`bridge-panel synth {o.name} -p {leader_peer} -d {o.dir}` re-runs just this step", file=sys.stderr)
+        (out / "report.md").unlink(missing_ok=True)
+        ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start)
+        return 4
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    roles_line = ", ".join(f"{r} ({used[r]})" if used.get(r) and used[r] != roles[r]["peer"] else r for r in findings)
+    head = (f"# Panel `{o.name}` — {stamp}\n\nLeader: {leader_peer} · roles: {roles_line} · "
+            f"cross-examination: {'no' if o.no_cross else 'yes'} · first pass "
+            f"{'saw' if o.hypothesis else 'blind to'} the leader's hypothesis · dir: {o.dir}\n\n")
+    if fallbacks:
+        head += ("> Roles answered by their fallback peer (the role's own peer failed):\n"
+                 + "".join(f"> - {r}: {t}\n" for r, t in fallbacks.items()) + "\n")
+    if failed:
+        head += ("> Roles whose run failed and were left out of the report:\n"
+                 + "".join(f"> - {r}: {t[:200]}\n" for r, t in failed.items()) + "\n")
+    if edited:
+        head += ("> **Workers changed the working tree** (panel is read-only by contract — inspect with `git diff`, revert what "
+                 "you did not ask for):\n" + "".join(f"> - {r}: {', '.join(d)}\n" for r, d in edited.items()) + "\n")
+    if needs_input:
+        head += "> Roles that asked back (exit 5) — answer in their thread and re-run:\n" + "".join(
+            f"> - {r}: `ask-agent {roles[r]['peer']} --conv panel-{o.name}-{r} \"<answer>\"`\n" for r in needs_input) + "\n"
+    (out / "report.md").write_text(head + report + ("\n\n" + cite_md if cite_md else "") + "\n")
+    if o.fix and "implementer" in roles and roles["implementer"].get("peer") in peers:
+        imp = roles["implementer"]
+        print(f"[panel] patch sketch with {imp['peer']} …", file=sys.stderr)
+        _, patch = ask(imp["peer"], f"panel-{o.name}-implementer", fix_prompt(o.name, report, case, imp),
+                       o, imp.get("model") or None, imp.get("mode") or "ask")
+        verdict = check_patch(o.dir, patch)
+        (out / "patch.md").write_text(verdict + "\n" + patch + "\n")
+        print(f"[panel] {verdict.strip()}", file=sys.stderr)
+        print(f"[panel] patch={out / 'patch.md'}", file=sys.stderr)
+    post(topic, f"Report written: {out / 'report.md'}\n\n" + report[:3000])
+    ledger_row(o, kind, findings, used, fallbacks, failed, 0, t_start)
+    print(head + report)
+    print(f"\n[panel] report={out / 'report.md'} board={topic} threads=panel-{o.name}-*", file=sys.stderr)
+    return 0
+
+
+def ledger_row(o, kind: str, findings: dict, used: dict, fallbacks: dict, failed: dict, rc: int, t_start: float) -> None:
+    try:
+        ledger.record({"type": "panel", "name": o.name, "kind": kind, "peers": o.peers, "roles": list(findings),
+                       "answered": used, "fallbacks": list(fallbacks), "failed": list(failed), "rc": rc,
+                       "fix": bool(o.fix), "cross": not o.no_cross, "agreement": bool(o.agreement),
+                       "duration_s": round(time.time() - t_start)})
+    except Exception:  # noqa: BLE001 — the ledger must never break a panel
+        pass
+
+
+def check_patch(workspace: str, patch_md: str) -> str:
+    """Run `git apply --check` on the sketch: a diff that cannot be applied is a lead, not a patch — say which."""
+    m = re.search(r"```(?:diff|patch)\n(.*?)```", patch_md, re.S)
+    if not m:
+        return "> Patch check: no fenced diff block found in the reply.\n"
+    body = m.group(1)
+    if not body.endswith("\n"):
+        body += "\n"
+    r = subprocess.run(["git", "-C", workspace, "apply", "--check", "-"], input=body, capture_output=True, text=True)
+    if r.returncode == 0:
+        return "> Patch check: `git apply --check` accepts this diff against the workspace as it stands.\n"
+    return ("> Patch check: **`git apply --check` rejects this diff** — read it as a sketch, not a patch:\n> `"
+            + (r.stderr.strip().splitlines() or ["(no message)"])[0][:200] + "`\n")
+
+
+def fix_prompt(name: str, report: str, case: str, role: dict) -> str:
+    """The agreed report in, the smallest patch out — still read-only: a diff to review, never a file written."""
+    return (f"{role['prompt']}\n\nPanel `{name}` reached this conclusion:\n\n{report[:MAX_SHARE * 2]}\n\n{case}\n\n"
+            "Produce, in the reply body: (1) a unified diff implementing ONLY the agreed root-cause fix — no refactor, no "
+            "rename, no defensive extras, but every comment or docstring the change falsifies updated in the same diff "
+            "(a line reading `# BUG: <the thing you just fixed>` must not survive the patch); (2) the callers affected, "
+            "listed from a real search, or NONE; (3) one test that fails before the change and passes after, with the "
+            "exact input and expected value. Do not write any file; do not narrate. " + lang_rule(case))
+
+
+def gc(o) -> int:
+    """Retention for the panel's own artefacts plus the ask-agent run logs and threads they create.
+
+    Directories that hold a session card (`agreement.md`) are never fully deleted — other files are pruned so the
+    card survives (Q2=C / panel bridge-core-session, user 2026-09-27).
+    """
+    cutoff = time.time() - o.days * 86400
+    targets = [(PANELS, "panel"), (BRIDGE / "conv", "conv")]
+    removed, pruned, kept = [], [], 0
+    for root, label in targets:
+        for d in sorted(root.glob("*")) if root.is_dir() else []:
+            if not d.is_dir():
+                continue
+            newest = max((f.stat().st_mtime for f in d.rglob("*") if f.is_file()), default=d.stat().st_mtime)
+            if newest < cutoff:
+                agreement = d / "agreement.md"
+                if agreement.is_file():
+                    extras = [f for f in d.rglob("*") if f.is_file() and f.resolve() != agreement.resolve()]
+                    pruned.append(f"{label}/{d.name} (keep agreement.md, drop {len(extras)} files)")
+                    if not o.dry_run:
+                        for f in extras:
+                            f.unlink()
+                        for sub in sorted((x for x in d.rglob("*") if x.is_dir()), reverse=True):
+                            try:
+                                sub.rmdir()
+                            except OSError:
+                                pass
+                else:
+                    removed.append(f"{label}/{d.name}")
+                    if not o.dry_run:
+                        shutil.rmtree(d)
+            else:
+                kept += 1
+    runs = BRIDGE / "runs"
+    old = [f for f in runs.glob("*") if f.is_file() and f.stat().st_mtime < cutoff] if runs.is_dir() else []
+    for f in old:
+        if not o.dry_run:
+            f.unlink()
+    verb = "would remove" if o.dry_run else "removed"
+    pverb = "would prune" if o.dry_run else "pruned"
+    print(f"bridge-panel gc: {verb} {len(removed)} dir(s), {pverb} {len(pruned)} card-bearing dir(s), "
+          f"and {verb} {len(old)} run log file(s) older than {o.days} days; kept {kept} fresh dir(s).")
+    for r in removed:
+        print(f"  {verb}: {r}")
+    for r in pruned:
+        print(f"  {pverb}: {r}")
+    return 0
+
+
+def fix(o) -> int:
+    """Re-run the closing patch stage against panel/<name>/report.md — used when the role prompt changed."""
+    out = PANELS / o.name
+    roles = load_roles()
+    imp = roles.get("implementer")
+    if not (out / "report.md").is_file() or imp is None:
+        print(f"bridge-panel: need panel/{o.name}/report.md and an `implementer` role", file=sys.stderr)
+        return 2
+    if imp["peer"] not in [x.strip() for x in o.peers.split(",")]:
+        print(f"bridge-panel: -p must name the implementer peer ({imp['peer']})", file=sys.stderr)
+        return 2
+    case = (out / "case.md").read_text() if (out / "case.md").is_file() else ""
+    print(f"[panel] patch sketch with {imp['peer']} …", file=sys.stderr)
+    rc, patch = ask(imp["peer"], f"panel-{o.name}-implementer",
+                    fix_prompt(o.name, (out / "report.md").read_text(), case, imp), o,
+                    imp.get("model") or None, imp.get("mode") or "ask")
+    verdict = check_patch(o.dir, patch)
+    (out / "patch.md").write_text(verdict + "\n" + patch + "\n")
+    print(verdict + patch)
+    print(f"\n[panel] patch={out / 'patch.md'}", file=sys.stderr)
+    return rc
+
+
+def synth(o) -> int:
+    """Rebuild the report from panel/<name>/{plan,findings,cross}.json — the shared record survives a failed leader run."""
+    out = PANELS / o.name
+    try:
+        problem = json.loads((out / "plan.json").read_text()).get("questions", [{}])[0].get("question", o.name)
+        findings = json.loads((out / "findings.json").read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"bridge-panel: no saved panel `{o.name}` to synthesise ({e})", file=sys.stderr)
+        return 2
+    cross = json.loads((out / "cross.json").read_text()) if (out / "cross.json").is_file() else {}
+    if o.leader not in [x.strip() for x in o.peers.split(",")]:
+        print(f"bridge-panel: -p must name the leader peer ({o.leader})", file=sys.stderr)
+        return 2
+    cites = verify_citations(o.dir, {**findings, **{f"{r} (cross)": t for r, t in cross.items()}})
+    (out / "citations.json").write_text(json.dumps(cites, ensure_ascii=False, indent=2))
+    cite_md = citation_table(cites)
+    print(f"[panel] re-synthesising `{o.name}` from {len(findings)} saved findings …", file=sys.stderr)
+    rc, report = ask(o.leader, f"panel-{o.name}-leader", synth_prompt(o.name, problem, findings, cross, cite_md), o)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    head = f"# Panel `{o.name}` — re-synthesised {stamp}\n\nLeader: {o.leader} · roles: {', '.join(findings)}\n\n"
+    (out / "report.md").write_text(head + report + ("\n\n" + cite_md if cite_md else "") + "\n")
+    print(head + report)
+    return rc
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="bridge-panel", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("name")
+    r.add_argument("problem")
+    r.add_argument("-p", "--peers", required=True, help="peers the user allows, e.g. claude,cursor (egress control)")
+    r.add_argument("-r", "--roles", help=f"worker roles (default: {','.join(DEFAULT_ROLES)})")
+    r.add_argument("-d", "--dir", default=os.getcwd())
+    r.add_argument("-t", "--timeout", type=int, default=420, help="seconds per peer run (default 420)")
+    r.add_argument("--leader", help="peer family for the leader (default: the leader role's peer)")
+    r.add_argument("--leader-role", default="leader")
+    r.add_argument("--no-cross", action="store_true", help="skip the cross-examination round")
+    r.add_argument("--fix", action="store_true",
+                   help="after the report, ask the `implementer` role for the smallest patch (read-only: a diff sketch, "
+                        "no file is written) → panel/<name>/patch.md")
+    r.add_argument("--hypothesis", action="store_true",
+                   help="let the workers see the leader's first guess (default: blind, so the first pass is independent)")
+    r.add_argument("--parallel", type=int, default=None, choices=range(1, 7),
+                   help="concurrent peer runs, 1–6 (default: every worker role at once — a 4-role panel with the old "
+                        "cap of 3 serialised one role per round, +1.5 min of 6.3 measured on 2026-09-27)")
+    r.add_argument("--detach", action="store_true",
+                   help="fork to the background at once: prints `detached pid=N log=panel/<name>/run.log`; wait with "
+                        "`bridge-wait panel <name>`")
+    r.add_argument("--agreement", help="agreement file from `bridge-plan` — embedded in the case; refused while a TODO remains")
+    r.add_argument("--kind", default="", help="playbook kind for the ledger (default: classified from the problem)")
+    r.add_argument("--allow-single", action="store_true",
+                   help="synthesise even when only one role answered (default: abort with exit 4 below two roles — "
+                        "one voice is not a panel)")
+    sub.add_parser("roles")
+    g = sub.add_parser("gc", help="delete panel output, conversation threads and run logs older than N days")
+    g.add_argument("--days", type=int, default=14)
+    g.add_argument("--dry-run", action="store_true")
+    x = sub.add_parser("fix", help="re-run only the patch sketch from a panel's saved report (1 peer run)")
+    x.add_argument("name")
+    x.add_argument("-p", "--peers", required=True)
+    x.add_argument("-d", "--dir", default=os.getcwd())
+    x.add_argument("-t", "--timeout", type=int, default=420)
+    x.add_argument("--detach", action="store_true")
+    y = sub.add_parser("synth", help="re-run only the synthesis from a panel's saved findings (1 peer run)")
+    y.add_argument("name")
+    y.add_argument("-p", "--peers", required=True)
+    y.add_argument("-d", "--dir", default=os.getcwd())
+    y.add_argument("-t", "--timeout", type=int, default=420)
+    y.add_argument("--leader", default="claude")
+    y.add_argument("--leader-role", default="leader")
+    y.add_argument("--detach", action="store_true")
+    s = sub.add_parser("show")
+    s.add_argument("name")
+    o = ap.parse_args()
+    if o.cmd == "roles":
+        for n, m in load_roles().items():
+            fb = f" (fallback: {m['fallback_peer']})" if m.get("fallback_peer") else ""
+            t = f"t={m['timeout']}s" if m.get("timeout") else "-"
+            print(f"{n:18} {m.get('peer', '?') + fb:24} {m.get('mode', 'ask'):6} {t:7} {m.get('model', '') or '-':24} "
+                  f"{m.get('summary', '')}")
+        return 0
+    if o.cmd == "gc":
+        return gc(o)
+    if o.cmd == "show":
+        f = PANELS / o.name / "report.md"
+        print(f.read_text() if f.is_file() else f"no report at {f}")
+        return 0
+    clear_rc(o.name, report=(o.cmd == "run"))
+    if o.detach:
+        detach(PANELS / o.name / "run.log")
+    if o.cmd == "fix":
+        return guarded_rc(o.name, write_rc, lambda: fix(o))
+    if o.cmd == "synth":
+        return guarded_rc(o.name, write_rc, lambda: synth(o))
+    return guarded_rc(o.name, write_rc, lambda: run(o))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

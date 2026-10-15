@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""bridge-work — let the bridge implement a task in a project by itself: worktree → write → verify → review → report.
+
+    bridge-work run <name> -d <repo> [-p claude[,cursor]] [--base <ref>] [--files <glob>,...] [--verify "<cmd>"]
+                    [--rounds 2] [-t 900] [--implementer claude] [--reviewer cursor|claude] "<task>"
+    bridge-work show <name>            ~/.agent-bridge/work/<name>/report.md
+    bridge-work list                   work items and their state
+
+Pipeline (each peer step is an ordinary `ask-agent` run — background, on the board, visible in `bridge-watch`):
+  0. skill      pick a work-skill pack from task+files+verify (`work-skills/*.md`) unless `--skill none`; inject into prompts
+  1. worktree   `git worktree add <repo>/.claude/worktrees/bridge-<name> -b bridge/<name> <base>` — nothing touches the
+                user's checkout; the branch is the deliverable
+  2. write      implementer peer, `-m write`, prompt = task + agreement + skill addendum
+  3. verify     the verify command runs in the worktree by THIS script (no model) → rc + tail; touched files are checked
+                against --files (a file outside the set is a finding, never silently kept)
+  4. review     reviewer peer, `-m ask`, over `git diff <base>` → table `file:line — finding — severity — must-fix`
+  5. loop       must-fix=yes findings or a red verify go back to the implementer, at most --rounds times
+  6. report     work/<name>/report.md: diff stat · verify output · review table · files vs allowed · how to merge
+Commit, merge and push stay with the user: the branch `bridge/<name>` is left in place, nothing is committed.
+
+Autonomy gate (playbook `implement` = negotiate): the run starts by itself only when --files AND --verify are given
+(or `--agreement` names a completed file); otherwise it writes the agreement card and stops with exit 3.
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bridgelib import grill as grill_plan, ledger, workskills  # noqa: E402
+from bridgelib.core import BRIDGE, HOP_VAR, detach, guarded_rc, lang_rule  # noqa: E402
+
+ASK = BRIDGE / "bin" / "ask-agent"
+WORK = BRIDGE / "work"
+
+
+def git(repo: str | Path, *a: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True)
+
+
+def ask(peer: str, mode: str, cwd: str, prompt: str, timeout: int, conv: str, kind: str) -> tuple[int, str, str]:
+    """One bridged run; returns (rc, answer, bridge/error lines)."""
+    argv = [str(ASK), peer, "-m", mode, "-d", cwd, "-t", str(timeout), "--conv", conv, "--kind", kind]
+    r = subprocess.run(argv, input=prompt, capture_output=True, text=True)
+    answer = "\n".join(ln for ln in r.stdout.splitlines() if not ln.startswith("[bridge]")).strip()
+    notes = "\n".join(ln for ln in r.stderr.splitlines() if ln.startswith("[bridge]"))
+    if r.returncode not in (0, 5) and not answer:
+        answer = f"(run failed rc={r.returncode}) " + (re.search(r"^\[bridge\] error: (.+)$", r.stderr, re.M) or [None, r.stderr[-300:]])[1]
+    return r.returncode, answer, notes
+
+
+FALLBACK_RC = (7, 127, 4)   # out of quota · binary missing · peer disabled: the peer is unavailable, not wrong
+
+
+def ask_with_fallback(peer: str, mode: str, cwd: str, prompt: str, timeout: int, conv: str, kind: str) -> tuple[int, str, str, str]:
+    """Like ask(); when the peer is unavailable the role falls back to claude once (local, no egress). Returns the peer used."""
+    rc, answer, notes = ask(peer, mode, cwd, prompt, timeout, conv, kind)
+    if rc in FALLBACK_RC and peer != "claude":
+        print(f"[work] {peer} unavailable (rc={rc}) — falling back to claude for this step", file=sys.stderr)
+        rc, answer, notes = ask("claude", mode, cwd, prompt, timeout, conv + "-fallback", kind)
+        return rc, answer, notes, "claude"
+    return rc, answer, notes, peer
+
+
+def touched(wt: Path, base: str) -> list[str]:
+    r = git(wt, "diff", "--name-only", base, "--")
+    files = set(r.stdout.split())
+    files |= set(git(wt, "ls-files", "--others", "--exclude-standard").stdout.split())
+    return sorted(files)
+
+
+def outside(files: list[str], allowed: list[str]) -> list[str]:
+    return [f for f in files if allowed and not any(fnmatch.fnmatch(f, g) or f == g or f.startswith(g.rstrip("/") + "/") for g in allowed)]
+
+
+def verify(wt: Path, cmd: str, timeout: int = 600) -> tuple[int, str]:
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, f"verify timed out after {timeout}s"
+    out = (r.stdout + "\n" + r.stderr).strip()
+    tail = "\n".join(out.splitlines()[-25:])
+    return r.returncode, tail
+
+
+def write_prompt(o, allowed: list[str], round_no: int, feedback: str, skill_addendum: str = "") -> str:
+    fb = (f"\n\nRound {round_no}: the previous attempt is already in this worktree. Fix ONLY these points, keep everything else:\n{feedback}"
+          if feedback else "")
+    return (f"You are implementing a task inside a dedicated git worktree (this directory, branch bridge/{o.name}). "
+            f"The task:\n\n{o.task}\n\n"
+            f"Agreement:\n- touch only: {', '.join(allowed) if allowed else '(the files the task names)'}\n"
+            f"- done when this command passes here: `{o.verify}`\n"
+            f"- do not commit, stage, push or tag; do not create files outside the allowed set; no placeholder/stub code; "
+            f"no new dependency unless the task names it\n"
+            f"- keep the diff minimal and idiomatic for this codebase (read the neighbouring code first)\n"
+            f"- nobody answers the board or [[ASK]] during this run: if a task item needs a file outside the allowed set, "
+            f"skip it, say so under OPEN and finish — do not wait\n"
+            f"{skill_addendum}{fb}\n\n"
+            f"Work in small steps: read → edit → run `{o.verify}` → fix until green. Then reply with: FILES CHANGED (list), "
+            f"WHAT CHANGED (3–6 lines), VERIFY (the last 5 lines of the command's output), OPEN (anything you could not "
+            f"do and why). Write the answer in the reply body; do not narrate. {lang_rule(o.task)}")
+
+
+def review_prompt(o, allowed: list[str], diff: str, verify_rc: int, verify_tail: str, bad: list[str],
+                  skill_addendum: str = "") -> str:
+    return (f"Review this diff (branch bridge/{o.name}, produced by another agent for the task below) for correctness, "
+            f"convention and scope. Task:\n\n{o.task}\n\n"
+            f"Agreement: the implementer may touch ONLY {', '.join(allowed)}. A task item that would need any other file is "
+            f"out of the agreement by design — report it as severity=low, must-fix=no, finding prefixed `out-of-agreement:`; "
+            f"never demand a file outside the set.\n\n"
+            f"Verify command `{o.verify}` exit={verify_rc}; last lines:\n{verify_tail}\n"
+            + (f"\nFiles touched OUTSIDE the allowed set (a finding by definition, must-fix=yes): {', '.join(bad)}\n" if bad else "")
+            + skill_addendum
+            + f"\nDiff:\n```diff\n{diff[:60000]}\n```\n\n"
+            "Reply ONLY with a markdown table `file:line | finding | severity (high/medium/low) | must-fix (yes/no) | why`, "
+            "or the single word NONE. must-fix=yes only for defects that make the change wrong, unsafe, or outside the task. "
+            "Write the answer in the reply body; do not narrate. " + lang_rule(o.task))
+
+
+def must_fix(table: str, allowed: list[str], touched_files: list[str]) -> list[str]:
+    """must-fix=yes rows; a row that only asks for a file outside the agreed set is dropped (the agreement wins)."""
+    rows = []
+    for ln in table.splitlines():
+        if not (ln.startswith("|") and re.search(r"\|\s*yes\s*\|", ln, re.I)) or re.search(r"must-fix", ln, re.I):
+            continue
+        cell = ln.strip("| ").split("|")[0].strip().strip("`")
+        file = re.split(r":\d", cell)[0].strip()
+        if allowed and file and file not in touched_files and outside([file], allowed):
+            continue
+        rows.append(ln.strip())
+    return rows
+
+
+def clear_rc(name: str, *, report: bool = False) -> None:
+    d = WORK / name
+    (d / "rc").unlink(missing_ok=True)
+    if report:
+        (d / "report.md").unlink(missing_ok=True)
+
+
+def parse_card_gates(text: str) -> tuple[list[str], str]:
+    """Read `- touch only:` / `- verify command…:` from a session card when CLI flags are absent."""
+    files: list[str] = []
+    verify = ""
+    tm = re.search(r"^- touch only:\s*(.+)$", text, re.M)
+    if tm:
+        raw = tm.group(1).strip().strip("`'\"")
+        if not re.search(r"\bTODO\b", raw):
+            files = [f.strip().strip("`'\"") for f in raw.split(",") if f.strip()]
+    vm = re.search(r"^- verify command[^:]*:\s*(.+)$", text, re.M)
+    if vm:
+        raw = vm.group(1).strip().strip("`'\"")
+        if not re.search(r"\bTODO\b", raw):
+            verify = raw
+    return files, verify
+
+
+def write_rc(name: str, rc: int) -> int:
+    """Durable completion sentinel under work/<name>/rc + last stderr line `rc=N`."""
+    d = WORK / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "rc").write_text(f"{rc}\n")
+    print(f"rc={rc}", file=sys.stderr)
+    return rc
+
+
+def run(o) -> int:
+    if os.environ.get(HOP_VAR):
+        print("bridge-work: refusing inside a bridged run (one hop only)", file=sys.stderr)
+        return 3
+    repo = Path(o.dir).resolve()
+    if git(repo, "rev-parse", "--is-inside-work-tree").returncode != 0:
+        print(f"bridge-work: {repo} is not a git repo", file=sys.stderr)
+        return 2
+    allowed = [f.strip() for f in (o.files or "").split(",") if f.strip()]
+    card_default = WORK / o.name / "agreement.md"
+    if not o.agreement and (not allowed or not o.verify) and card_default.is_file():
+        o.agreement = str(card_default)
+    if o.agreement:
+        af = Path(o.agreement)
+        if not af.is_file():
+            print(f"bridge-work: no agreement file {af}", file=sys.stderr)
+            return 2
+        text = af.read_text()
+        todos = grill_plan.open_field_todos(text)
+        if todos:
+            print(f"bridge-work: agreement {o.agreement} still has {len(todos)} TODO field(s) — fill them first",
+                  file=sys.stderr)
+            for t in todos:
+                print("  " + t[:120], file=sys.stderr)
+            return 3
+        err, warn = grill_plan.gate_before_run(text)
+        if err:
+            print(f"bridge-work: {err}", file=sys.stderr)
+            return 3
+        if warn:
+            print(f"WARNING: {warn}", file=sys.stderr)
+        cf, cv = parse_card_gates(text)
+        if not allowed:
+            allowed = cf
+        if not o.verify:
+            o.verify = cv
+        o.task = o.task + "\n\nAgreement (agreed before this run):\n" + text
+    if not allowed or not o.verify:
+        out = WORK / o.name
+        out.mkdir(parents=True, exist_ok=True)
+        card = out / "agreement.md"
+        if card.is_file():
+            print(f"bridge-work: card {card} still missing a concrete --files/--verify "
+                  f"(or those lines still say TODO). Edit the card, then re-run with "
+                  f"--files/--verify or --agreement {card}", file=sys.stderr)
+            return 3
+        touch = ", ".join(allowed) or "TODO: file globs"
+        verify_ph = o.verify or "TODO: e.g. mvn -o -q test -Dtest=X"
+        hint_skill = None
+        try:
+            hint_skill = workskills.pick(o.task, allowed, o.verify or "", forced=getattr(o, "skill", None))
+        except KeyError:
+            pass
+        hint_line = (
+            f"- suggested skill `{hint_skill['name']}` verify_hint: {hint_skill.get('verify_hint')}\n"
+            if hint_skill and hint_skill.get("verify_hint") else ""
+        )
+        card.write_text(
+            f"# Work agreement `{o.name}` (implement = negotiate)\n\n"
+            f"Task:\n{o.task}\n\n"
+            f"- touch only: {touch}\n"
+            f"- verify command (done when it passes): {verify_ph}\n"
+            f"{hint_line}"
+            f"- out of scope: TODO\n- who merges: the user (branch bridge/{o.name})\n"
+        )
+        print(f"bridge-work: the task needs --files and --verify before it can run by itself "
+              f"(playbook implement = negotiate). Card written: {card} — fill it, then re-run "
+              f"with --files/--verify or --agreement {card}", file=sys.stderr)
+        return 3
+    clear_rc(o.name, report=True)
+
+    try:
+        skill = workskills.pick(o.task, allowed, o.verify or "", forced=getattr(o, "skill", None))
+    except KeyError as exc:
+        print(f"bridge-work: {exc}", file=sys.stderr)
+        return 2
+    impl_add, rev_add = workskills.prompt_addenda(skill)
+    if skill:
+        print(f"[work] skill `{skill['name']}` — {skill.get('summary', '')}", file=sys.stderr)
+    else:
+        print("[work] skill: (none — generic implementer prompt)", file=sys.stderr)
+
+    peers = [p.strip() for p in o.peers.split(",") if p.strip()]
+    implementer = o.implementer or peers[0]
+    reviewer = o.reviewer or (next((p for p in peers if p != implementer), None) or implementer)
+    if implementer not in peers or reviewer not in peers:
+        print(f"bridge-work: -p must include the implementer ({implementer}) and the reviewer ({reviewer}) — it is the egress gate",
+              file=sys.stderr)
+        return 2
+    base = o.base or git(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() or "HEAD"
+    base_sha = git(repo, "rev-parse", base).stdout.strip()
+    wt = repo / ".claude" / "worktrees" / f"bridge-{o.name}"
+    out = WORK / o.name
+    out.mkdir(parents=True, exist_ok=True)
+    if not wt.exists():
+        r = git(repo, "worktree", "add", "-b", f"bridge/{o.name}", str(wt), base_sha)
+        if r.returncode != 0:
+            r = git(repo, "worktree", "add", str(wt), f"bridge/{o.name}")     # branch exists from an earlier round
+            if r.returncode != 0:
+                print(f"bridge-work: worktree failed: {r.stderr.strip()}", file=sys.stderr)
+                return 2
+    print(f"[work] worktree {wt} (branch bridge/{o.name} from {base}@{base_sha[:9]}) — watch: bridge-watch", file=sys.stderr)
+    t0 = time.time()
+    rounds: list[dict] = []
+    feedback = ""
+    final_rc, final_tail, review, bad, diffstat = None, "", "", [], ""
+    review_ok = False
+    review_by = reviewer
+    used: dict[str, set] = {"implementer": set(), "reviewer": set()}
+    for n in range(1, o.rounds + 1):
+        print(f"[work] round {n}/{o.rounds}: {implementer} writes …", file=sys.stderr)
+        rc, answer, notes, impl_used = ask_with_fallback(implementer, "write", str(wt), write_prompt(o, allowed, n, feedback, impl_add),
+                                                         o.timeout, f"work-{o.name}-impl", "implement")
+        used["implementer"].add(implementer if impl_used == implementer else f"{implementer}→{impl_used}")
+        if rc not in (0, 5):
+            print(f"[work] implementer failed: {answer[:200]}", file=sys.stderr)
+            rounds.append({"round": n, "impl_rc": rc, "impl": answer})
+            break
+        files = touched(wt, base_sha)
+        bad = outside(files, allowed)
+        vrc, vtail = verify(wt, o.verify)
+        final_rc, final_tail = vrc, vtail
+        diffstat = git(wt, "diff", "--stat", base_sha, "--").stdout.strip()
+        diff = git(wt, "diff", base_sha, "--").stdout + "".join(
+            f"\n--- new file: {f}\n" + (wt / f).read_text(errors="replace")[:8000] for f in files
+            if (wt / f).is_file() and f not in git(wt, "diff", "--name-only", base_sha, "--").stdout.split())
+        print(f"[work] verify `{o.verify}` → exit {vrc}; files {files}{'; OUTSIDE allowed: ' + str(bad) if bad else ''}", file=sys.stderr)
+        print(f"[work] {reviewer} reviews …", file=sys.stderr)
+        rrc, review, _, rev_used = ask_with_fallback(reviewer, "ask", str(wt), review_prompt(o, allowed, diff, vrc, vtail, bad, rev_add),
+                                                     o.timeout, f"work-{o.name}-review", "review-change")
+        used["reviewer"].add(reviewer if rev_used == reviewer else f"{reviewer}→{rev_used}")
+        review_by = rev_used
+        review_ok = rrc in (0, 5)
+        fixes = must_fix(review, allowed, files) if review_ok else []
+        if not review_ok:
+            print(f"[work] review failed (rc={rrc}) — the result cannot be READY without a review", file=sys.stderr)
+        rounds.append({"round": n, "impl": answer, "files": files, "outside": bad, "verify_rc": vrc, "verify": vtail,
+                       "review_rc": rrc, "review": review, "must_fix": fixes})
+        (out / "rounds.json").write_text(json.dumps(rounds, ensure_ascii=False, indent=2))
+        if vrc == 0 and not fixes and not bad:
+            break                       # review_ok False here still ends the loop: a re-write would not fix a missing review
+        feedback = ((f"- verify command failed (exit {vrc}):\n{vtail}\n" if vrc else "")
+                    + (f"- files outside the allowed set must be reverted or the change moved: {', '.join(bad)}\n" if bad else "")
+                    + ("- reviewer must-fix findings:\n" + "\n".join(fixes) if fixes else ""))
+    ok = final_rc == 0 and review_ok and not bad and not (rounds and rounds[-1].get("must_fix"))
+    verdict = "READY FOR REVIEW" if ok else ("NOT DONE — no review" if final_rc == 0 and not review_ok and not bad else "NOT DONE")
+    who = " · ".join(f"{k}: {', '.join(sorted(v))}" for k, v in used.items() if v) or f"implementer: {implementer} · reviewer: {reviewer}"
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    report = (f"# Work `{o.name}` — {stamp} — {verdict}\n\n"
+              f"Repo: {repo} · base: {base}@{base_sha[:9]} · branch: `bridge/{o.name}` · worktree: `{wt}`\n"
+              f"skill: `{skill['name'] if skill else 'none'}` · {who} (→ = fell back to a local peer) · rounds: {len(rounds)}/{o.rounds} · "
+              f"{round((time.time() - t0) / 60, 1)} min\n\n## Task\n\n{o.task}\n\n"
+              f"## Result\n\n- verify `{o.verify}` → {'not run (implementer failed)' if final_rc is None else f'exit {final_rc}'}\n- files: {', '.join(rounds[-1].get('files', [])) if rounds else '-'}\n"
+              + (f"- **outside the allowed set**: {', '.join(bad)}\n" if bad else "")
+              + f"\n```\n{diffstat or '(no diff)'}\n```\n\n### verify output (tail)\n\n```\n{final_tail}\n```\n\n"
+              f"## Review ({review_by})\n\n{review or '(no review)'}\n\n"
+              + (f"### still must-fix\n\n" + "\n".join(rounds[-1]['must_fix']) + "\n\n" if rounds and rounds[-1].get("must_fix") else "")
+              + f"## Implementer's last note\n\n{rounds[-1].get('impl', '') if rounds else ''}\n\n"
+              f"## How to take it\n\n```bash\ngit -C {repo} diff {base_sha[:9]} bridge/{o.name}      # read the whole change\n"
+              f"git -C {wt} status                                      # nothing is committed; the worktree holds it\n"
+              f"# merge / cherry-pick / commit is yours — the bridge never commits\n"
+              f"git -C {repo} worktree remove {wt} --force && git -C {repo} branch -D bridge/{o.name}   # to discard\n```\n")
+    (out / "report.md").write_text(report)
+    try:
+        ledger.record({"type": "work", "name": o.name, "kind": "implement", "skill": skill["name"] if skill else None,
+                       "peers": o.peers, "implementer": implementer,
+                       "reviewer": reviewer, "used": {k: sorted(v) for k, v in used.items()}, "review_ok": review_ok,
+                       "rounds": len(rounds), "verify_rc": final_rc, "ok": ok,
+                       "outside": bad, "duration_s": round(time.time() - t0)})
+    except Exception:  # noqa: BLE001
+        pass
+    print(report)
+    print(f"\n[work] report={out / 'report.md'} worktree={wt}", file=sys.stderr)
+    return 0 if ok else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="bridge-work", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("name")
+    r.add_argument("task")
+    r.add_argument("-d", "--dir", default=os.getcwd(), help="repo root (the worktree is created under it)")
+    r.add_argument("--detach", action="store_true",
+                   help="fork to the background at once: prints `detached pid=N log=work/<name>/run.log`; wait with "
+                        "`bridge-work`'s sibling `bridge-wait work <name>`")
+    r.add_argument("-p", "--peers", default="claude", help="peers allowed to see the repo (egress gate), e.g. claude,cursor")
+    r.add_argument("--implementer", help="peer that writes (default: first of -p)")
+    r.add_argument("--reviewer", help="peer that reviews (default: the other peer in -p, else the implementer in a fresh session)")
+    r.add_argument("--base", help="ref to branch from (default: current HEAD)")
+    r.add_argument("--files", help="comma-separated globs the implementer may touch (autonomy gate)")
+    r.add_argument("--verify", help="command that must pass in the worktree (autonomy gate)")
+    r.add_argument("--agreement", help="completed agreement file (from bridge-plan) appended to the task")
+    r.add_argument("--rounds", type=int, default=2, help="max write→verify→review rounds (default 2)")
+    r.add_argument("-t", "--timeout", type=int, default=900, help="seconds per peer run (default 900)")
+    r.add_argument("--skill", help="force a work-skill name, or 'none' to disable auto-pick (see `bridge-work skills`)")
+    s = sub.add_parser("show")
+    s.add_argument("name")
+    sub.add_parser("list")
+    sub.add_parser("skills", help="list work-skill packs under ~/.agent-bridge/work-skills/")
+    o = ap.parse_args()
+    if o.cmd == "show":
+        f = WORK / o.name / "report.md"
+        print(f.read_text() if f.is_file() else f"no report at {f}")
+        return 0
+    if o.cmd == "list":
+        for d in sorted(WORK.iterdir()) if WORK.is_dir() else []:
+            head = (d / "report.md").read_text().splitlines()[0] if (d / "report.md").is_file() else "(no report)"
+            print(f"{d.name:24} {head[:100]}")
+        return 0
+    if o.cmd == "skills":
+        for name, s in workskills.load_skills().items():
+            print(f"{name:18} {s.get('summary', '')}")
+            if s.get("verify_hint"):
+                print(f"{'':18} verify_hint: {s['verify_hint']}")
+        return 0
+    clear_rc(o.name)
+    if o.detach:
+        detach(WORK / o.name / "run.log")
+    return guarded_rc(o.name, write_rc, lambda: run(o))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

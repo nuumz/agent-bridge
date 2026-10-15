@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# thin wrapper — see ask-agent --help
+exec "$(dirname "$(readlink -f "$0")")/ask-agent" cursor "$@"

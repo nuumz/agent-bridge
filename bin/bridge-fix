@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""bridge-fix — analyze → decision → fix, as one resumable flow with the decision left to a human.
+
+    bridge-fix run <name> -d <repo> -p claude[,cursor,copilot] [-r roles] [--files <globs>] [--verify "<cmd>"]
+                  [--rounds 2] [-t 420] "<problem: symptom · expected vs actual · files involved>"
+    bridge-fix decide <name> (--answer "1=B" ... | --go) [--files <globs>] [--verify "<cmd>"] [--note "..."] [--no-fix]
+    bridge-fix status <name> | show <name> | list
+
+Stages (state in ~/.agent-bridge/work/<name>/flow.json — re-running `run` resumes at the current stage):
+  analyze   `bridge-panel run fix-<name> --fix` — roles read the files, cross-examine over machine-checked citations,
+            the leader writes ranked root causes + a `Decisions for the user` table + a patch sketch (`git apply --check`)
+  decide    the script turns that table into work/<name>/agreement.md (question · options · recommendation · if undecided)
+            plus the proposed file set (from the patch sketch) and verify command — then STOPS (exit 3). Nothing continues
+            until a human runs `bridge-fix decide` (an explicit ruling, or `--go` = "take every recommendation"). A peer
+            never decides; the script never picks a default.
+  fix       `bridge-work run fix-<name>` with the ruling inlined — worktree, implementer, real verify, reviewer, fix loop, report.
+            Commit / merge stay with the user.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bridgelib import grill as grill_plan, ledger  # noqa: E402
+from bridgelib.core import BRIDGE, HOP_VAR, detach, guarded_rc  # noqa: E402
+
+BIN = BRIDGE / "bin"
+WORK = BRIDGE / "work"
+PANELS = BRIDGE / "panel"
+DEFAULT_ROLES = "as-built-realist,spec-reader,design-critic"     # playbook defect-root-cause
+
+
+def flow_path(name: str) -> Path:
+    return WORK / name / "flow.json"
+
+
+def load(name: str) -> dict | None:
+    f = flow_path(name)
+    return json.loads(f.read_text()) if f.is_file() else None
+
+
+def save(fl: dict) -> None:
+    flow_path(fl["name"]).parent.mkdir(parents=True, exist_ok=True)
+    fl["updated"] = time.strftime("%Y-%m-%d %H:%M")
+    flow_path(fl["name"]).write_text(json.dumps(fl, ensure_ascii=False, indent=2))
+
+
+def section(md: str, heading: str) -> str:
+    """Body of the `## <heading>` section (first match, case-insensitive prefix)."""
+    m = re.search(rf"^## {re.escape(heading)}[^\n]*\n(.*?)(?=^## |\Z)", md, re.S | re.M | re.I)
+    return m.group(1).strip() if m else ""
+
+
+def table_rows(md: str) -> list[list[str]]:
+    rows = []
+    for ln in md.splitlines():
+        if ln.startswith("|") and not re.match(r"^\|\s*-", ln):
+            cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+            rows.append(cells)
+    return rows[1:] if rows else []          # drop the header row
+
+
+def patch_files(patch_md: str) -> list[str]:
+    files = re.findall(r"^\+\+\+ b/(\S+)", patch_md, re.M) + re.findall(r"^diff --git a/(\S+)", patch_md, re.M)
+    return sorted(set(files))
+
+
+def clear_fix_rc(name: str) -> None:
+    d = WORK / name
+    (d / "fix.rc").unlink(missing_ok=True)
+
+
+def write_fix_rc(name: str, rc: int) -> int:
+    """Done signal for peer-fix — `work/<name>/fix.rc` (not `rc`, which belongs to bridge-work)."""
+    d = WORK / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "fix.rc").write_text(f"{rc}\n")
+    print(f"rc={rc}", file=sys.stderr)
+    return rc
+
+
+
+def stream_filtered(argv: list[str], prefixes: tuple[str, ...]) -> int:
+    """Run a child bridge tool; echo matching stderr lines live; terminate child if we are interrupted."""
+    p = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, bufsize=1)
+    try:
+        assert p.stderr is not None
+        for ln in p.stderr:
+            if ln.startswith(prefixes):
+                print("  " + ln.rstrip()[:200], file=sys.stderr, flush=True)
+        return p.wait()
+    except BaseException:
+        p.terminate()
+        try:
+            p.wait(timeout=30)
+        except Exception:  # noqa: BLE001
+            p.kill()
+        raise
+
+
+# ---------------------------------------------------------------- analyze
+
+def analyze(fl: dict, o) -> int:
+    panel = f"fix-{fl['name']}"
+    problem = (f"{fl['problem']}\n\nThis panel feeds an analyze → decision → fix flow: the `Decisions for the user` table "
+               f"must list every choice a human has to make before a fix is written (question · options · recommendation · "
+               f"if undecided · block?), and `Next actions` must name the files to change and the command that proves the fix.")
+    argv = [str(BIN / "bridge-panel"), "run", panel, "-p", fl["peers"], "-r", fl["roles"], "-d", fl["repo"], "-t", str(o.timeout),
+            "--kind", "defect-root-cause", "--fix", problem]
+    print(f"[fix] analyze: bridge-panel run {panel} (roles {fl['roles']} on {fl['peers']}) — watch: bridge-watch", file=sys.stderr)
+    rc = stream_filtered(argv, ("[panel]", "[bridge] error"))
+    report = PANELS / panel / "report.md"
+    if rc != 0 or not report.is_file():
+        print(f"[fix] analyze failed (panel rc={rc}); status: {PANELS / panel / 'status.json'}", file=sys.stderr)
+        return 1
+    fl.update({"stage": "decide", "panel": panel, "report": str(report),
+               "patch": str(PANELS / panel / "patch.md") if (PANELS / panel / "patch.md").is_file() else None})
+    save(fl)
+    return 0
+
+
+# ---------------------------------------------------------------- decide
+
+def write_agreement(fl: dict) -> Path:
+    report = Path(fl["report"]).read_text()
+    patch = Path(fl["patch"]).read_text() if fl.get("patch") else ""
+    root = section(report, "Root cause")
+    decisions = section(report, "Decisions for the user")
+    actions = section(report, "Next actions")
+    rows = table_rows(decisions)
+    proposed = fl.get("files") or ",".join(patch_files(patch))
+    verify = fl.get("verify") or "TODO: the command that fails now and must pass after the fix"
+    patch_verdict = patch.splitlines()[0] if patch else "(no patch sketch)"
+    q_lines = "".join(f"- {i + 1}. {r[0][:160]} → **TODO** (options: {r[1][:200]}; panel recommends: {r[2][:120] if len(r) > 2 else '-'})\n"
+                      for i, r in enumerate(rows)) or "- (the panel listed no decision — `--go` confirms its recommendation)\n"
+    books = ledger.load_playbooks()
+    book = books.get("analyze-decide-fix") or {
+        "name": "analyze-decide-fix", "grill": "recommend", "form": "fix-flow",
+    }
+    gplan = grill_plan.recommend(book, [], fl.get("problem") or "", "negotiate")
+    text = f"""# Fix agreement `{fl['name']}` — analyze → decision → fix
+
+Problem:
+{fl['problem'].strip()}
+
+Panel `{fl['panel']}` ({fl['peers']}; report: {fl['report']}). {patch_verdict}
+
+## Root cause (panel, ranked — a lead until you open the file:line it cites)
+{root or '(none written)'}
+
+## Decisions for the user
+{decisions or '(none)'}
+
+## Next actions (panel)
+{actions or '(none)'}
+
+{grill_plan.card_section(gplan)}
+## Ruling — filled by a human, never by a peer or this script
+{q_lines}- files the fix may touch: {proposed or 'TODO: globs'}
+- verify command (must fail now, pass after): {verify}
+- note: -
+"""
+    home = WORK / fl["name"]
+    home.mkdir(parents=True, exist_ok=True)
+    f = home / "agreement.md"
+    f.write_text(text)
+    fl["agreement"] = str(f)
+    fl["questions"] = [r[0] for r in rows]
+    fl["proposed_files"] = proposed
+    save(fl)
+    return f
+
+
+def decide_card(fl: dict) -> None:
+    f = fl["agreement"]
+    print(f"\n[fix] DECISION NEEDED — the flow stops here until a human rules.\n"
+          f"  report:    {fl['report']}\n  agreement: {f}\n"
+          f"  questions: {len(fl.get('questions', []))} (see the Ruling section)\n"
+          f"  proposed:  files={fl.get('proposed_files') or 'TODO'}  verify={fl.get('verify') or 'TODO'}\n\n"
+          f"  bridge-fix decide {fl['name']} --answer '1=<option>' [--answer '2=…'] --files '<globs>' --verify '<cmd>'\n"
+          f"  bridge-fix decide {fl['name']} --go --files … --verify …      # take every recommendation as given\n",
+          file=sys.stderr)
+
+
+def decide(o) -> int:
+    fl = load(o.name)
+    if not fl:
+        print(f"bridge-fix: no flow named {o.name}", file=sys.stderr)
+        return 2
+    if fl["stage"] not in ("decide", "fix"):
+        print(f"bridge-fix: {o.name} is at stage {fl['stage']}, not waiting for a decision", file=sys.stderr)
+        return 2
+    if not o.go and not o.answer:
+        print("bridge-fix decide: give --answer 'N=<choice>' per question or --go", file=sys.stderr)
+        return 2
+    f = Path(fl["agreement"])
+    text = f.read_text()
+    answers: dict[int, str] = {}
+    for a in o.answer or []:
+        m = re.match(r"^\s*(\d+)\s*=\s*(.+)$", a)
+        if not m:
+            print(f"bridge-fix decide: --answer must look like '1=B', got {a!r}", file=sys.stderr)
+            return 2
+        answers[int(m.group(1))] = m.group(2).strip()
+    n_q = len(fl.get("questions", []))
+    for i in range(1, n_q + 1):
+        if i not in answers and not o.go:
+            print(f"bridge-fix decide: question {i} has no --answer (use --go to take the recommendations)", file=sys.stderr)
+            return 2
+    lines = text.splitlines()
+    for idx, ln in enumerate(lines):
+        m = re.match(r"^- (\d+)\. (.*) → \*\*TODO\*\*(.*)$", ln)
+        if m:
+            i = int(m.group(1))
+            ruling = answers.get(i) or "GO — the panel's recommendation as written"
+            lines[idx] = f"- {i}. {m.group(2)} → **{ruling}**{m.group(3)}"
+    files = o.files or fl.get("proposed_files") or ""
+    verify = o.verify or fl.get("verify") or ""
+    if not files or not verify or "TODO" in files or "TODO" in verify:
+        print(f"bridge-fix decide: the fix needs a file set and a verify command — pass --files and --verify "
+              f"(proposed files: {fl.get('proposed_files') or 'none'})", file=sys.stderr)
+        return 2
+    for idx, ln in enumerate(lines):
+        if ln.startswith("- files the fix may touch:"):
+            lines[idx] = f"- files the fix may touch: {files}"
+        elif ln.startswith("- verify command"):
+            lines[idx] = f"- verify command (must fail now, pass after): {verify}"
+        elif ln.startswith("- note:") and o.note:
+            lines[idx] = f"- note: {o.note}"
+    text = "\n".join(lines) + "\n"
+    ruling = text.split("## Ruling", 1)[-1] if "## Ruling" in text else text
+    todos = grill_plan.open_field_todos(ruling)
+    err, warn = grill_plan.gate_before_run(text)
+    if warn:
+        print(f"WARNING: {warn}", file=sys.stderr)
+    if err:
+        print(f"bridge-fix decide: {err} — edit the Grill plan on the agreement, then re-run decide",
+              file=sys.stderr)
+        f.write_text(text)
+        return 2
+    if todos:
+        print("bridge-fix decide: a TODO survived in the Ruling section — edit the agreement, then re-run decide",
+              file=sys.stderr)
+        for t in todos:
+            print("  " + t[:120], file=sys.stderr)
+        f.write_text(text)
+        return 2
+    f.write_text(text)
+    fl.update({"stage": "fix", "files": files, "verify": verify, "ruling": answers or "GO", "decided_at": time.strftime("%Y-%m-%d %H:%M"),
+               "decided_by": os.environ.get("USER", "user")})
+    save(fl)
+    print(f"[fix] ruling recorded in {f}", file=sys.stderr)
+    if o.no_fix:
+        return 0
+    return fix(fl, o)
+
+
+# ---------------------------------------------------------------- fix
+
+def fix(fl: dict, o) -> int:
+    agreement = Path(fl["agreement"]).read_text()
+    patch = Path(fl["patch"]).read_text() if fl.get("patch") else ""
+    sketch = ""
+    if patch and "accepts this diff" in patch.splitlines()[0]:
+        sketch = "\n\nPatch sketch from the analysis (accepted by `git apply --check` at analysis time — use it as guidance, re-read the files first):\n" + patch[:12000]
+    task = (f"Fix the defect below exactly as ruled in the agreement (Ruling section = what the human chose; the panel's "
+            f"recommendation is NOT the ruling where they differ).\n\nProblem:\n{fl['problem']}\n\n{agreement}{sketch}")
+    argv = [str(BIN / "bridge-work"), "run", f"fix-{fl['name']}", "-d", fl["repo"], "-p", fl["peers"], "--files", fl["files"],
+            "--verify", fl["verify"], "--rounds", str(getattr(o, "rounds", 2) or 2), "-t", str(max(getattr(o, "timeout", 420) or 420, 600)), task]
+    print(f"[fix] fix: bridge-work run fix-{fl['name']} (files {fl['files']}; verify `{fl['verify']}`)", file=sys.stderr)
+    rc = stream_filtered(argv, ("[work]",))
+    report = WORK / f"fix-{fl['name']}" / "report.md"
+    fl.update({"stage": "done" if rc == 0 else "fix", "work_rc": rc,
+               "work_report": str(report) if report.is_file() else None})
+    save(fl)
+    try:
+        ledger.record({"type": "fix", "name": fl["name"], "kind": "analyze-decide-fix", "peers": fl["peers"], "panel": fl["panel"],
+                       "questions": len(fl.get("questions", [])), "ruling": fl.get("ruling"), "work_rc": rc,
+                       "ok": rc == 0})
+    except Exception:  # noqa: BLE001
+        pass
+    if report.is_file():
+        print(report.read_text())
+    print(f"\n[fix] {'DONE — branch bridge/fix-' + fl['name'] + ' waits for your review and commit' if rc == 0 else 'fix NOT DONE (rc=' + str(rc) + ') — read the work report, rule again or adjust --files/--verify, then `bridge-fix run` resumes at fix'}",
+          file=sys.stderr)
+    return 0 if rc == 0 else 1
+
+
+# ---------------------------------------------------------------- run / status
+
+def run(o) -> int:
+    if os.environ.get(HOP_VAR):
+        print("bridge-fix: refusing inside a bridged run (one hop only)", file=sys.stderr)
+        return 3
+    fl = load(o.name)
+    if fl is None:
+        if not o.problem:
+            print("bridge-fix run: a new flow needs the problem text", file=sys.stderr)
+            return 2
+        repo = str(Path(o.dir).resolve())
+        if subprocess.run(["git", "-C", repo, "rev-parse", "--is-inside-work-tree"], capture_output=True).returncode != 0:
+            print(f"bridge-fix: {repo} is not a git repo", file=sys.stderr)
+            return 2
+        fl = {"name": o.name, "stage": "analyze", "problem": o.problem, "repo": repo, "peers": o.peers,
+              "roles": o.roles or DEFAULT_ROLES, "files": o.files or "", "verify": o.verify or "",
+              "created": time.strftime("%Y-%m-%d %H:%M")}
+        save(fl)
+    else:
+        print(f"[fix] resuming {o.name} at stage {fl['stage']}", file=sys.stderr)
+    if fl["stage"] == "analyze":
+        if analyze(fl, o) != 0:
+            return 1
+    if fl["stage"] == "decide":
+        if not fl.get("agreement"):
+            write_agreement(fl)
+        decide_card(fl)
+        return 3
+    if fl["stage"] == "fix":
+        return fix(fl, o)
+    print(f"[fix] {o.name} is done — work report: {fl.get('work_report')}", file=sys.stderr)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="bridge-fix", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run")
+    r.add_argument("name")
+    r.add_argument("problem", nargs="?")
+    r.add_argument("-d", "--dir", default=os.getcwd())
+    r.add_argument("-p", "--peers", default="claude", help="peers allowed to see the repo (egress gate)")
+    r.add_argument("-r", "--roles", help=f"panel roles for analyze (default {DEFAULT_ROLES}; roles on a peer not in -p are skipped)")
+    r.add_argument("--files", help="file globs the fix may touch (else proposed from the patch sketch, confirmed at decide)")
+    r.add_argument("--verify", help="command that fails now and must pass after the fix (else asked at decide)")
+    r.add_argument("--rounds", type=int, default=2)
+    r.add_argument("-t", "--timeout", type=int, default=420, help="seconds per peer run in the panel (default 420)")
+    r.add_argument("--detach", action="store_true",
+                   help="fork to the background at once: prints `detached pid=N log=work/<name>/fix.log`; wait with "
+                        "`bridge-wait fix <name>`")
+    d = sub.add_parser("decide")
+    d.add_argument("name")
+    d.add_argument("--answer", action="append", help="'N=<chosen option or text>' per question in the Ruling section")
+    d.add_argument("--go", action="store_true", help="take every panel recommendation as the ruling (still a human act)")
+    d.add_argument("--files")
+    d.add_argument("--verify")
+    d.add_argument("--note")
+    d.add_argument("--no-fix", action="store_true", help="record the ruling only; `bridge-fix run <name>` starts the fix later")
+    d.add_argument("--rounds", type=int, default=2)
+    d.add_argument("-t", "--timeout", type=int, default=600)
+    d.add_argument("--detach", action="store_true")
+    for c in ("status", "show"):
+        s = sub.add_parser(c)
+        s.add_argument("name")
+    sub.add_parser("list")
+    o = ap.parse_args()
+    if o.cmd in ("run", "decide"):
+        clear_fix_rc(o.name)
+        if o.detach:
+            detach(WORK / o.name / "fix.log")
+        return guarded_rc(o.name, write_fix_rc,
+                          (lambda: run(o)) if o.cmd == "run" else (lambda: decide(o)))
+    if o.cmd == "list":
+        for f in sorted(WORK.glob("*/flow.json")):
+            fl = json.loads(f.read_text())
+            print(f"{fl['name']:24} {fl['stage']:8} {fl.get('updated', '')}  {fl['problem'][:70]}")
+        return 0
+    fl = load(o.name)
+    if not fl:
+        print(f"no flow named {o.name}", file=sys.stderr)
+        return 2
+    if o.cmd == "status":
+        print(json.dumps(fl, ensure_ascii=False, indent=2))
+        return 0
+    for key in ("agreement", "work_report"):
+        if fl.get(key) and Path(fl[key]).is_file():
+            print(f"\n===== {fl[key]}\n" + Path(fl[key]).read_text())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

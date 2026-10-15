@@ -1,0 +1,2 @@
+# scripts must stay LF on checkout — the global core.autocrlf=true would write CRLF shebangs that macOS cannot exec
+* text=auto eol=lf

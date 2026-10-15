@@ -1,0 +1,446 @@
+"""One adapter per peer CLI: common options → that tool's flags, and its output → Parsed."""
+from __future__ import annotations
+
+import argparse
+import atexit
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from .core import (BOARD_TOOLS, BRIDGE, BRIDGE_CMDS, CLAUDE_READ_ONLY_BASH, CLAUDE_WRITE_BASH, DISABLED, GIT_DENY, HOME,
+                   find_bin, last_json, sum_keys)
+
+class Parsed:
+    def __init__(self, result: str, session: str | None = None, tok_in: Any = "?", tok_out: Any = "?",
+                 is_error: bool = False, extra: str = ""):
+        self.result, self.session, self.tok_in, self.tok_out, self.is_error, self.extra = (
+            result, session, tok_in, tok_out, is_error, extra)
+
+
+class Adapter:
+    name = ""
+    binary = ""
+    skip_bin_substr: tuple[str, ...] = ()
+    supports_worktree = False
+    supports_deny = False
+    recovery = False          # narration-only detection + auto --resume (Cursor)
+    rules_mirror = ""         # where bridge-sync mirrors ~/.claude/CLAUDE.md for this peer
+
+    def resolve(self) -> str | None:
+        return find_bin(self.binary, self.skip_bin_substr)
+
+    def auth_hint(self) -> str:
+        return ""
+
+    def argv(self, o: argparse.Namespace, prompt: str) -> list[str]:
+        raise NotImplementedError
+
+    def resume_argv(self, o: argparse.Namespace, session: str, prompt: str) -> list[str]:
+        raise NotImplementedError
+
+    def parse(self, raw: str) -> Parsed:
+        raise NotImplementedError
+
+    def prepare(self, o: argparse.Namespace, dry: bool) -> list[str]:
+        """Make the machine-wide rules reachable for this run; returns notes for the [bridge] line."""
+        return []
+
+    def preamble(self, o: argparse.Namespace) -> str:
+        """Text prepended to the prompt when a rules file cannot be injected (e.g. fresh worktree)."""
+        return ""
+
+    def finish(self, o: argparse.Namespace) -> None:
+        """Undo anything prepare() set up for the run; idempotent, also runs on timeout/signal via atexit."""
+
+
+class Claude(Adapter):
+    name, binary = "claude", "claude"
+    supports_worktree = True
+    supports_deny = True
+    rules_mirror = "~/.claude/CLAUDE.md (source of truth)"
+
+    def _base(self, o: argparse.Namespace) -> list[str]:
+        deny = [f"Bash({c}:*)" for c in GIT_DENY] + [f"Bash({c}:*)" for c in BRIDGE_CMDS] + list(o.deny)
+        if o.board:
+            # plan mode blocks every MCP tool (verified 2026-09-12): read-only runs use default mode + explicit edit denies
+            mode = {"ask": "default", "plan": "default", "write": "acceptEdits"}[o.mode]
+            if o.mode != "write":
+                deny += ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+        else:
+            mode = {"ask": "plan", "plan": "plan", "write": "acceptEdits"}[o.mode]
+        # stream-json (+ --verbose, which print mode requires for it): one line per turn while the run is alive, so
+        # `bridge-watch` can show what the peer is doing; the final `result` line carries the same fields as the
+        # plain json format, so parse() is unchanged (user request 2026-09-26: see each agent while it works)
+        a = ["-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode,
+             "--disallowed-tools", ",".join(deny)]
+        allowed = [BOARD_TOOLS] if o.board else []
+        # write mode also pre-approves the build/test runners: headless claude denies any non-allowlisted Bash and a
+        # denied `mvn test` turns an implement run into 30 turns of guessing (measured 2026-09-26)
+        allowed += [f"Bash({c}:*)" for c in (CLAUDE_WRITE_BASH if o.mode == "write" else CLAUDE_READ_ONLY_BASH)]
+        if allowed:
+            a += ["--allowed-tools", ",".join(allowed)]
+        if o.model:
+            a += ["--model", o.model]
+        for d in o.add_dir:
+            a += ["--add-dir", d]
+        if o.worktree is not None:
+            a += ["--worktree"] + ([o.worktree] if o.worktree != "auto" else [])
+        return a
+
+    def argv(self, o, prompt):
+        a = self._base(o)
+        if o.session:
+            a += ["--resume", o.session]
+        elif o.cont:
+            a += ["--continue"]
+        return a + ["--", prompt]
+
+    def resume_argv(self, o, session, prompt):
+        return self._base(o) + ["--resume", session, "--", prompt]
+
+    def preamble(self, o):
+        if o.mode == "write":
+            return ("(Headless write run: file edits are auto-approved; git commit/push/tag are denied and a denied command "
+                    "cannot be approved, so use ONE simple command per Bash call — no `for` loops, no `VAR=…;` prefixes, "
+                    "no `&&` chains. Pre-approved: the read-only set (rg, git log/show/diff, cat/sed -n, find, ls) plus build/"
+                    "test runners (mvn, gradle, bun, npm test/run, npx, tsc, pytest, python -m pytest, ruff, go, cargo, make) "
+                    "and git add/restore. Touch only the files the task names; leave everything uncommitted.)\n\n")
+        return ("(Headless read-only run: a denied command cannot be approved, so use ONE simple command per Bash call — "
+                "no `for` loops, no `VAR=…;` prefixes, no `&&` chains, no python heredocs. Pre-approved: rg, git "
+                "log/show/grep/diff/blame, cat/head/tail/sed -n, find, ls, wc, unzip -l/-p, javap, rtk read. Builds (mvn), "
+                "scripts (python3) and file writes are not — do not attempt them; say what you could not check instead.)\n\n")
+
+    def parse(self, raw):
+        obj = last_json(raw)
+        if obj is None:
+            return Parsed(raw)
+        u = obj.get("usage") or {}
+        # turns × the context each turn re-sends, and what the run newly pulled into context (cache_write), drive cost
+        return Parsed(str(obj.get("result", raw)), obj.get("session_id"), u.get("input_tokens", "?"),
+                      u.get("output_tokens", "?"), bool(obj.get("is_error")),
+                      f"cost={obj.get('total_cost_usd', '?')} turns={obj.get('num_turns', '?')} "
+                      f"cache_write={u.get('cache_creation_input_tokens', '?')}")
+
+
+class Cursor(Adapter):
+    DEFAULT_MODEL = "auto"          # cursor-agent --list-models: "auto - Auto (default)"; -M overrides per run
+    name, binary = "cursor", "cursor-agent"
+    supports_worktree = True
+    recovery = True
+    rules_mirror = "~/.cursor/rules/10-user-preferences.mdc"
+
+    def auth_hint(self):
+        try:
+            cfg = json.loads((HOME / ".cursor/cli-config.json").read_text())
+            email = (cfg.get("authInfo") or {}).get("email")
+            model = (cfg.get("model") or {}).get("modelId", "default")
+            deny = (cfg.get("permissions") or {}).get("deny") or []
+            return f"login={email or 'NONE'} model={self.DEFAULT_MODEL} (app pick: {model}) deny={','.join(deny) or 'NONE'}"
+        except Exception:  # noqa: BLE001
+            return "no ~/.cursor/cli-config.json"
+
+    # cursor-agent reads <repo>/.cursor/rules/*.mdc and AGENTS.md but NOT ~/.cursor/rules (verified 2026-09-12),
+    # so the machine-wide mirror is linked into the workspace before each run and kept out of git via info/exclude.
+    RULE_FILES = ("00-agent-bridge.mdc", "10-user-preferences.mdc")
+
+    # User ruling 2026-09-12: Cursor runs in its DEFAULT agent mode (not --mode ask) on the latest Grok. Headless default
+    # mode creates files without --force (--force only gates shell), and only the GLOBAL ~/.cursor/cli-config.json deny
+    # list is honoured (a project .cursor/cli.json is ignored) — verified on the real CLI. So a read-only run holds a
+    # temporary deny set there: flock + pid refcount in cursor-deny.json, restored byte-identical when the last live
+    # holder leaves; a `-m write` run refuses to start while the deny is held (its edits would be silently blocked).
+    #
+    # User 2026-10-13 (option A): do NOT deny Shell(*). That blocked git log/diff/blame and burned 50–140 tool calls
+    # per ask run. Allowlist cannot override Shell(*) (verified 2026-09-12). Keep Write(**) + denials for the known
+    # Write bypass (printf > file) and common filesystem mutators. Residual: unrestricted shell can still write via
+    # python/node/redirection — ask preamble tells the peer to use read-only shell only.
+    DENY_ENTRIES = (
+        "Write(**)",
+        "Shell(printf)", "Shell(printf *)",
+        "Shell(tee)", "Shell(tee *)",
+        "Shell(cp)", "Shell(cp *)",
+        "Shell(mv)", "Shell(mv *)",
+        "Shell(rm)", "Shell(rm *)",
+        "Shell(rmdir)", "Shell(rmdir *)",
+        "Shell(touch)", "Shell(touch *)",
+        "Shell(mkdir)", "Shell(mkdir *)",
+        "Shell(chmod)", "Shell(chmod *)",
+        "Shell(chown)", "Shell(chown *)",
+        "Shell(ln)", "Shell(ln *)",
+        "Shell(install)", "Shell(install *)",
+        "Shell(dd)", "Shell(dd *)",
+        "Shell(truncate)", "Shell(truncate *)",
+    )
+    DENY_STATE = HOME / ".agent-bridge" / "cursor-deny.json"
+    DENY_LOCK = HOME / ".agent-bridge" / "cursor-deny.lock"
+    CLI_CONFIG = HOME / ".cursor" / "cli-config.json"
+    _LEGACY_SHELL_STAR = "Shell(*)"
+    _held = False
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def _deny_state(self, fn: Callable[[dict], Any]) -> Any:
+        """Run fn(state) under the lock; sweeps dead holders first and restores the config if they were the last."""
+        self.DENY_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.DENY_LOCK, "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            state = {"pids": [], "added": False, "orig": ""}
+            if self.DENY_STATE.is_file():
+                try:
+                    state.update(json.loads(self.DENY_STATE.read_text()))
+                except json.JSONDecodeError:
+                    pass
+            state["pids"] = [q for q in state["pids"] if self._alive(q)]
+            if not state["pids"] and state["added"]:          # holders died without cleanup — put the user's file back
+                self._deny_restore(state)
+            result = fn(state)
+            self.DENY_STATE.write_text(json.dumps(state))
+            return result
+
+    def _deny_acquire(self) -> str:
+        def fn(state):
+            if not state["pids"]:
+                text = self.CLI_CONFIG.read_text() if self.CLI_CONFIG.is_file() else "{}"
+                cfg = json.loads(text or "{}")
+                deny = cfg.setdefault("permissions", {}).setdefault("deny", [])
+                # Drop leftover Shell(*) from pre-2026-10-13 holds so read-only shell works; do not put it back on restore.
+                if self._LEGACY_SHELL_STAR in deny:
+                    deny[:] = [e for e in deny if e != self._LEGACY_SHELL_STAR]
+                    text = json.dumps(cfg, indent=2) + "\n"
+                    self.CLI_CONFIG.write_text(text)
+                missing = [e for e in self.DENY_ENTRIES if e not in deny]
+                if missing:                                     # never rewrite a file that already denies these
+                    deny.extend(missing)
+                    written = json.dumps(cfg, indent=2) + "\n"
+                    self.CLI_CONFIG.write_text(written)
+                    state.update(added=True, orig=text, written=written, entries=missing)
+            if os.getpid() not in state["pids"]:
+                state["pids"].append(os.getpid())
+            return (f"cursor: default agent mode, `Write(**)` + write-capable Shell denials held "
+                    f"(Shell(*) not denied — git/rg/cat ok; holders: {state['pids']})")
+        note = self._deny_state(fn)
+        if not self._held:
+            self._held = True
+            atexit.register(self.finish, None)
+        return note
+
+    def _deny_holders(self) -> list[int]:
+        return self._deny_state(lambda state: list(state["pids"]))
+
+    def finish(self, o):
+        if not self._held:
+            return
+        self._held = False
+
+        def fn(state):
+            state["pids"] = [q for q in state["pids"] if q != os.getpid()]
+            if not state["pids"] and state["added"]:
+                self._deny_restore(state)
+        self._deny_state(fn)
+
+    def _deny_restore(self, state: dict) -> None:
+        """Last holder out: byte-identical restore when nobody else touched the file since we wrote it; otherwise
+        (cursor-agent rewrites cli-config.json itself — model choice, auth refresh) drop only the entries we added."""
+        current = self.CLI_CONFIG.read_text() if self.CLI_CONFIG.is_file() else ""
+        if current == state.get("written", ""):
+            self.CLI_CONFIG.write_text(state["orig"])
+        else:
+            try:
+                cfg = json.loads(current or "{}")
+                deny = (cfg.get("permissions") or {}).get("deny") or []
+                keep = [e for e in deny if e not in state.get("entries", [])]
+                if keep != deny:
+                    cfg["permissions"]["deny"] = keep
+                    self.CLI_CONFIG.write_text(json.dumps(cfg, indent=2) + "\n")
+            except json.JSONDecodeError:
+                pass                                            # unreadable: leave the user's file alone
+        state.update(added=False, orig="", written="", entries=[])
+
+    def prepare(self, o, dry):
+        notes = []
+        if o.mode == "ask" and not dry:
+            notes.append(self._deny_acquire())
+        elif o.mode == "write":
+            holders = [q for q in self._deny_holders() if q != os.getpid()]
+            if holders:
+                print(f"ask-agent: cursor -m write refused — read-only agent-mode run(s) {holders} hold the global "
+                      f"Write(**) deny (+ write-capable Shell denials), which would silently block this run. "
+                      f"Retry when they finish.",
+                      file=sys.stderr)
+                raise SystemExit(6)
+        top = subprocess.run(["git", "-C", o.dir, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        root = Path(top.stdout.strip()) if top.returncode == 0 else Path(o.dir)
+        rules = root / ".cursor" / "rules"
+        for name in self.RULE_FILES:
+            src, dst = HOME / ".cursor" / "rules" / name, rules / name
+            if not src.is_file():
+                continue
+            if dst.is_symlink() and dst.resolve() == src.resolve():
+                continue
+            if dst.exists() or dst.is_symlink():
+                notes.append(f"rules: {dst} exists (not the bridge link) — left alone")
+                continue
+            if dry:
+                notes.append(f"would link {dst} -> {src}")
+                continue
+            rules.mkdir(parents=True, exist_ok=True)
+            dst.symlink_to(src)
+            notes.append(f"linked {dst.relative_to(root)}")
+        # `--git-path` resolves the real gitdir, so a linked worktree (.git is a file there) gets the right exclude
+        gp = subprocess.run(["git", "-C", str(root), "rev-parse", "--git-path", "info/exclude"], capture_output=True, text=True)
+        exclude = (root / gp.stdout.strip()).resolve() if gp.returncode == 0 and gp.stdout.strip() else root / ".git" / "info" / "exclude"
+        if top.returncode == 0 and not dry:
+            lines = exclude.read_text().splitlines() if exclude.is_file() else []
+            want = [f".cursor/rules/{n}" for n in self.RULE_FILES if f".cursor/rules/{n}" not in lines]
+            if want:
+                exclude.parent.mkdir(parents=True, exist_ok=True)
+                with open(exclude, "a") as f:
+                    f.write("# agent-bridge rule links (local only)\n" + "\n".join(want) + "\n")
+                notes.append("git info/exclude updated")
+        return notes
+
+    def preamble(self, o):
+        bits = []
+        if o.mode == "ask":
+            bits.append(
+                "Read-only run: do not create or modify files. Shell is for read-only commands only "
+                "(git log/show/diff/status/blame/grep, rg, cat, head, tail, sed -n, find, ls, wc, unzip -l|-p). "
+                "Write tool is denied. Put the answer in the reply body with file:line evidence.\n\n"
+            )
+        if o.worktree is not None:
+            bits.append(
+                "Before anything else, read and follow ~/.agent-bridge/mirror/agent-bridge.md and "
+                "~/.agent-bridge/mirror/user-rules.md (machine-wide rules; this worktree has no copy).\n\n"
+            )
+        return "".join(bits)
+
+    def _base(self, o):
+        # stream-json: one `assistant` line per turn, so narration and the answer stay separate chunks
+        # (the `result` field of the plain json format glues every chunk together with no separator)
+        a = ["-p", "--output-format", "stream-json", "--trust", "--workspace", o.dir]
+        # ask = default agent mode (no --mode) with Write(**)+write-capable Shell denials — see prepare()
+        a += {"ask": [], "plan": ["--mode", "plan"], "write": ["--force"]}[o.mode]
+        if o.board:
+            a += ["--approve-mcps"]                       # headless cursor-agent loads no MCP server without this
+        # always pass a model: without --model cursor-agent takes the app's last pick from cli-config.json (grok-4.6 on
+        # 2026-09-26, which ran out of usage) — the bridge starts on `auto` unless -M says otherwise (user 2026-09-26)
+        a += ["--model", o.model or self.DEFAULT_MODEL]
+        for d in o.add_dir:
+            a += ["--add-dir", d]
+        return a
+
+    def argv(self, o, prompt):
+        a = self._base(o)
+        if o.worktree is not None:
+            a += ["--worktree"] + ([o.worktree] if o.worktree != "auto" else [])
+        if o.session:
+            a += ["--resume", o.session]
+        elif o.cont:
+            a += ["--continue"]
+        return a + ["--", prompt]
+
+    def resume_argv(self, o, session, prompt):
+        return self._base(o) + ["--resume", session, "--", prompt]
+
+    def parse(self, raw):
+        obj = last_json(raw)
+        if obj is None:
+            return Parsed(raw)
+        chunks = []
+        for line in raw.splitlines():
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(d, dict) and d.get("type") == "assistant":
+                chunks += [c.get("text", "") for c in (d.get("message") or {}).get("content") or [] if c.get("type") == "text"]
+        result = "\n\n".join(c.strip() for c in chunks if c.strip()) or str(obj.get("result", raw) or "")
+        u = obj.get("usage") or {}
+        return Parsed(result, obj.get("session_id"), u.get("inputTokens", "?"), u.get("outputTokens", "?"),
+                      bool(obj.get("is_error")))
+
+
+
+class Copilot(Adapter):
+    """GitHub Copilot CLI (`npm i -g @github/copilot`). The VS Code shim of the same name is skipped:
+    it is interactive (offers to install) and would hang a headless run."""
+    name, binary = "copilot", "copilot"
+    skip_bin_substr = ("github.copilot-chat/copilotCli",)
+    supports_deny = True
+    rules_mirror = "~/.copilot/instructions/agent-bridge-user-rules.instructions.md"
+
+    def auth_hint(self):
+        try:
+            cfg = json.loads(re.sub(r"^\s*//.*$", "", (HOME / ".copilot/config.json").read_text(), flags=re.M))
+            return f"login={(cfg.get('lastLoggedInUser') or {}).get('login', 'NONE')}"
+        except Exception:  # noqa: BLE001
+            return "no ~/.copilot/config.json"
+
+    def _base(self, o):
+        # JSONL (`--output-format json`, CLI 1.0.88): `assistant.message` events carry the answer, the final `result`
+        # event the session id + usage — before 2026-09-26 the bridge used `-s` plain text and Copilot runs had no
+        # session to resume and no duration/cost in the run logs
+        a = ["--no-ask-user", "--output-format", "json"]
+        if o.mode == "write":
+            a += ["--allow-all-tools"]
+            for c in GIT_DENY:
+                a += [f"--deny-tool=shell({c})", f"--deny-tool=shell({c}:*)"]
+        else:
+            a += ["--deny-tool=write", "--deny-tool=shell"]
+        for t in o.deny:
+            a += [f"--deny-tool={t}"]
+        if o.model:
+            a += [f"--model={o.model}"]
+        for d in o.add_dir:
+            a += [f"--add-dir={d}"]
+        return a
+
+    def argv(self, o, prompt):
+        a = self._base(o)
+        if o.session:
+            a += [f"--resume={o.session}"]
+        elif o.cont:
+            a += ["--continue"]
+        return a + ["-p", prompt]
+
+    def resume_argv(self, o, session, prompt):
+        return self._base(o) + [f"--resume={session}", "-p", prompt]
+
+    def parse(self, raw):
+        events = []
+        for line in raw.splitlines():
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(d, dict) and d.get("type"):
+                events.append(d)
+        if not events:                                   # older CLI or `-s` output: plain text
+            return Parsed(raw.strip())
+        final = [e for e in events if e.get("type") == "assistant.message"]
+        answer = [(e.get("data") or {}).get("content", "") for e in final if (e.get("data") or {}).get("phase", "final_answer") == "final_answer"]
+        text = "\n\n".join(t.strip() for t in answer if t and t.strip()) or \
+            "\n\n".join(t.strip() for t in ((e.get("data") or {}).get("content", "") for e in final) if t and t.strip())
+        res = next((e for e in reversed(events) if e.get("type") == "result"), {})
+        u = res.get("usage") or {}
+        edited = ((u.get("codeChanges") or {}).get("filesModified")) or []
+        extra = f"premium={u.get('premiumRequests', '?')} api={u.get('totalApiDurationMs', '?')}ms"
+        if edited:
+            extra += f" EDITED={','.join(edited)}"
+        is_error = res.get("exitCode", 0) not in (0, None) or not text
+        # the JSONL stream carries no token counts — premiumRequests is billing units, kept in `extra`, never tok_out
+        return Parsed(text or "(copilot returned no assistant message)", res.get("sessionId"), "?", "?", is_error, extra)
+
+
+ADAPTERS: dict[str, Adapter] = {a.name: a for a in (Claude(), Cursor(), Copilot())}

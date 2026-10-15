@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""bridge-watch — see what every bridged peer is doing while it runs.
+
+    bridge-watch                      overview of live runs, refreshed every 2 s (Ctrl-C to stop); --once for one screen
+    bridge-watch -f <pid|identity|log>   follow one run: every tool call, text and the final result as they happen
+    bridge-watch --tmux               tmux session `bridge`: window 0 = overview, one window per live run (auto-added)
+
+Reads the worker registry in the board (pid, identity, peer, log path, deadline — written by ask-agent at spawn) and the
+peer's own stream log under ~/.agent-bridge/runs/: Claude and Cursor `stream-json`, Copilot JSONL. Nothing here talks to
+a peer; it only renders what they already write. A run started with --no-board is not registered and is found from its
+log path instead.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import boardlib  # noqa: E402
+
+BRIDGE = Path.home() / ".agent-bridge"
+RUNS = BRIDGE / "runs"
+SELF = str(Path(__file__).resolve())
+TMUX_SESSION = "bridge"
+
+
+# ----------------------------------------------------------------------------- event rendering
+def compact(v, n: int = 110) -> str:
+    """One short line out of a tool input / result of any shape."""
+    if isinstance(v, dict):
+        for k in ("command", "cmd", "path", "file_path", "pattern", "query", "url", "prompt"):
+            if k in v and isinstance(v[k], str):
+                return one_line(v[k], n)
+        s = " ".join(f"{k}={one_line(str(x), 40)}" for k, x in list(v.items())[:4])
+        return one_line(s, n)
+    if isinstance(v, list):
+        return one_line(" ".join(compact(x, n) for x in v[:3]), n)
+    return one_line(str(v), n)
+
+
+def one_line(s: str, n: int) -> str:
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def render(peer: str, d: dict) -> tuple[str, str] | None:
+    """(kind, text) for one log line, or None for noise. kind ∈ init · text · tool · result · done · error."""
+    t = d.get("type")
+    if peer in ("claude", "cursor"):
+        if t == "system" and d.get("subtype") == "init":
+            return "init", f"model={d.get('model', '?')} mode={d.get('permissionMode', '?')} cwd={d.get('cwd', '')}"
+        if t == "assistant":
+            out = []
+            for c in (d.get("message") or {}).get("content") or []:
+                if c.get("type") == "text" and c.get("text", "").strip():
+                    out.append(("text", one_line(c["text"], 160)))
+                elif c.get("type") == "tool_use":
+                    out.append(("tool", f"{c.get('name')} {compact(c.get('input'))}"))
+            return out[-1] if out else None
+        if t == "user":                                   # claude: tool results come back as user turns
+            for c in (d.get("message") or {}).get("content") or []:
+                if c.get("type") == "tool_result":
+                    body = c.get("content")
+                    if isinstance(body, list):
+                        body = " ".join(x.get("text", "") for x in body if isinstance(x, dict))
+                    return "result", ("ERROR " if c.get("is_error") else "") + one_line(str(body or ""), 120)
+            return None
+        if t == "tool_call":                              # cursor: {"tool_call": {"<kind>ToolCall": {"args": …, "result": …}}}
+            call = d.get("tool_call") or {}
+            kind = next(iter(call), "?")
+            body = call.get(kind) or {}
+            name = kind.replace("ToolCall", "")
+            if d.get("subtype") == "started":
+                return "tool", f"{name} {compact(body.get('args'))}"
+            res = body.get("result") or {}
+            ok = res.get("success") if isinstance(res, dict) else None
+            shown = ok.get("content", ok) if isinstance(ok, dict) else res
+            return "result", ("ERROR " if isinstance(res, dict) and "error" in res else "") + one_line(compact(shown), 120)
+        if t == "result":
+            return "done", (f"{'ERROR' if d.get('is_error') else 'ok'} {d.get('duration_ms', '?')} ms "
+                            f"turns={d.get('num_turns', '?')} cost={d.get('total_cost_usd', '?')}")
+        return None
+    if peer == "copilot":
+        data = d.get("data") or {}
+        if t == "assistant.message":
+            names = [r.get("name") for r in data.get("toolRequests") or []]
+            if data.get("content", "").strip():
+                return "text", one_line(data["content"], 160)
+            return ("tool", "requests " + ", ".join(n for n in names if n)) if names else None
+        if t == "tool.execution_start":
+            return "tool", f"{data.get('toolName')} {compact(data.get('arguments'))}"
+        if t == "tool.execution_complete":
+            return "result", ("ok " if data.get("success") else "ERROR ") + one_line(compact((data.get("result") or {}).get("content", "")), 120)
+        if t == "result":
+            u = d.get("usage") or {}
+            return "done", f"exit={d.get('exitCode')} premium={u.get('premiumRequests', '?')} api={u.get('totalApiDurationMs', '?')} ms"
+        if t == "session.auto_mode_resolved":
+            return "init", f"model={data.get('chosenModel', '?')}"
+        return None
+    return None
+
+
+def peer_of(log: Path) -> str:
+    stem = log.name.rsplit(".", 1)[0]
+    return stem.split("-")[-1].replace(".recover", "")
+
+
+def read_events(log: Path, peer: str, offset: int = 0) -> tuple[list[tuple[str, str]], int]:
+    """Rendered events after byte `offset`, and the new offset (only whole lines are consumed)."""
+    out: list[tuple[str, str]] = []
+    try:
+        with open(log, "rb") as f:
+            f.seek(offset)
+            chunk = f.read()
+    except OSError:
+        return out, offset
+    if not chunk:
+        return out, offset
+    end = chunk.rfind(b"\n") + 1
+    if end == 0:
+        return out, offset
+    for raw in chunk[:end].splitlines():
+        try:
+            d = json.loads(raw.decode("utf-8", "replace"))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(d, dict):
+            ev = render(peer, d)
+            if ev and (not out or out[-1] != ev):          # copilot repeats the final assistant.message
+                out.append(ev)
+    return out, offset + end
+
+
+# ----------------------------------------------------------------------------- live runs
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def live_runs() -> list[dict]:
+    """Registered runs whose CLI process is still alive (a stale row from a killed driver is skipped, not deleted)."""
+    try:
+        rows = boardlib.live_workers(boardlib.connect())
+    except Exception:  # noqa: BLE001 — board unavailable: nothing to list
+        rows = []
+    runs = []
+    for r in rows:
+        r = dict(r)
+        if not alive(int(r["pid"])):
+            continue
+        r["log"] = Path(r["log"]) if r.get("log") else None
+        r["peer_name"] = r.get("family") or (peer_of(r["log"]) if r["log"] else "?")
+        runs.append(r)
+    return runs
+
+
+def resolve(target: str) -> tuple[Path, str, int | None]:
+    """-f argument → (log path, peer, pid|None): a pid, an identity such as cursor#123, or a log path."""
+    for r in live_runs():
+        if target in (str(r["pid"]), r.get("identity")) and r["log"]:
+            return r["log"], r["peer_name"], int(r["pid"])
+    p = Path(target)
+    if p.is_file():
+        return p, peer_of(p), None
+    if target.isdigit():                                  # pid of a run that already finished: newest log is the best guess
+        raise SystemExit(f"bridge-watch: no live run with pid/identity {target} (finished? see ~/.agent-bridge/runs/)")
+    raise SystemExit(f"bridge-watch: {target} is neither a live pid/identity nor a log file")
+
+
+def fmt_elapsed(s: int) -> str:
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def overview_lines() -> list[str]:
+    runs = live_runs()
+    now = int(time.time())
+    if not runs:
+        return [f"bridge-watch {time.strftime('%H:%M:%S')} — no bridged run is alive  (runs log: {RUNS})"]
+    lines = [f"bridge-watch {time.strftime('%H:%M:%S')} — {len(runs)} live run(s); follow one with: bridge-watch -f <pid>", ""]
+    for r in runs:
+        started = int(r.get("started_at") or now)
+        limit = int(r.get("deadline") or 0) - started
+        head = (f"{r.get('identity', '?'):<20} {r['peer_name']:<8} pid={r['pid']:<6} "
+                f"{fmt_elapsed(now - started)}{('/' + fmt_elapsed(limit)) if limit > 0 else ''}"
+                f"{'  task#' + str(r['task_id']) if r.get('task_id') else ''}")
+        lines.append(head)
+        last: dict[str, str] = {}
+        if r["log"]:
+            evs, _ = read_events(r["log"], r["peer_name"])
+            for kind, text in evs:
+                last[kind] = text
+            n_tools = sum(1 for k, _ in evs if k == "tool")
+            lines.append(f"    tools={n_tools}  " + "  ".join(f"{k}: {last[k]}" for k in ("tool", "text", "done") if k in last))
+            err = r["log"].with_suffix(".err")
+            if err.is_file() and err.stat().st_size:
+                lines.append("    stderr: " + one_line(err.read_text(errors='replace').strip().splitlines()[-1], 140))
+        else:
+            lines.append("    (no log path registered)")
+        lines.append("")
+    return lines
+
+
+def overview(o) -> int:
+    while True:
+        text = "\n".join(overview_lines())
+        if o.once:
+            print(text)
+            return 0
+        sys.stdout.write("\x1b[2J\x1b[H" + text + "\n")
+        sys.stdout.flush()
+        try:
+            time.sleep(o.interval)
+        except KeyboardInterrupt:
+            return 0
+
+
+def follow(o) -> int:
+    log, peer, pid = resolve(o.follow)
+    print(f"bridge-watch: following {peer} {'pid=' + str(pid) if pid else ''} log={log}  (Ctrl-C to stop)")
+    offset = 0
+    idle = 0.0
+    while True:
+        evs, offset = read_events(log, peer, offset)
+        for kind, text in evs:
+            print(f"{time.strftime('%H:%M:%S')} {kind:<6} {text}")
+        if any(k == "done" for k, _ in evs):
+            return 0
+        if not evs:
+            if pid is not None and not alive(pid):
+                idle += 0.5
+                if idle > 3:                              # process gone and nothing new for 3 s: it was killed or crashed
+                    err = log.with_suffix(".err")
+                    tail = err.read_text(errors="replace").strip().splitlines()[-3:] if err.is_file() else []
+                    print("bridge-watch: run ended without a result line" + (": " + " | ".join(tail) if tail else ""))
+                    return 1
+            elif pid is None and idle > 3:                # a finished log with no result line
+                return 0
+            elif pid is None:
+                idle += 0.5
+        else:
+            idle = 0.0
+        try:
+            time.sleep(0.5)
+        except KeyboardInterrupt:
+            return 0
+
+
+def tmux(o) -> int:
+    if not shutil.which("tmux"):
+        print("bridge-watch: tmux is not installed (brew install tmux)", file=sys.stderr)
+        return 2
+
+    def t(*a: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["tmux", *a], capture_output=True, text=True)
+
+    if t("has-session", "-t", TMUX_SESSION).returncode != 0:
+        t("new-session", "-d", "-s", TMUX_SESSION, "-n", "overview", f"{sys.executable} {SELF}")
+    windows = set(t("list-windows", "-t", TMUX_SESSION, "-F", "#{window_name}").stdout.split())
+    added = []
+    for r in live_runs():
+        name = str(r.get("identity") or r["pid"]).replace(":", "_")
+        if name in windows:
+            continue
+        t("new-window", "-d", "-t", TMUX_SESSION, "-n", name,
+          f"{sys.executable} {SELF} -f {r['pid']}; echo; echo '[run ended — window closes in 120 s]'; sleep 120")
+        added.append(name)
+    print(f"bridge-watch: tmux session `{TMUX_SESSION}` — {len(added)} window(s) added{': ' + ', '.join(added) if added else ''}; "
+          f"attach with: tmux attach -t {TMUX_SESSION}   (re-run --tmux to add windows for new runs)")
+    if o.attach:
+        os.execvp("tmux", ["tmux", "attach", "-t", TMUX_SESSION])
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="bridge-watch", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-f", "--follow", help="pid, identity (cursor#123) or log path of one run to follow")
+    ap.add_argument("--once", action="store_true", help="print the overview once and exit")
+    ap.add_argument("-i", "--interval", type=float, default=2.0, help="overview refresh seconds (default 2)")
+    ap.add_argument("--tmux", action="store_true", help="open/refresh the tmux session with one window per live run")
+    ap.add_argument("-a", "--attach", action="store_true", help="with --tmux: attach to the session afterwards")
+    o = ap.parse_args()
+    if o.tmux:
+        return tmux(o)
+    if o.follow:
+        return follow(o)
+    return overview(o)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
