@@ -13,7 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .core import (BOARD_TOOLS, BRIDGE, BRIDGE_CMDS, CLAUDE_READ_ONLY_BASH, CLAUDE_WRITE_BASH, DISABLED, GIT_DENY, HOME,
+from .core import (BOARD_TOOLS, STATE, BRIDGE_CMDS, CLAUDE_READ_ONLY_BASH, CLAUDE_WRITE_BASH, DISABLED, GIT_DENY, HOME,
                    find_bin, last_json, sum_keys)
 
 class Parsed:
@@ -149,13 +149,13 @@ class Cursor(Adapter):
     # so the machine-wide mirror is linked into the workspace before each run and kept out of git via info/exclude.
     RULE_FILES = ("00-agent-bridge.mdc", "10-user-preferences.mdc")
 
-    # User ruling 2026-09-12: Cursor runs in its DEFAULT agent mode (not --mode ask) on the latest Grok. Headless default
+    # Decision 2026-09-12: Cursor runs in its DEFAULT agent mode (not --mode ask) on the latest Grok. Headless default
     # mode creates files without --force (--force only gates shell), and only the GLOBAL ~/.cursor/cli-config.json deny
     # list is honoured (a project .cursor/cli.json is ignored) — verified on the real CLI. So a read-only run holds a
     # temporary deny set there: flock + pid refcount in cursor-deny.json, restored byte-identical when the last live
     # holder leaves; a `-m write` run refuses to start while the deny is held (its edits would be silently blocked).
     #
-    # User 2026-10-13 (option A): do NOT deny Shell(*). That blocked git log/diff/blame and burned 50–140 tool calls
+    # Decision 2026-10-13: do NOT deny Shell(*). That blocked git log/diff/blame and burned 50–140 tool calls
     # per ask run. Allowlist cannot override Shell(*) (verified 2026-09-12). Keep Write(**) + denials for the known
     # Write bypass (printf > file) and common filesystem mutators. Residual: unrestricted shell can still write via
     # python/node/redirection — ask preamble tells the peer to use read-only shell only.
@@ -176,8 +176,8 @@ class Cursor(Adapter):
         "Shell(dd)", "Shell(dd *)",
         "Shell(truncate)", "Shell(truncate *)",
     )
-    DENY_STATE = HOME / ".agent-bridge" / "cursor-deny.json"
-    DENY_LOCK = HOME / ".agent-bridge" / "cursor-deny.lock"
+    DENY_STATE = STATE / "cursor-deny.json"
+    DENY_LOCK = STATE / "cursor-deny.lock"
     CLI_CONFIG = HOME / ".cursor" / "cli-config.json"
     _LEGACY_SHELL_STAR = "Shell(*)"
     _held = False
@@ -320,8 +320,8 @@ class Cursor(Adapter):
             )
         if o.worktree is not None:
             bits.append(
-                "Before anything else, read and follow ~/.agent-bridge/mirror/agent-bridge.md and "
-                "~/.agent-bridge/mirror/user-rules.md (machine-wide rules; this worktree has no copy).\n\n"
+                "Before anything else, read and follow ~/.agent-bridge/state/mirror/agent-bridge.md and "
+                "~/.agent-bridge/state/mirror/user-rules.md (machine-wide rules; this worktree has no copy).\n\n"
             )
         return "".join(bits)
 
@@ -334,7 +334,7 @@ class Cursor(Adapter):
         if o.board:
             a += ["--approve-mcps"]                       # headless cursor-agent loads no MCP server without this
         # always pass a model: without --model cursor-agent takes the app's last pick from cli-config.json (grok-4.6 on
-        # 2026-09-26, which ran out of usage) — the bridge starts on `auto` unless -M says otherwise (user 2026-09-26)
+        # 2026-09-26, which ran out of usage) — the bridge starts on `auto` unless -M says otherwise
         a += ["--model", o.model or self.DEFAULT_MODEL]
         for d in o.add_dir:
             a += ["--add-dir", d]

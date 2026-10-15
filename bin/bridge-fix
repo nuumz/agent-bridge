@@ -6,7 +6,7 @@
     bridge-fix decide <name> (--answer "1=B" ... | --go) [--files <globs>] [--verify "<cmd>"] [--note "..."] [--no-fix]
     bridge-fix status <name> | show <name> | list
 
-Stages (state in ~/.agent-bridge/work/<name>/flow.json — re-running `run` resumes at the current stage):
+Stages (state in ~/.agent-bridge/state/work/<name>/flow.json — re-running `run` resumes at the current stage):
   analyze   `bridge-panel run fix-<name> --fix` — roles read the files, cross-examine over machine-checked citations,
             the leader writes ranked root causes + a `Decisions for the user` table + a patch sketch (`git apply --check`)
   decide    the script turns that table into work/<name>/agreement.md (question · options · recommendation · if undecided)
@@ -29,11 +29,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger  # noqa: E402
-from bridgelib.core import BRIDGE, HOP_VAR, detach, guarded_rc  # noqa: E402
+from bridgelib.core import HOP_VAR, ROOT, STATE, detach, guarded_rc  # noqa: E402
 
-BIN = BRIDGE / "bin"
-WORK = BRIDGE / "work"
-PANELS = BRIDGE / "panel"
+BIN = ROOT / "bin"
+WORK = STATE / "work"
+PANELS = STATE / "panel"
 DEFAULT_ROLES = "as-built-realist,spec-reader,design-critic"     # playbook defect-root-cause
 
 

@@ -9,10 +9,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .core import BRIDGE
+from .core import ROOT
 
-SKILLS = BRIDGE / "work-skills"
-LOCAL_SKILLS = BRIDGE / "work-skills.local"
+SKILLS = ROOT / "work-skills"
+LOCAL_SKILLS = ROOT / "work-skills.local"
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:

@@ -12,10 +12,10 @@ import re
 import time
 from pathlib import Path
 
-from .core import BRIDGE, RUNS
+from .core import ROOT, RUNS, STATE
 
-LEDGER = BRIDGE / "ledger.jsonl"
-PLAYBOOKS = BRIDGE / "playbooks"
+LEDGER = STATE / "ledger.jsonl"
+PLAYBOOKS = ROOT / "playbooks"
 
 
 def load_playbooks() -> dict[str, dict]:
@@ -58,7 +58,7 @@ def classify(text: str, books: dict[str, dict] | None = None) -> list[tuple[str,
         if hits:
             scored.append((name, len(hits), hits[0].start()))
     # more hits first; on a tie the playbook whose trigger appears earliest wins — the leading noun names the job
-    # ("review MR !3491 for defects" is a review, not a root-cause hunt)
+    # ("review MR !123 for defects" is a review, not a root-cause hunt)
     return [(n, c) for n, c, _ in sorted(scored, key=lambda x: (-x[1], x[2]))]
 
 
@@ -111,11 +111,11 @@ def _last_json(path: Path) -> dict:
 
 
 def backfill() -> tuple[int, int]:
-    """Rebuild the ledger from ~/.agent-bridge/runs and panel/ — used once to seed learning from history."""
+    """Rebuild the ledger from ~/.agent-bridge/state/runs and panel/ — used once to seed learning from history."""
     books = load_playbooks()
     out: list[dict] = []
     panel_kind: dict[str, str] = {}
-    for d in sorted((BRIDGE / "panel").iterdir()) if (BRIDGE / "panel").is_dir() else []:
+    for d in sorted((STATE / "panel").iterdir()) if (STATE / "panel").is_dir() else []:
         for p in sorted(RUNS.glob("*-claude.prompt.txt")):
             t = p.read_text(errors="replace")
             if f"Panel `{d.name}`" in t and "Problem from the user" in t:
@@ -149,7 +149,7 @@ def backfill() -> tuple[int, int]:
     for r in sorted(out, key=lambda r: r["ts"]):             # backfilled ts = start, so this is start order
         r["cost"] = run_cost(r["session"], r["cost_session"], r["ts"], done)
         done.append(r)
-    for d in sorted((BRIDGE / "panel").iterdir()) if (BRIDGE / "panel").is_dir() else []:
+    for d in sorted((STATE / "panel").iterdir()) if (STATE / "panel").is_dir() else []:
         if not d.is_dir():
             continue
         fnd = d / "findings.json"

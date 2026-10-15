@@ -9,11 +9,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 
 def _load():
-    path = Path(__file__).resolve().parents[1] / "bridge-wait"
+    path = Path(__file__).resolve().parents[1] / "bin" / "bridge-wait"
     loader = importlib.machinery.SourceFileLoader("bridge_wait_mod", str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec)

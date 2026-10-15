@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 def _load():
-    path = Path(__file__).resolve().parents[1] / "bridge-sync"
+    path = Path(__file__).resolve().parents[1] / "bin" / "bridge-sync"
     loader = importlib.machinery.SourceFileLoader("bridge_sync_mod", str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec)

@@ -13,13 +13,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 HOME = Path.home()
-BRIDGE = HOME / ".agent-bridge"
-RUNS = BRIDGE / "runs"
-PANELS = BRIDGE / "panel"
-WORK = BRIDGE / "work"
-# Session cards (Q2=C, user 2026-09-27 / panel bridge-core-session): live under panel/<name>/ or work/<name>/,
+# Files shipped with the checkout (bin, roles, playbooks, work-skills) resolve from wherever it was cloned;
+# runtime state (runs, panel, work, board, ledger, …) always lives under STATE — one git-ignored directory.
+ROOT = Path(__file__).resolve().parents[2]
+STATE = HOME / ".agent-bridge" / "state"
+RUNS = STATE / "runs"
+PANELS = STATE / "panel"
+WORK = STATE / "work"
+# Session cards live under panel/<name>/ or work/<name>/,
 # never under conv/ or a top-level agreements/ directory. Legacy flat files may sit in agreements.archived/.
-AGREEMENTS_ARCHIVED = BRIDGE / "agreements.archived"
+AGREEMENTS_ARCHIVED = STATE / "agreements.archived"
 HOP_VAR = "AGENT_BRIDGE_HOP"
 
 def guarded_rc(name: str, write_rc: Callable[[str, int], int], body: Callable[[], int]) -> int:
@@ -70,12 +73,10 @@ BOARD_TOOLS = "mcp__bridge_board"            # Claude Code permission rule: ever
 GIT_DENY = ("git commit", "git push", "git tag")
 BRIDGE_CMDS = ("ask-agent", "ask-claude", "ask-cursor", "ask-copilot")
 # peers switched off on this machine (reason shown by --list and on any attempt); delete the entry to re-enable
-# (gemini was removed from the bridge entirely on 2026-09-23, user request — it had been disabled since
-#  2026-09-12 by the corporate firewall; restore from git history if it is ever wanted back)
 DISABLED: dict[str, str] = {}
 # A peer that reports an exhausted plan/quota is marked here for QUOTA_TTL seconds; every later run of that peer fails
 # fast with exit 7 instead of paying the caller's set-up cost (a panel leader, a dialog) for a run that cannot start.
-QUOTA_DIR = BRIDGE / "quota"
+QUOTA_DIR = STATE / "quota"
 QUOTA_TTL = 30 * 60
 QUOTA_RE = re.compile(r"out of usage|exceeded your (?:monthly )?quota|Increase limits for faster responses|"
                       r"usage limit reached|rate.?limit(?:ed| exceeded)|insufficient[_ ]quota", re.I)
@@ -88,9 +89,9 @@ CLAUDE_READ_ONLY_BASH = (
     "find", "file", "echo", "cd", "pwd", "diff", "tree", "unzip -l", "unzip -p", "jar tf", "javap", "codegraph",
     "rtk read", "rtk wc", "rtk ls", "rtk grep", "rtk find", "rtk cat", "rtk head", "rtk tail",
 )
-# Language (user ruling 2026-09-26): agent ↔ agent exchange uses whatever is cheapest and fastest; whatever is RETURNED to
-# the orchestrating agent or the user is in the language of the request itself (fallback: the user's native language).
-USER_LANG = os.environ.get("AGENT_BRIDGE_LANG", "Thai")
+# Language: agent ↔ agent exchange uses whatever is cheapest and fastest; whatever is RETURNED to the orchestrating
+# agent or the user is in the language of the request itself (fallback: AGENT_BRIDGE_LANG).
+USER_LANG = os.environ.get("AGENT_BRIDGE_LANG", "English")
 PEER_TALK_RULE = ("This exchange is agent-to-agent: use whatever language is cheapest and fastest for you (terse English is "
                   "fine), no pleasantries, no restating the question — only what the other agent needs.")
 
@@ -258,7 +259,7 @@ def find_session_card(name: str) -> Path | None:
     for p in (PANELS / name / "agreement.md", WORK / name / "agreement.md"):
         if p.is_file():
             return p
-    for root in (BRIDGE / "agreements", AGREEMENTS_ARCHIVED):
+    for root in (STATE / "agreements", AGREEMENTS_ARCHIVED):
         for candidate in (root / f"{name}.md", root / f"work-{name}.md", root / f"fix-{name}.md"):
             if candidate.is_file():
                 return candidate

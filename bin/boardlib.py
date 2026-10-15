@@ -1,7 +1,7 @@
 """boardlib — shared SQLite store for the agent-bridge board (messages, task queue, worker registry).
 
 Used by `bridge-board` (MCP server + CLI + dispatcher) and `ask-agent` (worker registration, task completion).
-One file `~/.agent-bridge/board/board.db`, WAL mode, every writer opens `BEGIN IMMEDIATE` so N concurrent
+One file `~/.agent-bridge/state/board/board.db`, WAL mode, every writer opens `BEGIN IMMEDIATE` so N concurrent
 stdio servers plus the dispatcher never race on seq numbers or task claims.
 """
 from __future__ import annotations
@@ -13,8 +13,10 @@ import subprocess
 import time
 from pathlib import Path
 
+from bridgelib.core import STATE
+
 HOME = Path.home()
-BOARD_DIR = HOME / ".agent-bridge" / "board"
+BOARD_DIR = STATE / "board"
 DB_PATH = BOARD_DIR / "board.db"
 ONLINE_S = 120            # agent counts as online when its last heartbeat is younger than this
 LEASE_S = 1500            # claim lease: ask-agent default timeout (900 s) + recovery run + margin

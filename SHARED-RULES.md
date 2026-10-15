@@ -1,10 +1,9 @@
 # Cross-Agent Bridge — shared protocol (Claude Code · Cursor Agent · Copilot CLI)
 
 Machine-wide contract for coding agents that share the same checkouts on this machine.
-Owner-facing docs are in English; user-facing replies follow each agent's own language rule
-(Thai for this user).
+Owner-facing docs are in English; user-facing replies follow each agent's own language rule.
 
-**Bridge core vs session** (ruling Q1=B · Q2=C · Q3=A; peer review: panel bridge-core-session, 2026-09-27):
+**Bridge core vs session**:
 §1–§9 = **bridge core** (machine-wide; a session card cannot weaken it). §10–§12 = **session-facing**
 (playbooks, session cards under `panel/<name>/agreement.md` or `work/<name>/agreement.md`, work/fix pipelines).
 `routine` / `confirm` / `negotiate` are **session depth**, not a third agreement tier.
@@ -20,10 +19,6 @@ Owner-facing docs are in English; user-facing replies follow each agent's own la
 `ask-agent --list` shows which peers are installed and logged in. All three `ask-*` commands are thin wrappers
 around `ask-agent <peer>`; every peer reads the same machine-wide rules (§5) and the same per-repo rules
 (`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursor/rules/**`).
-
-Gemini CLI was a fourth peer until 2026-09-23, when the user asked for it to be removed (it had been
-disabled since 2026-09-12 — the corporate firewall blocks `@google/gemini-cli`). Adapter, shim and
-policy template are gone; git history has them if it is ever wanted back.
 
 ## 2. Bridge command
 
@@ -42,9 +37,9 @@ own first stderr line>` before the raw dump — scripts (`bridge-panel`) read th
   allowlisted in `~/.claude/settings.json` (headless `-p` auto-denies every permission prompt). Cursor
   `-m write` = `--force`: everything runs except its `permissions.deny` list.
 - The answer is printed, then a `[bridge]` line with the peer session id, token use, and a JSON log path under
-  `~/.agent-bridge/runs/`. Resume with `--session <id>` (`--chat` is an alias) or `-c` for the peer's latest.
+  `~/.agent-bridge/state/runs/`. Resume with `--session <id>` (`--chat` is an alias) or `-c` for the peer's latest.
 - **Quota fail-fast.** A run whose peer reports an exhausted plan (Cursor "out of usage", Copilot "exceeded your monthly
-  quota") exits 7 and marks the peer in `~/.agent-bridge/quota/<peer>.json`; for 30 min every run of that peer exits 7
+  quota") exits 7 and marks the peer in `~/.agent-bridge/state/quota/<peer>.json`; for 30 min every run of that peer exits 7
   at once without spawning anything (`--list` shows the mark, `--ignore-quota` overrides). Added 2026-09-26 after 24
   runs in three days died on the same message while their panel leaders were paid in full.
 - **Read-only Claude is pre-approved for read-only shell.** Headless `-p` cannot ask, so `-m ask|plan` passes
@@ -60,7 +55,7 @@ How the common options map onto each CLI:
 
 | Option | claude | cursor | copilot |
 |---|---|---|---|
-| `-m ask` / `plan` | `--permission-mode plan` | default agent mode + temporary global `Write(**)` deny (user ruling 2026-09-12; `-m write` refuses with exit 6 while held) / `--mode plan` | `--deny-tool=write --deny-tool=shell` |
+| `-m ask` / `plan` | `--permission-mode plan` | default agent mode + temporary global `Write(**)` deny (decision 2026-09-12; `-m write` refuses with exit 6 while held) / `--mode plan` | `--deny-tool=write --deny-tool=shell` |
 | `-m write` | `--permission-mode acceptEdits` | `--force` | `--allow-all-tools` + `--deny-tool=shell(git commit)` … |
 | git commit/push/tag denied by | `--disallowed-tools Bash(git commit:*)…` + PreToolUse hook | `permissions.deny` in `~/.cursor/cli-config.json` | `--deny-tool=shell(git …)` |
 | `-M model` | `--model` | `--model` (always passed: `auto` unless `-M`, so the app's last pick in cli-config.json never leaks in) | `--model=` |
@@ -71,7 +66,7 @@ How the common options map onto each CLI:
 
 Cursor read-only detail: `-m ask` holds `Write(**)` plus denials for write-capable Shell commands (`printf`/`tee`/`cp`/`mv`/`rm`/…)
 in the global deny for the run (the model routed around a denied Write with `printf > file` under
-`approvalMode=unrestricted` — verified 2026-09-12). **`Shell(*)` is not denied** (user 2026-10-13 option A) so
+`approvalMode=unrestricted` — verified 2026-09-12). **`Shell(*)` is not denied** (decision 2026-10-13) so
 `git log`/`diff`/`blame`, `rg`, and `cat` work in ask mode — a blanket `Shell(*)` previously burned 50–140 tool calls
 per run and an allow-list entry cannot override it (`Shell(git log)` allowed + `Shell(*)` denied → git blocked).
 Residual: unrestricted shell can still write via python/node/redirection; the ask preamble tells the peer to stay
@@ -101,16 +96,16 @@ Do **not** delegate when: the answer needs ≤2 local tool calls; the peer would
 conversation restated to be useful; or the task is already in flight in another session.
 
 **Data egress.** Every bridged call sends the prompt and the files the peer reads to that vendor's cloud.
-**Copilot is company-licensed (user 2026-10-13)** — company data may go to it like to the Claude peer, no per-turn ask.
-**Cursor** (cursor.sh + its model vendor) is external: company data crosses that line
-**only when the user asks for Cursor in the current turn** — never on the agent's own judgement.
+Which vendors may see which code is the machine owner's policy — keep it in your own rules (`CLAUDE.md`, the
+`agent-bridge` skill). A peer that policy has not cleared for the code at hand runs **only when the user asks for
+it in the current turn** — never on the agent's own judgement.
 
 **No deep recursion.** One hop only: if you were invoked *by* the bridge, do the work yourself —
 never call a bridge command back. Enforced: `ask-agent` exports `AGENT_BRIDGE_HOP=1` to the peer and exits 3
 when it is already set; `ask-claude` additionally denies `Bash(ask-*:*)`.
 
 **Run it detached from an agent shell.** Claude Code's Bash tool caps a foreground call at
-120 s (600 s max) and the corporate gateway holds each reply until complete — a foreground bridge call is
+120 s (600 s max) — a foreground bridge call is
 killed before the peer finishes (real runs: 1–5 min). A 0-byte log with an empty `.err` is that kill.
 `bridge-panel run` / `bridge-work run` / `bridge-fix run|decide` take **`--detach`**: the call returns at once
 with `detached pid=N log=…`, the run continues in its own session with its output in `panel/<name>/run.log` ·
@@ -149,7 +144,7 @@ write delegation review `git status` / `git diff` before building on the result.
 
 ## 5. Hard rules every peer inherits
 
-- **Language (user 2026-09-26)**: agent ↔ agent exchange (board, dialog turns, panel findings and cross-examination) uses
+- **Language**: agent ↔ agent exchange (board, dialog turns, panel findings and cross-examination) uses
   whatever is cheapest and fastest — `PEER_TALK_RULE` tells peers terse English is fine, no pleasantries. Whatever is
   *returned* — the panel report, the implementer's note, the review table, a work/fix report, a direct answer — is in the
   **language the request was written in** (`lang_of()`: Thai script → Thai, else English; `lang_rule(text)` in
@@ -160,11 +155,11 @@ write delegation review `git status` / `git diff` before building on the result.
 - **cursor-agent does not read `~/.cursor/rules/`** (canary-verified 2026-09-12: user-level NO, `<repo>/.cursor/rules/` YES,
   `AGENTS.md` YES). So `ask-agent cursor` links `00-agent-bridge.mdc` + `10-user-preferences.mdc` from `~/.cursor/rules/` into
   `<repo>/.cursor/rules/` before each run and lists them in `.git/info/exclude` (local only, never committed); a `-w` run gets a
-  prompt preamble pointing at `~/.agent-bridge/mirror/` instead, because a fresh worktree has no untracked files. User-level skills
+  prompt preamble pointing at `~/.agent-bridge/state/mirror/` instead, because a fresh worktree has no untracked files. User-level skills
   in `~/.cursor/skills-cursor/` DO reach the CLI (canary YES).
 - Machine-wide engineering rules live in `~/.claude/CLAUDE.md` (source of truth). `bridge-sync` strips the
   Claude-only parts (the `@RTK.md` import, `## Efficient Agent Usage`, the commit-token recipe, any
-  `<!-- bridge:skip --> … <!-- /bridge:skip -->` region) into `~/.agent-bridge/mirror/user-rules.md` and
+  `<!-- bridge:skip --> … <!-- /bridge:skip -->` region) into `~/.agent-bridge/state/mirror/user-rules.md` and
   writes it to each peer — **edit the Claude file, never a mirror** (mirrors carry a GENERATED marker and are
   overwritten; a peer file without the marker is the user's and is left alone).
 - Per-repo rules override machine-wide rules. Read the repo's `AGENTS.md` / `CLAUDE.md` /
@@ -199,33 +194,41 @@ CLI spawns its own stdio server, so there is no daemon. Verified 2026-09-12 with
 ## 7. Files
 
 ```
-~/.agent-bridge/
+~/.agent-bridge/                 the checkout — source only
   bin/ask-agent       the bridge (python3); one adapter per peer CLI
   bin/ask-claude      = ask-agent claude        bin/ask-cursor  = ask-agent cursor
   bin/ask-copilot     = ask-agent copilot
   bin/bridgelib/      the pieces of ask-agent: core.py (paths, quota mark, helpers) · adapters.py (Claude/Cursor/Copilot)
-                      · runner.py (process group + timeout, board registration, threads, execute); bridge-sync imports
-                      the peer table from here
+                      · runner.py (process group + timeout, board registration, threads, execute) · grill.py (grill-plan
+                      recommend/card section for bridge-plan); bridge-sync imports the peer table from here
   bin/bridge-watch    live view of bridged runs: overview (worker registry + each peer's stream log), `-f <pid>` follow,
                       `--tmux [-a]` one window per run; peers write stream-json (claude, cursor) / JSONL (copilot)
   bin/bridge-sync     regenerates the peer mirrors of ~/.claude/CLAUDE.md and the skill links; runs the panel/run-log gc
   bin/bridge-work     autonomous implement pipeline: worktree → implementer (-m write) → verify command by script →
                       reviewer over the diff → fix loop → work/<name>/report.md; never commits (§11)
-  work/               one folder per bridge-work / bridge-fix run (report.md, rounds.json, agreement.md) — runtime state, git-ignored
-  panel/<name>/       one folder per panel (report.md, plan.json, … + agreement.md session card when negotiate/confirm)
-  playbooks/          playbook catalog (kind · session depth · roles) — core catalog, not a per-job card
-  bin/bridgelib/grill.py  grill-plan recommend/card section for bridge-plan
-  work-skills/        capability packs for bridge-work (impl-test · impl-mapper · …) — policy on the write/review prompts
-  ledger.jsonl        outcome ledger for bridge-plan learn
-  agreements.archived/ legacy flat session cards (renamed from agreements/ under Q2=C; read-only archive)
-  agents/             Claude Code subagent wrappers peer-ask.md / peer-panel.md / peer-work.md (linked into ~/.claude/agents/ by
-                      bridge-sync): a bridged call spawned like any other subagent — background, notified, verbatim relay
   bin/bridge-board    shared board: MCP server (`serve`), human CLI (status/post/read/tail/task), `dispatch`, `gc`
   bin/boardlib.py     SQLite schema + operations shared by bridge-board and ask-agent
-  board/              board.db (+ dispatch/ logs) — runtime state, git-ignored
-  mirror/             user-rules.md (canonical stripped rules) · agent-bridge.md (protocol note for peers)
+  agents/             Claude Code subagent wrappers peer-ask.md / peer-panel.md / peer-work.md / peer-fix.md (linked into
+                      ~/.claude/agents/ by bridge-sync): a bridged call spawned like any other subagent
+  roles/              panel personas (§9)
+  playbooks/          playbook catalog (kind · session depth · roles) — core catalog, not a per-job card
+  work-skills/        capability packs for bridge-work (impl-test · impl-mapper · …) — policy on the write/review prompts
+  work-skills.local/  machine-local packs, same format — git-ignored
+  tests/              unit tests
   SHARED-RULES.md     this file
+
+~/.agent-bridge/state/           runtime state — git-ignored; every relative state path in this file is under it
   runs/               JSON transcript + prompt of every bridged call (<stamp>-<peer>.{json,err,prompt.txt})
+  panel/<name>/       one folder per panel (report.md, plan.json, … + agreement.md session card when negotiate/confirm)
+  work/<name>/        one folder per bridge-work / bridge-fix run (report.md, rounds.json, agreement.md)
+  conv/<name>/        multi-turn threads (transcript + peer session ids)
+  live/<peer>/        bridge-live broker state and stream
+  board/              board.db (+ dispatch/ logs)
+  mirror/             user-rules.md (canonical stripped rules) · agent-bridge.md (protocol note for peers)
+  quota/              per-peer exhausted-plan marks
+  ledger.jsonl        outcome ledger for bridge-plan learn
+  cursor-deny.json    read-only deny bookkeeping (+ .lock)
+  agreements.archived/ legacy flat session cards (read-only archive)
 ```
 
 Peer-side generated files: `~/.cursor/rules/10-user-preferences.mdc` + `~/.cursor/rules/00-agent-bridge.mdc`,
@@ -239,7 +242,7 @@ With the board on (default) every thread is also a board topic `conv:<name>`; wi
 
 | Need | Command | What happens |
 |---|---|---|
-| Keep talking to the same peer session | `ask-agent <peer> --conv <name> "…"` (repeat) | The thread remembers the peer's session id per peer, appends both sides to `~/.agent-bridge/conv/<name>/transcript.md` and mirrors them to topic `conv:<name>` (request as `user:<USER>` kind=note, reply as `<peer>#<CLI pid>` kind=answer — raw text only, never the protocol suffix). `--conv <name> --show` prints the transcript; `--list` lists threads |
+| Keep talking to the same peer session | `ask-agent <peer> --conv <name> "…"` (repeat) | The thread remembers the peer's session id per peer, appends both sides to `~/.agent-bridge/state/conv/<name>/transcript.md` and mirrors them to topic `conv:<name>` (request as `user:<USER>` kind=note, reply as `<peer>#<CLI pid>` kind=answer — raw text only, never the protocol suffix). `--conv <name> --show` prints the transcript; `--list` lists threads |
 | Let the peer ask the caller something **while it runs** | peer does `board_post kind=question` on `conv:<name>` then `board_wait` | The caller answers with `bridge-board post conv:<name> "…" -k answer` (or `board_post` from the primary session); the run continues and finishes normally. Each wait is capped to the run's remaining `-t` minus 30 s and refused when under 30 s remain |
 | Same, when nobody answers in time (or `--no-board`) | peer ends its reply with one line `[[ASK]] <question>` | `ask-agent` exits **5** and prints how to answer (`--conv <name>` or `--session <id>`); the caller answers in the same thread. The protocol suffix tells the peer: reply in the body, do **not** `board_post` the answer (the bridge mirrors it), ask live first, fall back to `[[ASK]]` after two waits |
 | Two peers argue a topic while a script relays | `ask-agent dialog -p claude,cursor -r 3 [--conv name] "topic"` | Posts the topic once as `user:<USER>` kind=note, then round 1: A opens, B responds; afterwards each answers the other's last message; stops after `-r` rounds or when both end with `[[AGREE]]`. Read-only (`ask`/`plan` only, no `-w`). Transcript labels are `moderator → A` / `A → moderator`; relays are not re-posted |
@@ -312,7 +315,7 @@ re-runs that stage alone. The patch must also correct any comment or docstring t
 
 A role file = frontmatter (`name`, `peer`, optional `model` → `-M`, optional `mode` → `-m` (default `ask`), optional
 `timeout` → raises `-t` for that role only, never lowers it (as-built-realist: 600), `summary`) + the
-persona prompt; add a role by adding a file. Cursor roles run on `auto` (user ruling 2026-09-26, replacing the 2026-09-12
+persona prompt; add a role by adding a file. Cursor roles run on `auto` (decision 2026-09-26, replacing the 2026-09-12
 pin to the latest Grok, which ran out of usage); set `model:` in a role file to pin one. See §2 for how `-m ask` maps to it. Rules: `-p` is the egress gate — roles whose peer is not in `-p` are skipped, so the user names every vendor that
 will see the repo; the leader never investigates, and the report may cite only evidence a role gave (else UNVERIFIED);
 a worker that asks back (exit 5) is listed at the top of the report with the exact `--conv` command to answer it; the
@@ -362,7 +365,7 @@ prints `do · who · when · status` and embeds a **Grill plan** section on the 
 `A (user <session id>): "<verbatim>"` — the quote is in a prompt, mid-turn message or AskUserQuestion answer of that
 Claude Code transcript (compact summaries, meta and other tool results do not count) · `A (source <abs path>):
 "<verbatim ≥12 chars>"` — the quote is in that file · `A (peer <name> <conv id>)` — `conv/<id>` exists. Decisions
-take user or source only (a peer may not settle one, user 2026-09-29); facts and analysis take source or peer — the
+take user or source only (a peer may not settle one); facts and analysis take source or peer — the
 agent looks facts up or asks a peer and puts only decisions to the user. `A (main): …` never counts (the main agent
 answering its own frontier from session context is not a grill — pay-simplify, 2026-09-29). **Runtime re-check:** `bridge-panel` / `bridge-work
 --agreement` refuse (exit 3) on grill `do=yes` + `status=TODO` or an unevidenced close before peers spend; `pending`
@@ -379,7 +382,7 @@ user), **user** (invokes `/grill-me`), or **panel-leader** (recommends only in t
 ```bash
 bridge-work run <name> -d /repo -p claude[,cursor] --files 'src/x/*.java,src/test/x/*.java' \
   --verify 'mvn -o -q test -Dtest=XTest' [--rounds 2] [-t 900] "<task: what, where, done-when, must-not-change>"
-bridge-work show <name>       # ~/.agent-bridge/work/<name>/report.md
+bridge-work show <name>       # ~/.agent-bridge/state/work/<name>/report.md
 ```
 
 1. **Worktree** `<repo>/.claude/worktrees/bridge-<name>` on branch `bridge/<name>` from the current HEAD (or `--base`):

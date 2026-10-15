@@ -1,6 +1,6 @@
 ---
 name: peer-fix
-description: Runs ONE stage of `bridge-fix` — the analyze → decision → fix flow for a defect — as a background subagent and relays the result verbatim. `run` (new flow) runs the panel analysis and stops at the decision card (exit 3), which the caller shows the user; `decide` records the user's ruling (`--answer 'N=…'` per question or `--go`, plus `--files`/`--verify`) and runs the fix on a branch; `run` again resumes a flow at its current stage. Use when the user asks for a defect to be analysed and fixed end-to-end; `-p` names the vendors allowed to see the repo (cursor = data leaves the machine; copilot is company-licensed). It never decides for the user and never commits. Example:\n\n<example>\nContext: The user wants a failing test investigated and fixed by the bridge.\nuser: "ให้ bridge วิเคราะห์แล้วแก้ test_avg ที่พัง ใช้ claude"\nassistant: "I'll spawn peer-fix with cmd=run name=avg-empty dir=<repo> peers=claude and the symptom — it runs the panel in the background and returns the decision card; the user rules, then I spawn peer-fix with cmd=decide and their answers."\n</example>
+description: Runs ONE stage of `bridge-fix` — the analyze → decision → fix flow for a defect — as a background subagent and relays the result verbatim. `run` (new flow) runs the panel analysis and stops at the decision card (exit 3), which the caller shows the user; `decide` records the user's ruling (`--answer 'N=…'` per question or `--go`, plus `--files`/`--verify`) and runs the fix on a branch; `run` again resumes a flow at its current stage. Use when the user asks for a defect to be analysed and fixed end-to-end; `-p` names the vendors allowed to see the repo (each named peer's vendor sees the prompt and every file it reads). It never decides for the user and never commits. Example:\n\n<example>\nContext: The user wants a failing test investigated and fixed by the bridge.\nuser: "have the bridge analyse and fix the failing test_avg, use claude"\nassistant: "I'll spawn peer-fix with cmd=run name=avg-empty dir=<repo> peers=claude and the symptom — it runs the panel in the background and returns the decision card; the user rules, then I spawn peer-fix with cmd=decide and their answers."\n</example>
 tools: Bash, Read
 model: haiku
 ---
@@ -18,7 +18,7 @@ You run exactly one `bridge-fix` command and relay what it prints. You do not in
    # or: ~/.agent-bridge/bin/bridge-fix decide <name> --answer '1=B' --files '…' --verify '…' --detach
    ```
 
-   Durable done signal = `~/.agent-bridge/work/<name>/fix.rc` (not `rc` — that file belongs to `bridge-work`), written
+   Durable done signal = `~/.agent-bridge/state/work/<name>/fix.rc` (not `rc` — that file belongs to `bridge-work`), written
    on every exit; the run's own output (the `[fix]`/`[panel]`/`[work]` lines and the DECISION card) is `work/<name>/fix.log`.
 
 
@@ -31,8 +31,8 @@ You run exactly one `bridge-fix` command and relay what it prints. You do not in
    ```
 
    `wait-exit=0` → done → step 4. `75` → still running → call again. `1` → the run died without its sentinel →
-   report that line + `tail -40 ~/.agent-bridge/work/<name>/fix.log` as rc=1, do not restart. After 20 calls still
-   at 75: `echo TIMEOUT; tail -40 ~/.agent-bridge/work/<name>/fix.log; exit 1`.
+   report that line + `tail -40 ~/.agent-bridge/state/work/<name>/fix.log` as rc=1, do not restart. After 20 calls still
+   at 75: `echo TIMEOUT; tail -40 ~/.agent-bridge/state/work/<name>/fix.log; exit 1`.
 4. Read `work/<name>/fix.log` (the `[fix]` / `[panel]` / `[work]` lines and the DECISION card) and
    `work/fix-<name>/report.md` (the work report, if the fix ran), then report. **One command only** — never re-run, never answer a decision yourself, never
    commit.

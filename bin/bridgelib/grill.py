@@ -11,6 +11,8 @@ import json
 import re
 from pathlib import Path
 
+from .core import STATE
+
 
 # who: main-agent = this session runs `grilling` with the user
 #       panel-leader = leader peer only recommends questions in the report (no interactive run)
@@ -161,7 +163,7 @@ def open_field_todos(text: str) -> list[str]:
 
 
 PROJECTS = Path.home() / ".claude" / "projects"   # Claude Code transcripts: what the user really typed
-CONV = Path.home() / ".agent-bridge" / "conv"      # one dir per bridged peer conversation
+CONV = STATE / "conv"                             # one dir per bridged peer conversation
 _ACCEPTS = {"decision": ("user", "source"), "fact": ("source", "peer"), "analysis": ("source", "peer")}
 _MIN_QUOTE = {"user": 2, "source": 12}
 

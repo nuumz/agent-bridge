@@ -4,7 +4,7 @@
     bridge-panel run <name> -p claude,cursor [-r role,role] [-d DIR] [-t SEC] [--leader claude] [--no-cross]
                      [--parallel N] "<problem>"
     bridge-panel roles                 list the roles in ~/.agent-bridge/roles
-    bridge-panel show <name>           print ~/.agent-bridge/panel/<name>/report.md
+    bridge-panel show <name>           print ~/.agent-bridge/state/panel/<name>/report.md
 
 Pattern: orchestrator-workers + evaluator (Anthropic, "Building effective agents"): the leader decomposes the problem into
 one question per role, workers answer in parallel (each a normal `ask-agent` run with its own thread, so every turn is on
@@ -40,14 +40,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger  # noqa: E402
-from bridgelib.core import PEER_TALK_RULE, detach, guarded_rc, lang_rule  # noqa: E402
+from bridgelib.core import PEER_TALK_RULE, ROOT, STATE, detach, guarded_rc, lang_rule  # noqa: E402
 
-HOME = Path.home()
-BRIDGE = HOME / ".agent-bridge"
-ROLES = BRIDGE / "roles"
-PANELS = BRIDGE / "panel"
-ASK = BRIDGE / "bin" / "ask-agent"
-BOARD = BRIDGE / "bin" / "bridge-board"
+ROLES = ROOT / "roles"
+PANELS = STATE / "panel"
+ASK = ROOT / "bin" / "ask-agent"
+BOARD = ROOT / "bin" / "bridge-board"
 HOP_VAR = "AGENT_BRIDGE_HOP"
 DEFAULT_ROLES = ["root-cause", "contract-checker", "design-critic", "spec-reader"]  # spec-reader settled 4 disputes by
                                                                                     # running the code (measured 2026-09-12)
@@ -573,10 +571,10 @@ def gc(o) -> int:
     """Retention for the panel's own artefacts plus the ask-agent run logs and threads they create.
 
     Directories that hold a session card (`agreement.md`) are never fully deleted — other files are pruned so the
-    card survives (Q2=C / panel bridge-core-session, user 2026-09-27).
+    card survives.
     """
     cutoff = time.time() - o.days * 86400
-    targets = [(PANELS, "panel"), (BRIDGE / "conv", "conv")]
+    targets = [(PANELS, "panel"), (STATE / "conv", "conv")]
     removed, pruned, kept = [], [], 0
     for root, label in targets:
         for d in sorted(root.glob("*")) if root.is_dir() else []:
@@ -602,7 +600,7 @@ def gc(o) -> int:
                         shutil.rmtree(d)
             else:
                 kept += 1
-    runs = BRIDGE / "runs"
+    runs = STATE / "runs"
     old = [f for f in runs.glob("*") if f.is_file() and f.stat().st_mtime < cutoff] if runs.is_dir() else []
     for f in old:
         if not o.dry_run:

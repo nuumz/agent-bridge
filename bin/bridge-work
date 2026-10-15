@@ -3,7 +3,7 @@
 
     bridge-work run <name> -d <repo> [-p claude[,cursor]] [--base <ref>] [--files <glob>,...] [--verify "<cmd>"]
                     [--rounds 2] [-t 900] [--implementer claude] [--reviewer cursor|claude] "<task>"
-    bridge-work show <name>            ~/.agent-bridge/work/<name>/report.md
+    bridge-work show <name>            ~/.agent-bridge/state/work/<name>/report.md
     bridge-work list                   work items and their state
 
 Pipeline (each peer step is an ordinary `ask-agent` run — background, on the board, visible in `bridge-watch`):
@@ -35,10 +35,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger, workskills  # noqa: E402
-from bridgelib.core import BRIDGE, HOP_VAR, detach, guarded_rc, lang_rule  # noqa: E402
+from bridgelib.core import HOP_VAR, ROOT, STATE, detach, guarded_rc, lang_rule  # noqa: E402
 
-ASK = BRIDGE / "bin" / "ask-agent"
-WORK = BRIDGE / "work"
+ASK = ROOT / "bin" / "ask-agent"
+WORK = STATE / "work"
 
 
 def git(repo: str | Path, *a: str) -> subprocess.CompletedProcess:

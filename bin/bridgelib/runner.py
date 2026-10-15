@@ -17,10 +17,10 @@ from typing import Any
 import boardlib
 
 from .adapters import Adapter, Parsed
-from .core import (BRIDGE, HOP_VAR, IDENTITY_VAR, QUOTA_TTL, RUNS, TASK_VAR, err_summary, quota_block, quota_clear,
+from .core import (STATE, HOP_VAR, IDENTITY_VAR, QUOTA_TTL, RUNS, TASK_VAR, err_summary, quota_block, quota_clear,
                    quota_hit, quota_mark)
 
-CONV_DIR = BRIDGE / "conv"
+CONV_DIR = STATE / "conv"
 ASK_RE = re.compile(r"^\s*\[\[ASK\]\]\s*(.+?)\s*$", re.M)
 AGREE_RE = re.compile(r"\[\[(AGREE|DONE)\]\]")
 PROTOCOL = ("\n\n(Bridge protocol: write the answer in the reply body itself, do not narrate. If you need something only "
@@ -250,7 +250,7 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
         board.finish(status, None)
         if status == 143:
             print(f"ask-agent: killed after {o.timeout}s. From an agent shell run this in the background "
-                  "(Claude Code's Bash tool caps foreground calls at 120 s / 600 s max; the gateway at 10 min).",
+                  "(Claude Code's Bash tool caps foreground calls at 120 s / 600 s max).",
                   file=sys.stderr)
         else:
             print(f"ask-agent: {agent.binary} exited {status}. stderr:", file=sys.stderr)

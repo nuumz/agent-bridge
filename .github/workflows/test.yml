@@ -1,0 +1,26 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unittest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Every command parses and prints its help
+        run: |
+          for c in ask-agent bridge-board bridge-fix bridge-live bridge-panel bridge-plan bridge-wait bridge-watch bridge-work; do
+            python bin/$c --help > /dev/null
+          done
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v

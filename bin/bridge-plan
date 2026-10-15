@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import ledger  # noqa: E402
 from bridgelib import grill as grill_plan  # noqa: E402
 from bridgelib.core import (  # noqa: E402
-    BRIDGE, find_session_card, session_card_form_home, session_card_path,
+    find_session_card, session_card_form_home, session_card_path,
 )
 
 def doc_roots() -> list[Path]:
@@ -124,7 +124,7 @@ role argues the same question and returns the same shape.
 - decides: {decides}
 - main agent: frames, verifies every file:line, writes the decision row; runs grilling when Grill plan says who=main-agent
 - peers ({peers}): {book.get('panel_roles') or book.get('peers')} — gather and argue, never decide
-- data leaving the machine: {'yes — cursor' if 'cursor' in peers else 'no (claude / company-licensed copilot)'}
+- data leaving the machine: the prompt and every file read go to the vendor of each peer ({peers})
 
 ## Inputs still missing from the request
 {chr(10).join('- ' + g for g in gaps) if gaps else '- none spotted'}

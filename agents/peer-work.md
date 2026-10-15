@@ -1,6 +1,6 @@
 ---
 name: peer-work
-description: Runs ONE `bridge-work run` — the bridge implements a task in a project by itself (isolated worktree → a peer writes → the verify command runs → another peer reviews the diff → fix loop → report) as a background subagent and returns report.md verbatim plus the worktree/branch to inspect. Use when the user asks the bridge to implement/code/fix something in a repo (not the main agent's own edits); the task must carry the file set (--files), the command that proves it (--verify) and which vendors may see the repo (-p, cursor = data leaves the machine; copilot is company-licensed), otherwise bridge-work stops with an agreement card (exit 3) that the caller shows the user. Never commits or merges. Example:\n\n<example>\nContext: The user wants the bridge to add a mapper test in an API module.\nuser: "ให้ bridge เขียน test ของ UserMapper ให้ ใช้ claude"\nassistant: "I'll spawn peer-work with name=user-mapper-test dir=<repo> peers=claude files=src/test/java/.../UserMapperTest.java verify='mvn -o -q test -Dtest=UserMapperTest' and the task text — it runs bridge-work in the background and returns the report; the branch bridge/user-mapper-test is left for me and the user to read and commit."\n</example>
+description: Runs ONE `bridge-work run` — the bridge implements a task in a project by itself (isolated worktree → a peer writes → the verify command runs → another peer reviews the diff → fix loop → report) as a background subagent and returns report.md verbatim plus the worktree/branch to inspect. Use when the user asks the bridge to implement/code/fix something in a repo (not the main agent's own edits); the task must carry the file set (--files), the command that proves it (--verify) and which vendors may see the repo (-p; each named peer's vendor sees the prompt and every file it reads), otherwise bridge-work stops with an agreement card (exit 3) that the caller shows the user. Never commits or merges. Example:\n\n<example>\nContext: The user wants the bridge to add a mapper test in an API module.\nuser: "have the bridge write a UserMapper test, use claude"\nassistant: "I'll spawn peer-work with name=user-mapper-test dir=<repo> peers=claude files=src/test/java/.../UserMapperTest.java verify='mvn -o -q test -Dtest=UserMapperTest' and the task text — it runs bridge-work in the background and returns the report; the branch bridge/user-mapper-test is left for me and the user to read and commit."\n</example>
 tools: Bash, Read
 model: haiku
 ---
@@ -19,7 +19,7 @@ You run exactly one `bridge-work run` and relay its report. You do not investiga
        "$(cat "$SCRATCH/task.txt")"
    ```
 
-   Durable done signal = `~/.agent-bridge/work/<name>/rc`; the run's own output is `work/<name>/run.log` (bridge-work writes it on every exit and clears a prior `report.md` when a new
+   Durable done signal = `~/.agent-bridge/state/work/<name>/rc`; the run's own output is `work/<name>/run.log` (bridge-work writes it on every exit and clears a prior `report.md` when a new
    implement run actually starts). Do not treat an old `report.md` alone as done.
 
 
@@ -32,8 +32,8 @@ You run exactly one `bridge-work run` and relay its report. You do not investiga
    ```
 
    `wait-exit=0` → done → step 4. `75` → still running → call again. `1` → the run died without its sentinel →
-   report that line + `tail -40 ~/.agent-bridge/work/<name>/run.log` as rc=1, do not restart. After 20 calls still
-   at 75: `echo TIMEOUT; tail -40 ~/.agent-bridge/work/<name>/run.log; exit 1`.
+   report that line + `tail -40 ~/.agent-bridge/state/work/<name>/run.log` as rc=1, do not restart. After 20 calls still
+   at 75: `echo TIMEOUT; tail -40 ~/.agent-bridge/state/work/<name>/run.log; exit 1`.
 4. Read `work/<name>/report.md` and `work/<name>/run.log`, then report. **One run only** — never re-run, never
    `git commit/merge/push`, never touch the worktree.
 

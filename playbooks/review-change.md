@@ -14,7 +14,7 @@ output: "table `file:line — finding — severity — must-fix (yes/no) — why
 budget: "direct ≈ 2–5 min, $0–1.5 · panel 3 roles ≈ 6–8 min, $3–6"
 ---
 Evidence (14-day ledger, 2026-09-26): the most common job — 47 direct runs (cursor 28 · copilot 10 · claude 9) and
-15 of 33 panels (adjudicating findings on !3431/!3432/!3454/!3491/!781/!593, draft MRs, CR219). None of those panels
+15 of 33 panels (adjudicating review findings on MRs and draft MRs). None of those panels
 was cited in a spec (`peer review: panel …` = 0) because the result lands in the MR thread and the code, not in a doc.
 
 How: one peer from another model family reads the diff with `-m ask` and answers as the table above; run it as a

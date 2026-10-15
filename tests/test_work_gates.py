@@ -9,11 +9,11 @@ import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 
 def _load_bridge_work():
-    path = Path(__file__).resolve().parents[1] / "bridge-work"
+    path = Path(__file__).resolve().parents[1] / "bin" / "bridge-work"
     loader = importlib.machinery.SourceFileLoader("bridge_work_mod", str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec)

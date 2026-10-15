@@ -6,7 +6,7 @@
     bridge-watch --tmux               tmux session `bridge`: window 0 = overview, one window per live run (auto-added)
 
 Reads the worker registry in the board (pid, identity, peer, log path, deadline — written by ask-agent at spawn) and the
-peer's own stream log under ~/.agent-bridge/runs/: Claude and Cursor `stream-json`, Copilot JSONL. Nothing here talks to
+peer's own stream log under ~/.agent-bridge/state/runs/: Claude and Cursor `stream-json`, Copilot JSONL. Nothing here talks to
 a peer; it only renders what they already write. A run started with --no-board is not registered and is found from its
 log path instead.
 """
@@ -23,9 +23,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boardlib  # noqa: E402
+from bridgelib.core import RUNS  # noqa: E402
 
-BRIDGE = Path.home() / ".agent-bridge"
-RUNS = BRIDGE / "runs"
 SELF = str(Path(__file__).resolve())
 TMUX_SESSION = "bridge"
 
@@ -174,7 +173,8 @@ def resolve(target: str) -> tuple[Path, str, int | None]:
     if p.is_file():
         return p, peer_of(p), None
     if target.isdigit():                                  # pid of a run that already finished: newest log is the best guess
-        raise SystemExit(f"bridge-watch: no live run with pid/identity {target} (finished? see ~/.agent-bridge/runs/)")
+        raise SystemExit(f"bridge-watch: no live run with pid/identity {target} "
+                         "(finished? see ~/.agent-bridge/state/runs/)")
     raise SystemExit(f"bridge-watch: {target} is neither a live pid/identity nor a log file")
 
 

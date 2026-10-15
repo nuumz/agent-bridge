@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 from bridgelib import grill  # noqa: E402
 
 
@@ -207,7 +207,7 @@ class GrillEvidence(unittest.TestCase):
 
 
 def _load_bridge_plan():
-    path = Path(__file__).resolve().parents[1] / "bridge-plan"
+    path = Path(__file__).resolve().parents[1] / "bin" / "bridge-plan"
     loader = importlib.machinery.SourceFileLoader("bridge_plan_mod", str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     mod = importlib.util.module_from_spec(spec)

@@ -6,15 +6,15 @@
 
 One adapter per CLI turns the common options (mode, model, dir, session, worktree, timeout) into
 that tool's own flags and parses its output back into: answer text + a `[bridge]` line with the peer
-session id, token use and the JSON log path under ~/.agent-bridge/runs/.
+session id, token use and the JSON log path under ~/.agent-bridge/state/runs/.
 
 Hard rules baked in (see ~/.agent-bridge/SHARED-RULES.md):
   * read-only by default (`-m ask`); `-m write` is the only mode that may touch files;
   * git commit / push / tag are denied on every peer that supports a deny list;
   * one hop only: the peer receives AGENT_BRIDGE_HOP=1 and this script refuses to run when it is set.
-  * board: every run is registered in ~/.agent-bridge/board (identity `<agent>#<pid>` or `<agent>:task<N>` when
+  * board: every run is registered in ~/.agent-bridge/state/board (identity `<agent>#<pid>` or `<agent>:task<N>` when
     started by `bridge-board dispatch`) so the peer can talk on the shared board; `--no-board` opts out.
-  * quota: a peer that reports an exhausted plan is marked in ~/.agent-bridge/quota/ and every run of it fails fast
+  * quota: a peer that reports an exhausted plan is marked in ~/.agent-bridge/state/quota/ and every run of it fails fast
     (exit 7, `[bridge] error:` line on stderr) for QUOTA_TTL; `--ignore-quota` overrides, `--list` shows the mark.
 
 Exit codes: 0 ok · 1 peer error · 2 usage · 3 hop guard · 4 disabled · 5 peer asked back ([[ASK]]) · 6 cursor write

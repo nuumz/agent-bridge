@@ -11,7 +11,7 @@ inputs: the section list (§ numbers) · the SOT sibling to compare against · w
 output: "table `§X claim A` vs `§Y claim B` with file:line, or NONE"
 budget: "≈ 3–8 min per section pair, $1–4; never one run over a whole 100 KB+ document"
 ---
-Evidence: 3 direct runs cited in specs; the one panel of this kind (`seq-ready`, 167 KB spec + 5 SOTs + 2 repos)
+Evidence: 3 direct runs cited in specs; the one panel of this kind (167 KB spec + 5 SOTs + 2 repos)
 killed both workers at 600 s and produced nothing (2026-09-17). The fix that worked: `ask-claude -m ask -t 1500`
 per role with one section + one sibling per run.
 

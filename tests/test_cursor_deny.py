@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from bridgelib.adapters import Cursor
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
+from bridgelib.adapters import Cursor  # noqa: E402
 
 
 class CursorDenyTest(unittest.TestCase):

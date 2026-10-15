@@ -22,7 +22,7 @@ which is how a room goes quiet. A user:* decision containing [[STOP]] ends every
 
 Guards per peer: --max-turns, --budget (USD spent since this start), --idle, --turn-timeout. `start` again with the same
 peer name resumes its last session (context kept; within the 1 h cache TTL the rules stay cached) unless --fresh.
-Every turn is a ledger row (conv live:<room>, cost = that turn's own cost). State: ~/.agent-bridge/live/<peer>/.
+Every turn is a ledger row (conv live:<room>, cost = that turn's own cost). State: ~/.agent-bridge/state/live/<peer>/.
 """
 from __future__ import annotations
 
@@ -42,12 +42,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boardlib  # noqa: E402
 from bridgelib import ledger  # noqa: E402
 from bridgelib.adapters import ADAPTERS  # noqa: E402
-from bridgelib.core import (BRIDGE, HOP_VAR, PEER_TALK_RULE, detach, err_summary, quota_block, quota_hit,  # noqa: E402
-                            quota_mark)
+from bridgelib.core import (HOP_VAR, PEER_TALK_RULE, ROOT, STATE, detach, err_summary, quota_block,  # noqa: E402
+                            quota_hit, quota_mark)
 from bridgelib.runner import AGREE_RE, USER_AUTHOR, kill_tree  # noqa: E402
 
-LIVE = BRIDGE / "live"
-ROLES = BRIDGE / "roles"
+LIVE = STATE / "live"
+ROLES = ROOT / "roles"
 FED_KINDS = ("note", "question", "decision", "answer")
 
 

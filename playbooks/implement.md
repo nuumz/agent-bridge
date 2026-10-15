@@ -14,8 +14,8 @@ inputs: exact file set (`touch only …`) · worktree name · the spec or failin
 output: "branch bridge/<name> in <repo>/.claude/worktrees/ + work/<name>/report.md (diff stat · verify output · reviewer table · files vs allowed); the user reads `git diff` and commits"
 budget: "≈ 5–15 min, $2–8; one peer, never two on the same files"
 ---
-Evidence: 2 direct runs in the window (both claude `-m write -w`); `jp-identity-refactor` was the one panel about
-implementation shape and it stayed read-only. Every write delegation in the rules is paired with `-w` and an
+Evidence: 2 direct runs in the window (both claude `-m write -w`); the one panel about implementation shape
+stayed read-only. Every write delegation in the rules is paired with `-w` and an
 explicit file list; a stub or a mint-ahead identifier is not allowed (scaffold discipline).
 
 How: `bridge-work run` is the whole pipeline — worktree → implementer writes (`-m write`, build/test runners
