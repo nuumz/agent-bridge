@@ -25,6 +25,11 @@ WORK = STATE / "work"
 AGREEMENTS_ARCHIVED = STATE / "agreements.archived"
 HOP_VAR = "AGENT_BRIDGE_HOP"
 
+
+def hop_active(env: dict | None = None) -> bool:
+    """True inside a bridged run. Presence decides, not the value: `AGENT_BRIDGE_HOP=` must not open a second hop."""
+    return HOP_VAR in (os.environ if env is None else env)
+
 def guarded_rc(name: str, write_rc: Callable[[str, int], int], body: Callable[[], int]) -> int:
     """Run `body` with SIGTERM → exit 143; always write_rc(name, rc), including on SIGTERM.
 

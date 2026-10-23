@@ -29,7 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger  # noqa: E402
-from bridgelib.core import HOP_VAR, ROOT, STATE, detach, guarded_rc  # noqa: E402
+from bridgelib.core import ROOT, STATE, detach, guarded_rc, hop_active  # noqa: E402
 
 BIN = ROOT / "bin"
 WORK = STATE / "work"
@@ -296,7 +296,7 @@ def fix(fl: dict, o) -> int:
 # ---------------------------------------------------------------- run / status
 
 def run(o) -> int:
-    if os.environ.get(HOP_VAR):
+    if hop_active():
         print("bridge-fix: refusing inside a bridged run (one hop only)", file=sys.stderr)
         return 3
     fl = load(o.name)
