@@ -26,6 +26,17 @@ AGREEMENTS_ARCHIVED = STATE / "agreements.archived"
 HOP_VAR = "AGENT_BRIDGE_HOP"
 
 
+# The caller's own session identity must not reach a peer: a nested `claude` that inherits CLAUDE_CODE_SESSION_ID
+# reports the parent's session as its own (seen 2026-10-15), and the parent's messaging token is nobody else's.
+PRIVATE_ENV_PREFIXES = ("CLAUDE_CODE_", "CLAUDE_SESSION_", "CLAUDECODE")
+
+
+def peer_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment a bridged peer runs with: ours minus our session identity, plus the hop marker and `extra`."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(PRIVATE_ENV_PREFIXES)}
+    return {**env, HOP_VAR: "1", **(extra or {})}
+
+
 def hop_active(env: dict | None = None) -> bool:
     """True inside a bridged run. Presence decides, not the value: `AGENT_BRIDGE_HOP=` must not open a second hop."""
     return HOP_VAR in (os.environ if env is None else env)

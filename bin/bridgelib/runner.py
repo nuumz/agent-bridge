@@ -17,7 +17,8 @@ from typing import Any
 import boardlib
 
 from .adapters import Adapter, Parsed
-from .core import (STATE, HOP_VAR, IDENTITY_VAR, QUOTA_TTL, RUNS, TASK_VAR, err_summary, quota_block, quota_clear,
+from .core import (STATE, HOP_VAR, IDENTITY_VAR, QUOTA_TTL, RUNS, TASK_VAR, err_summary, peer_env, quota_block,
+                   quota_clear,
                    quota_hit, quota_mark)
 
 CONV_DIR = STATE / "conv"
@@ -57,7 +58,7 @@ def kill_tree(proc: subprocess.Popen, sig: int = signal.SIGTERM, grace: int = 10
 def run(binary: str, argv: list[str], cwd: str, timeout: int, log: Path, env_extra: dict[str, str] | None = None,
         on_start: Callable[[int], None] | None = None) -> int:
     err = log.with_suffix(".err")
-    env = {**os.environ, HOP_VAR: "1", **(env_extra or {})}
+    env = peer_env(env_extra)
     with open(log, "w") as out, open(err, "w") as e:
         # own process group: a timeout or a signal to ask-agent must take the peer AND its children down,
         # otherwise a killed run leaves node/rg/MCP processes burning CPU (and tokens) in the background
@@ -181,7 +182,8 @@ class Conv:
         rows = self.board.execute("SELECT seq, author, body FROM messages WHERE topic_id=? AND seq>? AND author LIKE 'user:%' "
                                   "AND kind='decision' ORDER BY seq", (self.topic, self.seen)).fetchall()
         self.seen = self.board.execute("SELECT COALESCE(MAX(seq),0) FROM messages WHERE topic_id=?", (self.topic,)).fetchone()[0]
-        return "\n".join(f"Moderator ({r['author']}): {r['body']}" for r in rows)
+        return "\n".join(f"Moderator ({r['author']}):\n" + "\n".join("    " + ln for ln in r["body"].splitlines())
+                         for r in rows)
 
 
 def execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | None,

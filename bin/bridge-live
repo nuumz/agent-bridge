@@ -43,7 +43,7 @@ import boardlib  # noqa: E402
 from bridgelib import ledger  # noqa: E402
 from bridgelib.adapters import ADAPTERS  # noqa: E402
 from bridgelib.core import (HOP_VAR, PEER_TALK_RULE, ROOT, STATE, detach, err_summary, hop_active,  # noqa: E402
-                            quota_block, quota_hit, quota_mark)
+                            peer_env, quota_block, quota_hit, quota_mark)
 from bridgelib.runner import AGREE_RE, USER_AUTHOR, kill_tree  # noqa: E402
 
 LIVE = STATE / "live"
@@ -180,7 +180,7 @@ def broker(o, after: int, stop_floor: int, resume: str | None, base: float) -> i
     def spawn() -> tuple[subprocess.Popen, queue.Queue]:
         p = subprocess.Popen(base_argv + (["--resume", session["id"]] if session["id"] else []), cwd=o.dir,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(err, "a"), text=True, bufsize=1,
-                             env={**os.environ, HOP_VAR: "1"}, process_group=0)
+                             env=peer_env(), process_group=0)
         # registered like any bridged run, so a shell inside it is this peer to the board and cannot open a hop
         boardlib.worker_register(conn, p.pid, me, "claude", None, str(peer_log))
         q: queue.Queue = queue.Queue()        # one queue per process: a killed process's EOF never reaches the next one

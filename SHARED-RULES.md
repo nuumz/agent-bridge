@@ -48,6 +48,9 @@ own first stderr line>` before the raw dump — scripts (`bridge-panel`) read th
   one simple command per call — 363 of 446 denials measured on 2026-09-26 were `for` loops, `VAR=…;` prefixes and
   heredocs the permission matcher cannot split. Builds (`mvn`) and `python3` stay denied in read-only runs.
 - Long prompts can be piped on stdin. `--dry-run` prints the resolved command line without running anything.
+- The peer runs with the caller's environment **minus the caller's session identity** (`CLAUDE_CODE_*`, `CLAUDECODE`,
+  `CLAUDE_SESSION_*`): a nested `claude` that inherits `CLAUDE_CODE_SESSION_ID` reports the parent's session as its own.
+  Credentials the peer itself needs (provider keys, `GH_TOKEN`) are passed through unchanged.
 - Default timeout 900 s; on expiry (or SIGTERM/SIGINT/SIGHUP to `ask-agent`) the peer's whole process group is killed —
   its tool/MCP children included — and the stderr tail is surfaced.
 
@@ -59,7 +62,7 @@ How the common options map onto each CLI:
 | `-m write` | `--permission-mode acceptEdits` | `--force` | `--allow-all-tools` + `--deny-tool=shell(git commit)` … |
 | git commit/push/tag denied by | `--disallowed-tools Bash(git commit:*)…` + PreToolUse hook | `permissions.deny` in `~/.cursor/cli-config.json` | `--deny-tool=shell(git …)` |
 | `-M model` | `--model` | `--model` (always passed: `auto` unless `-M`, so the app's last pick in cli-config.json never leaks in) | `--model=` |
-| `--session id` / `-c` | `--resume id` / `--continue` | `--resume id` / `--continue` | `--resume=id` / `--continue` |
+| `--session id` / `-c` | `--resume id --fork-session` / `--continue --fork-session` (the peer never writes into the session it resumes — with `-c` in your own directory that is yours) | `--resume id` / `--continue` | `--resume=id` / `--continue` |
 | `-w [name]` | `--worktree [name]` → `<repo>/.claude/worktrees/<name>` (locked) | `--worktree [name]` → `~/.cursor/worktrees/<repo>/<name>` | not supported (use `git worktree add` + `-d`) |
 | `--add-dir` | `--add-dir` | `--add-dir` | `--add-dir=` |
 | output parsed from | `--output-format stream-json --verbose` (last line = `result`: `result`, `session_id`, `usage`; earlier lines feed `bridge-watch`) | `--output-format stream-json` (`assistant` chunks, `result`) | `--output-format json` JSONL (`assistant.message` content, `result.sessionId` + `usage.premiumRequests`/`totalApiDurationMs`; `EDITED=` in the bridge line when `codeChanges.filesModified` is non-empty) |
