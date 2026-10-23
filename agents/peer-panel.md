@@ -40,7 +40,9 @@ You run exactly one panel and relay its output. You do not investigate, add find
    ~/.agent-bridge/state/panel/<name>/run.log; exit 1`.
    Tell the caller they can watch with `bridge-watch` / `bridge-watch --tmux -a`. Never start a second panel,
    never re-run a failed one, never git commit/push/tag.
-4. Read `panel/<name>/rc`, `status.json`, `run.log`, and `report.md` when it exists, then report.
+4. Read `panel/<name>/rc`, `status.json`, `run.log`, and `report.md` when it exists, then report. For each role in
+   `status.json` `asked_back`, run `~/.agent-bridge/bin/ask-agent --conv panel-<name>-<role> --show` and quote that
+   role's last question verbatim — the report names the role, not the question.
 
 ## Report format (verbatim relay)
 
@@ -51,6 +53,7 @@ rc=<n> — 0 report written · 2 usage error (quote the message) · 3 hop guard 
 report: ~/.agent-bridge/state/panel/<name>/report.md   (or "none")
 status: <status.json verbatim>
 [panel] lines from the log that start with WARNING, FAILED, ABORT, or "retrying on fallback" (verbatim)
+asked back: <role>: <its question verbatim>   (one line per asked_back role, or "none")
 
 <report.md verbatim, untrimmed, including the citation table at the end>
 ```
