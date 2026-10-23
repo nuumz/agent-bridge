@@ -78,8 +78,10 @@ class BoardIdentity(unittest.TestCase):
         return subprocess.run([sys.executable, str(BIN / "bridge-board"), *args], capture_output=True, text=True)
 
     def register_me_as_peer(self, identity: str = "cursor#777") -> None:
-        # the test process stands in for the peer CLI; anything it spawns has it as an ancestor
-        boardlib.worker_register(self.conn, os.getpid(), identity, "python", None, "-", True, None)
+        # the test process stands in for the peer CLI; anything it spawns has it as an ancestor. The family must
+        # match what `ps` reports for this process (macOS runs a framework binary named "Python", not "python").
+        family = boardlib.proc_cmd(os.getpid()).split()[0]
+        boardlib.worker_register(self.conn, os.getpid(), identity, family, None, "-", True, None)
 
     def test_a_stale_worker_row_does_not_claim_the_user(self):
         # a run killed before it unregistered: pid reused later by something that is not that CLI
