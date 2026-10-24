@@ -22,6 +22,13 @@ open and makes the ask cheaper to see and to answer; none adds a rule that a pee
 | 4 | **`bridge-sync --check` and `--dry-run`**, `.bak` beside every file it overwrites, Copilot MCP target `~/.copilot/mcp-config.json` | rulesync, ruler, mcpport | silent drift; config edits nobody previewed |
 | 5 | ✅ 2026-10-24 **Needs-you surface**: `bridge-board cards --brief` (one line per open card, the question quoted as data, silent when none); the plugin ships it as a `UserPromptSubmit` hook (`hooks/hooks.json`), the README has the snippet for a clone | Orchestrator.inc "Needs you" lane, agent-mail overseer, Claude agent view | asks that nobody sees |
 
+Also landed 2026-10-24, outside the borrowed list: **the message protocol as a spec** — [PROTOCOL.md](PROTOCOL.md)
+(identities, envelope, header lines, kinds, request lifecycle, topics, markers, what a transport must enforce),
+`protocol/envelope.schema.json`, `protocol/vectors.json`, `bridge-board read --json`, and `tests/test_protocol.py`
+holding spec, schema and board to each other. It is the first of four steps toward a protocol a fourth vendor can
+implement without reading SHARED-RULES.md: next the adapter conformance kit (#11), then a fourth family through it,
+then an A2A transport (#16) when a cross-machine peer exists.
+
 ## Next (M) — cheaper, safer runs
 
 | # | Item | Borrowed from | What it fixes |

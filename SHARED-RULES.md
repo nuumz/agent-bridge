@@ -231,6 +231,10 @@ write delegation review `git status` / `git diff` before building on the result.
 MCP server `bridge_board` (`bin/bridge-board serve`, registered by `bridge-sync`: Claude user scope via `claude mcp add`,
 Cursor via `~/.cursor/mcp.json`; Copilot when its npm CLI exists). State = one SQLite file `board/board.db` (WAL); every
 CLI spawns its own stdio server, so there is no daemon. Verified 2026-09-12 with real cursor-agent + claude runs.
+**The message grammar is specified in [docs/PROTOCOL.md](docs/PROTOCOL.md)** — identities, the envelope, header
+lines, kinds, addressing, the request lifecycle, topics, body markers, what a transport must enforce — with a JSON
+Schema and test vectors under `docs/protocol/` (`tests/test_protocol.py` holds spec, schema and board to each other);
+`bridge-board read <topic> --json` prints a topic as one envelope per line. This section stays the operational view.
 
 - Tools: `board_status`, `board_post`, `board_read`, `board_wait` (long-poll ≤120 s, 8 waits per session — a refused call
   does not count), `board_open`, `board_join`, `board_leave`, `board_close`, `board_task_add`, `board_task_claim`,
@@ -332,7 +336,8 @@ whatever its env says.
   bin/ask-copilot     = ask-agent copilot
   bin/bridgelib/      the pieces of ask-agent: core.py (paths, quota mark, helpers) · adapters.py (Claude/Cursor/Copilot)
                       · runner.py (process group + timeout, board registration, threads, execute) · grill.py (grill-plan
-                      recommend/card section for bridge-plan); bridge-sync imports the peer table from here
+                      recommend/card section for bridge-plan) · protocol.py (the message envelope of docs/PROTOCOL.md:
+                      export + schema check); bridge-sync imports the peer table from here
   bin/bridge-watch    live view of bridged runs: overview (worker registry + each peer's stream log), `-f <pid>` follow,
                       `--tmux [-a]` one window per run; peers write stream-json (claude, cursor) / JSONL (copilot)
   bin/bridge-sync     regenerates the peer mirrors of ~/.claude/CLAUDE.md and the skill links; runs the panel/run-log gc
@@ -348,6 +353,8 @@ whatever its env says.
   work-skills.local/  machine-local packs, same format — git-ignored
   tests/              unit tests
   SHARED-RULES.md     this file
+  docs/PROTOCOL.md    the message protocol (identities, envelope, kinds, request lifecycle, transports);
+                      docs/protocol/ holds envelope.schema.json and vectors.json
 
 ~/.agent-bridge/state/           runtime state — git-ignored; every relative state path in this file is under it
   runs/               JSON transcript + prompt of every bridged call (<stamp>-<peer>.{json,err,prompt.txt})

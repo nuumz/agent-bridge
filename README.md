@@ -7,6 +7,8 @@ share a message board, and run multi-agent reviews and fixes. The bridge wraps t
 
 > **Document boundary.** This README owns install, first-run, and the command map.
 > Protocol (exit codes, hop guard, egress, session cards): [SHARED-RULES.md](SHARED-RULES.md).
+> The message layer agents use to talk across vendors (identities, envelope, kinds, request lifecycle), with a JSON
+> Schema and test vectors: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 > What leaves the machine and which rail is enforced where: [SECURITY.md](SECURITY.md).
 > How it compares with other multi-agent tools: [docs/landscape.md](docs/landscape.md).
 > Changing the code: [CONTRIBUTING.md](CONTRIBUTING.md) (agents: [AGENTS.md](AGENTS.md)).
@@ -190,13 +192,13 @@ Every command takes `--help`.
 ## Repository layout
 
 ```
-bin/            executables; bin/bridgelib/ is the shared library (core, adapters, runner, ledger, grill, workskills)
+bin/            executables; bin/bridgelib/ is the shared library (core, adapters, runner, ledger, grill, workskills, protocol)
 agents/         Claude Code subagent wrappers, linked into ~/.claude/agents/ by bridge-sync
 roles/          panel personas (root-cause, contract-checker, design-critic, …)
 playbooks/      job kinds for bridge-plan: default roles, peers, session depth
 work-skills/    capability packs injected into bridge-work prompts (impl-test, impl-mapper, …)
 tests/          unit tests (standard-library unittest)
-docs/           landscape (comparable projects, what was borrowed) and the roadmap
+docs/           the message protocol (PROTOCOL.md + protocol/ schema and vectors), landscape, roadmap
 SHARED-RULES.md the protocol every peer follows
 ```
 
