@@ -49,14 +49,19 @@ EXCLUDE = {"cursor-bridge", "agent-bridge"}  # Claude-side bridge skill must not
 from bridgelib.core import DISABLED  # noqa: E402 — one peer table for ask-agent and the mirrors
 # Claude-only content that must not reach a peer (no RTK hook, no Claude subagents, no commit token):
 SKIP_IMPORTS = {"RTK.md"}                     # @-imports dropped by file name
-SKIP_HEADINGS = {"## Efficient Agent Usage", "## Skills (Claude Code)"}  # section dropped up to the next heading of same/higher level
+# sections dropped up to the next heading of the same or a higher level; a configured name the file no longer has is
+# reported every run, so a stale entry is noticed, not silent (the two 2026-09 names were retired on 2026-10-24)
+SKIP_HEADINGS: set[str] = set()
 SKIP_MARK = re.compile(r"<!-- bridge:skip -->.*?<!-- /bridge:skip -->\n?", re.S)  # explicit opt-out region
-# The line (or old fenced block) carrying the Claude-side commit marker — a peer must never learn to self-authorize.
-COMMIT_TOKEN_FENCE = re.compile(r"```\n[^\n]*\.commit-authorized[^\n]*\n```\n|^[^\n]*CLAUDE_COMMIT_AUTHORIZED[^\n]*\n", re.M)
-COMMIT_TOKEN_NOTE = ("*(Copilot / Cursor: a stricter rule applies to you — never run a mutating git command "
-                     "(`commit`, `push`, `tag`, `reset`, `rebase`, `merge`, `checkout`/`switch`, `stash`, branch "
-                     "create/delete), even when asked; there is no authorization marker on your side. Hand the user "
-                     "the exact command and commit message instead.)*\n")
+# The Claude-side commit marker — a peer must never learn to self-authorize. The old fenced recipe goes as a block;
+# an inline mention takes only its own sentence with it (a one-bullet Git section keeps its other rules).
+COMMIT_TOKEN = "CLAUDE_COMMIT_AUTHORIZED"
+COMMIT_TOKEN_BLOCK = re.compile(r"```[^\n]*\n[^\n]*\.commit-authorized[^\n]*\n```\n?")
+COMMIT_TOKEN_NOTE = ("*(The authorization marker is Claude-side only — a peer has none. `git commit` / `push` / `tag` "
+                     "only when the user asked for it in the current turn, as the bridge note says; otherwise hand the "
+                     "user the exact command and commit message.)*")
+# text that must never reach a peer: the mirror is not written while any of these survives the filters
+NEVER_MIRROR = (COMMIT_TOKEN, ".commit-authorized", "commit-autonomy on", "<!-- bridge:skip -->")
 
 # peer → (rules file, header template, skills dir)
 PEERS = {
@@ -131,8 +136,8 @@ def say(msg: str) -> None:
         print(msg)
 
 
-def resolve_imports(path: Path, seen: set[Path] | None = None) -> str:
-    """Inline `@relative/path.md` import lines the way Claude Code does."""
+def resolve_imports(path: Path, seen: set[Path] | None = None, notes: list[str] | None = None) -> str:
+    """Inline `@relative/path.md` import lines the way Claude Code does; a missing target is said, never pasted."""
     seen = seen or set()
     if path in seen or not path.is_file():
         return ""
@@ -146,32 +151,72 @@ def resolve_imports(path: Path, seen: set[Path] | None = None) -> str:
                 out.append(f"<!-- import {target} skipped: Claude-only -->")
                 continue
             child = (HOME / target[2:]) if target.startswith("~/") else (path.parent / target)
-            body = resolve_imports(child.resolve(), seen)
+            body = resolve_imports(child.resolve(), seen, notes)
             if body:
                 out.append(f"<!-- imported from {child} -->")
                 out.append(body)
-                continue
+            elif child.is_file():
+                out.append(f"<!-- import {target} empty or already inlined -->")
+            else:
+                out.append(f"<!-- import {target} not found -->")
+                if notes is not None:
+                    notes.append(f"import {target} not found (from {path}) — left out of the mirror")
+            continue
         out.append(line)
     return "\n".join(out)
 
 
-def strip_claude_only(body: str) -> str:
-    """Drop sections, marked regions and the commit-token recipe that only make sense inside Claude Code."""
-    body = SKIP_MARK.sub("", body)
-    body = COMMIT_TOKEN_FENCE.sub(COMMIT_TOKEN_NOTE, body)
-    out, skipping, level = [], False, 0
-    for line in body.splitlines():
+def _without_token_sentence(line: str) -> str:
+    """The line with the sentence that carries the commit marker replaced by the peer note; a list marker stays."""
+    m = re.match(r"^(\s*(?:(?:[-*+]|\d+\.)\s+)?)(.*)$", line, re.S)
+    prefix, rest = m.group(1), m.group(2)
+    # a sentence ends at `.` or `;` (a closing **, *, ) or quote may follow) before whitespace or the end of the line
+    parts = [m.group(0).strip() for m in re.finditer(r".+?(?:[.;](?:\*\*|\*|\)|\"|”)?(?=\s|$)|$)", rest)]
+    out: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        part = COMMIT_TOKEN_NOTE if COMMIT_TOKEN in part else part
+        if not (part == COMMIT_TOKEN_NOTE and out and out[-1] == COMMIT_TOKEN_NOTE):   # one note per line
+            out.append(part)
+    return prefix + " ".join(out)
+
+
+def strip_report(body: str) -> tuple[str, list[str]]:
+    """Drop sections, marked regions and the commit-token recipe that only make sense inside Claude Code.
+    Returns the text and one note per filter: what it dropped, and which configured anchor it did not find —
+    a filter that matches nothing stays audible (SKIP_HEADINGS named sections that no longer existed, 2026-10-23)."""
+    body, regions = SKIP_MARK.subn("", body)
+    body = COMMIT_TOKEN_BLOCK.sub(COMMIT_TOKEN_NOTE + "\n", body)
+    lines = [_without_token_sentence(ln) if COMMIT_TOKEN in ln else ln for ln in body.split("\n")]
+    out, skipping, level, dropped = [], False, 0, []
+    for line in lines:
         m = re.match(r"(#{1,6}) ", line)
         if m:
             if skipping and len(m.group(1)) <= level:
                 skipping = False
             if line.strip() in SKIP_HEADINGS:
                 skipping, level = True, len(m.group(1))
+                dropped.append(line.strip())
                 out.append(f"<!-- section '{line.strip()}' skipped: Claude-only -->")
                 continue
         if not skipping:
             out.append(line)
-    return "\n".join(out)
+    marker_lines = sum(1 for ln in out if COMMIT_TOKEN_NOTE in ln)
+    notes = [f"mirror: {regions} bridge:skip region(s) and {len(dropped)} section(s) dropped, "
+             f"{marker_lines} commit-marker line(s) replaced by the peer note"]
+    for heading in sorted(SKIP_HEADINGS - set(dropped)):
+        notes.append(f"mirror: section '{heading}' not found (SKIP_HEADINGS entry is stale or the file moved on)")
+    return "\n".join(out), notes
+
+
+def strip_claude_only(body: str) -> str:
+    return strip_report(body)[0]
+
+
+def leaks(text: str) -> list[str]:
+    """NEVER_MIRROR tokens still present after the filters — the mirror is not written while any is."""
+    return [t for t in NEVER_MIRROR if t in text]
 
 
 def current_text(path: Path) -> str | None:
@@ -209,12 +254,25 @@ def cursor_note() -> str:
             + CURSOR_PULL + "\n")
 
 
-def sync_rules() -> None:
-    body = ""
+def sync_rules() -> list[str]:
+    """Mirror the rules into every peer; returns the NEVER_MIRROR tokens that stopped the mirror (empty = written)."""
+    body, leaked = "", []
     if CLAUDE_MD.is_file():
-        body = strip_claude_only(resolve_imports(CLAUDE_MD)) + "\n"
-        write_if_changed(RULES_MIRROR, f"<!-- {MARKER} — canonical stripped mirror of ~/.claude/CLAUDE.md -->\n\n" + body,
-                         "canonical mirror")
+        notes: list[str] = []
+        body, strip_notes = strip_report(resolve_imports(CLAUDE_MD, notes=notes))
+        body += "\n"
+        for note in notes + strip_notes:
+            say(f"bridge-sync: {note}")
+        leaked = leaks(body)
+        if leaked:
+            # fail closed: peers keep their last good mirror rather than learn the commit recipe
+            print(f"bridge-sync: WARNING: the stripped {CLAUDE_MD} still carries {', '.join(leaked)} — mirror not "
+                  f"written; wrap that text in <!-- bridge:skip --> … <!-- /bridge:skip --> and run bridge-sync again",
+                  file=sys.stderr)
+            body = ""
+        else:
+            write_if_changed(RULES_MIRROR, f"<!-- {MARKER} — canonical stripped mirror of ~/.claude/CLAUDE.md -->\n\n"
+                             + body, "canonical mirror")
     else:
         say(f"bridge-sync: no {CLAUDE_MD}, skipping the user-rules mirror (peers still get the bridge note)")
     write_if_changed(BRIDGE_NOTE, BRIDGE_NOTE_BODY, "bridge note")
@@ -231,6 +289,8 @@ def sync_rules() -> None:
             if not target.parent.parent.exists():          # ~/.copilot, ~/.cursor absent → peer not installed
                 say(f"bridge-sync: {name}: {target.parent.parent} missing, skipped")
                 break
+            if leaked and target.is_file():                    # a leak: the last good file stays as it is
+                continue
             if not content:                                    # no CLAUDE.md: a stale mirror must not outlive its source
                 retire(target, label, f"(no {CLAUDE_MD})")
                 continue
@@ -240,6 +300,7 @@ def sync_rules() -> None:
                     f"(delete it to get the generated one; the user-rules mirror is {RULES_MIRROR})")
                 continue
             write_if_changed(target, content, label, current)
+    return leaked
 
 
 def disabled_skills() -> set[str]:
@@ -385,10 +446,13 @@ def main() -> int:
     global QUIET
     ap = argparse.ArgumentParser(prog="bridge-sync", description=__doc__.split("\n\n")[0],
                                  epilog="Writes only files that carry its GENERATED marker (or do not exist yet); "
-                                        "a user's own file is reported and left alone.")
-    ap.add_argument("--quiet", action="store_true", help="print nothing (for a SessionStart hook)")
+                                        "a user's own file is reported and left alone. Exit 1 when the stripped "
+                                        "CLAUDE.md would still carry the commit marker, `commit-autonomy on` or an "
+                                        "unterminated <!-- bridge:skip -->: the mirror is then not written.")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print nothing but a leak WARNING on stderr (for a SessionStart hook)")
     QUIET = ap.parse_args().quiet
-    sync_rules()
+    leaked = sync_rules()
     if SKILLS_SRC.is_dir():
         skills, off = bridged_skills()
         for name, peer in PEERS.items():
@@ -409,7 +473,7 @@ def main() -> int:
     first = (r.stdout.strip().splitlines() or [r.stderr.strip()[:200]])[0]
     if r.returncode != 0 or "removed 0 " not in first:
         say(f"bridge-sync: {first}")
-    return 0
+    return 1 if leaked else 0                 # a hook shows a non-zero exit and its stderr: the leak stays audible
 
 
 if __name__ == "__main__":

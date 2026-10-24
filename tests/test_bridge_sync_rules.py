@@ -1,7 +1,9 @@
 """bridge-sync rule files — every installed peer gets the bridge note on a fresh machine; a user's file is never clobbered."""
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import json
 import importlib.machinery
 import importlib.util
@@ -86,6 +88,44 @@ class RuleFiles(unittest.TestCase):
         first = self.peers["cursor"]["note_file"].read_text()
         self.bs.sync_rules()
         self.assertEqual(self.peers["cursor"]["note_file"].read_text(), first)
+
+    def test_a_mirror_that_would_leak_the_commit_recipe_is_not_written(self):
+        (self.home / ".claude").mkdir()
+        md = self.home / ".claude" / "CLAUDE.md"
+        md.write_text("# Rules\n- line length 120\n")
+        self.bs.sync_rules()
+        before = self.peers["copilot"]["rules"].read_text()
+        # an unterminated skip marker: the region regex cannot strip it, and the grant recipe sits right after it
+        md.write_text("# Rules\n- line length 120\n- <!-- bridge:skip -->run `commit-autonomy on -- go` first\n")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            leaked = self.bs.sync_rules()
+        self.assertCountEqual(leaked, ["<!-- bridge:skip -->", "commit-autonomy on"])
+        self.assertIn("not written", err.getvalue())
+        self.assertEqual(self.peers["copilot"]["rules"].read_text(), before)      # the last good mirror stays
+        self.assertNotIn("commit-autonomy", (self.home / "mirror" / "user-rules.md").read_text())
+        self.peers["copilot"]["rules"].unlink()                                    # a peer with no mirror yet
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.bs.sync_rules()
+        fresh = self.peers["copilot"]["rules"].read_text()
+        self.assertIn("One hop only", fresh)                                        # still gets the bridge note
+        self.assertNotIn("line length 120", fresh)                                  # and no user rules at all
+        self.assertNotIn("commit-autonomy", fresh)
+
+    def test_a_missing_import_is_said_not_pasted(self):
+        (self.home / ".claude").mkdir()
+        (self.home / ".claude" / "CLAUDE.md").write_text("# Rules\n@gone.md\n- keep\n")
+        out = io.StringIO()
+        self.bs.QUIET = False
+        try:
+            with contextlib.redirect_stdout(out):
+                self.bs.sync_rules()
+        finally:
+            self.bs.QUIET = True
+        mirror = self.peers["copilot"]["rules"].read_text()
+        self.assertNotIn("\n@gone.md", mirror)
+        self.assertIn("gone.md", out.getvalue())
+        self.assertIn("not found", out.getvalue())
 
 
 class Help(unittest.TestCase):
