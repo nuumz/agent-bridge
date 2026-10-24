@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 from bridgelib import workskills  # noqa: E402
@@ -27,6 +29,17 @@ class Pick(unittest.TestCase):
         )
         self.assertIsNotNone(skill)
         self.assertEqual(skill["name"], "impl-test")
+
+    def test_local_skill_is_loaded_and_wins_by_path(self):
+        # a machine-local skill (work-skills.local/) joins the public set and is picked on path evidence alone
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "impl-docs.md").write_text(
+                "---\nname: impl-docs\nsummary: edit docs\ntriggers: \"docs-lint\"\npaths: \"docs/\"\n---\n"
+                "### implementer\n- keep headings.\n### reviewer\n- must-fix=yes if a link breaks.\n")
+            with mock.patch.object(workskills, "LOCAL_SKILLS", Path(d)):
+                skill = workskills.pick("update the install guide", files=["docs/install.md"], verify="make docs-lint")
+        self.assertIsNotNone(skill)
+        self.assertEqual(skill["name"], "impl-docs")
 
     def test_small_fix_by_trigger(self):
         skill = workskills.pick(

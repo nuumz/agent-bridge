@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
+import boardlib  # noqa: E402
 from bridgelib import ledger, runner  # noqa: E402
 from bridgelib.adapters import Copilot  # noqa: E402
 
@@ -142,6 +143,8 @@ class CopilotRuntime(unittest.TestCase):
             with mock.patch.object(agent, "resolve", return_value=str(cli)), \
                     mock.patch.object(runner, "RUNS", root / "runs"), \
                     mock.patch.object(ledger, "LEDGER", root / "ledger.jsonl"), \
+                    mock.patch.object(boardlib, "BOARD_DIR", root / "board"), \
+                    mock.patch.object(boardlib, "DB_PATH", root / "board" / "board.db"), \
                     contextlib.redirect_stderr(out):
                 rc, parsed, log = runner.execute(agent, self.opts(dir=tmp), "Review src/a.py", None, None)
                 rows = ledger.rows()
@@ -167,6 +170,8 @@ class CopilotRuntime(unittest.TestCase):
             with mock.patch.object(agent, "resolve", return_value=str(cli)), \
                     mock.patch.object(runner, "RUNS", root / "runs"), \
                     mock.patch.object(ledger, "LEDGER", root / "ledger.jsonl"), \
+                    mock.patch.object(boardlib, "BOARD_DIR", root / "board"), \
+                    mock.patch.object(boardlib, "DB_PATH", root / "board" / "board.db"), \
                     contextlib.redirect_stderr(io.StringIO()):
                 rc, parsed, log = runner.execute(agent, self.opts(dir=tmp), "Review src/a.py", None, None)
                 row = ledger.rows()[0]
@@ -275,13 +280,14 @@ class SharedExtraRoots(unittest.TestCase):
         import subprocess
         from bridgelib import core
         with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as spec, \
-                mock.patch.dict(os.environ, {}, clear=False):
+                tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop(core.ADD_DIRS_VAR, None)
             core.share_add_dirs([spec, spec])
             core.share_add_dirs([cwd])
             self.assertEqual(core.add_dirs_from_env(),
                              [str(Path(spec).resolve()), str(Path(cwd).resolve())])
             env = {k: v for k, v in os.environ.items() if k != core.HOP_VAR}
+            env["HOME"] = home                      # the real ask-agent opens the board under HOME even on --dry-run
             out = subprocess.run([str(Path(__file__).resolve().parents[1] / "bin" / "ask-agent"), "copilot",
                                   "--dry-run", "-d", cwd, "q"], capture_output=True, text=True, env=env, cwd=cwd)
             self.assertIn(f"--add-dir={Path(spec).resolve()}", json.loads(out.stdout)["argv"])
