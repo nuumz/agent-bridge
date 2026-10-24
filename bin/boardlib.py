@@ -7,6 +7,7 @@ stdio servers plus the dispatcher never race on seq numbers or task claims.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import re
 import sqlite3
@@ -14,6 +15,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from bridgelib import evidence, ledger
 from bridgelib.core import STATE, hop_active
 
 HOME = Path.home()
@@ -247,9 +249,21 @@ def post(conn: sqlite3.Connection, tid: int, author: str, body: str, kind: str =
     if kind == "blocked" and header(body).get("missing", "").strip().lower() in NO_VALUE:
         raise BoardError("kind=blocked needs a `missing: <what you lack>` header line — if what you lack is a "
                          "decision or a fact only the user has, send a card (board_ask_user) instead")
-    if reply_to is not None and conn.execute("SELECT 1 FROM messages WHERE topic_id=? AND seq=?",
-                                             (tid, reply_to)).fetchone() is None:
-        raise BoardError(f"reply_to={reply_to} is not a message of this topic")
+    target = None
+    if reply_to is not None:
+        target = conn.execute("SELECT seq, author, kind, body, addressee FROM messages WHERE topic_id=? AND seq=?",
+                              (tid, reply_to)).fetchone()
+        if target is None:
+            raise BoardError(f"reply_to={reply_to} is not a message of this topic")
+    # an agent's reply to an agent's still-open request is scored; the requester withdrawing (a later run of the same
+    # ephemeral `<family>#<pid>` thread included), a human answering, and replies to a card (its shape names the kind
+    # of answer, the human writes it freely) are not
+    if (target is not None and target["kind"] == "request" and kind in ("answer", "done", "blocked")
+            and not same_run(author, target["author"]) and not author.startswith("user:")
+            and not (target["addressee"] or "").startswith("user:")
+            and conn.execute(f"SELECT 1 FROM messages m WHERE m.topic_id=? AND m.seq=? AND {OPEN_REQUEST}",
+                             (tid, target["seq"])).fetchone() is not None):
+        _score_reply(conn, tid, author, kind, body, target)
     with tx(conn):
         conn.execute("INSERT INTO messages(topic_id, seq, author, kind, body, reply_to, created_at, addressee) "
                      "SELECT ?, COALESCE(MAX(seq),0)+1, ?, ?, ?, ?, ?, ? FROM messages WHERE topic_id=?",
@@ -257,6 +271,50 @@ def post(conn: sqlite3.Connection, tid: int, author: str, body: str, kind: str =
         seq = conn.execute("SELECT MAX(seq) FROM messages WHERE topic_id=?", (tid,)).fetchone()[0]
         conn.execute("UPDATE tasks SET lease_until=? WHERE status='claimed' AND claimed_by=?", (now() + LEASE_S, author))
     return seq
+
+
+def _score_reply(conn: sqlite3.Connection, tid: int, author: str, kind: str, body: str, request: sqlite3.Row) -> None:
+    """A reply to a request is held to the request's `shape:`: an answer/done in another shape is refused (that
+    refusal is the one automatic re-request — it quotes the shape back), and the miss is a ledger row, as is every
+    `blocked`, so `bridge-plan learn --team` can tell who ships, who stalls and who misses the mark."""
+    shape = header(request["body"]).get("shape")
+    name = conn.execute("SELECT name FROM topics WHERE id=?", (tid,)).fetchone()[0]
+    row = {"peer": author, "topic": name, "request_seq": request["seq"], "requested_by": request["author"]}
+    if kind == "blocked":
+        _ledger({"type": "blocked", **row, "missing": header(body).get("missing", "")[:200]})
+        return
+    if evidence.shape_met(shape, body) is False:
+        digest = hashlib.sha1(body.strip().encode()).hexdigest()[:12]
+        if not _logged("shape_miss", row, digest):          # the same wrong body retried is one miss, not three
+            _ledger({"type": "shape_miss", **row, "shape": shape, "body_hash": digest})
+        raise BoardError(f"incomplete: the request asks for `{shape}` — reply in that shape, or post blocked with a "
+                         f"`missing:` line saying what stops you")
+
+
+def family(identity: str) -> str:
+    """cursor#41, claude@live:p, copilot:task3 → cursor, claude, copilot."""
+    return re.split(r"[#@:]", identity or "")[0]
+
+
+def same_run(a: str, b: str) -> bool:
+    """The same agent, or two runs of one `<family>#<pid>` thread (each ask-agent run is a fresh pid)."""
+    return a == b or ("#" in a and "#" in b and family(a) == family(b))
+
+
+def _logged(kind: str, row: dict, digest: str) -> bool:
+    try:
+        return any(r.get("type") == kind and r.get("body_hash") == digest and r.get("topic") == row["topic"]
+                   and r.get("request_seq") == row["request_seq"] and family(r.get("peer", "")) == family(row["peer"])
+                   for r in ledger.rows())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ledger(row: dict) -> None:
+    try:
+        ledger.record(row)
+    except Exception:  # noqa: BLE001 — the ledger never breaks a post
+        pass
 
 
 def _for_me(me: str, roles: list[str]) -> tuple[str, tuple]:
@@ -275,6 +333,8 @@ def _for_me(me: str, roles: list[str]) -> tuple[str, tuple]:
 OPEN_REQUEST = ("m.kind='request' AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.topic_id=m.topic_id "
                 "AND r.reply_to=m.seq AND (r.kind IN ('answer','done','blocked') OR (r.kind='decision' AND "
                 "m.addressee LIKE 'user:%')) AND (m.addressee='*' OR r.author=m.addressee OR r.author=m.author "
+                "OR (instr(m.author,'#')>0 AND instr(r.author,'#')>0 AND substr(m.author,1,instr(m.author,'#'))="
+                "substr(r.author,1,instr(r.author,'#'))) "     # a later run of the requester's own `<family>#<pid>` thread
                 "OR (m.addressee LIKE 'user:%' AND r.author LIKE 'user:%') OR (m.addressee LIKE '@%' AND r.author IN "
                 "(SELECT agent FROM members b WHERE b.topic_id=m.topic_id AND b.role=substr(m.addressee, 2) "
                 "AND b.left_at IS NULL))))")
