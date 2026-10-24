@@ -84,7 +84,8 @@ def ask_with_fallback(peer: str, mode: str, cwd: str, prompt: str, timeout: int,
 def review_valid(rc: int, review: str) -> bool:
     """A review counts only when the run finished (rc 0, not an [[ASK]]) and answered in the requested shape."""
     text = review.strip()
-    return rc == 0 and (text.upper() == "NONE" or any(ln.strip().startswith("|") for ln in text.splitlines()))
+    is_table = any(re.fullmatch(r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?", ln.strip()) for ln in text.splitlines())
+    return rc == 0 and (text.upper() == "NONE" or is_table)
 
 
 def review_label(reviewer_used: str, implementer_used: str) -> str:

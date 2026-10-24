@@ -92,6 +92,7 @@ class FallbackAndReviewGates(unittest.TestCase):
         self.assertFalse(self.bw.review_valid(5, "[[ASK]] which branch?"))
         self.assertFalse(self.bw.review_valid(0, "Looks good to me overall."))
         self.assertFalse(self.bw.review_valid(1, table))
+        self.assertFalse(self.bw.review_valid(0, "| I could not inspect the diff"))
 
     def test_self_review_is_disclosed(self):
         self.assertIn("not independent", self.bw.review_label("claude", "claude"))
