@@ -611,6 +611,10 @@ One resumable flow (`work/<name>/flow.json`) over two existing tools, with the d
 3. **fix** = `bridge-work run fix-<name>` with the ruling inlined into the task (the ruling beats the recommendation
    where they differ; the patch sketch is guidance only). Branch `bridge/fix-<name>`, report, ledger row `type: fix`.
 
-`bridge-fix run <name>` on an existing flow resumes at its stage (a failed fix stays at `fix`: adjust files/verify or
-rule again, then re-run). Hop guard and `-p` egress gate as everywhere (see §5/§6/§8). Subagent: `peer-fix` (one stage
-per spawn).
+`bridge-fix run <name>` on an existing flow resumes at its stage. A failed fix stays at `fix`: `bridge-fix decide` again
+replaces the earlier ruling in the agreement's Ruling section (what the implementer reads; the card is closed once —
+a re-rule closes it only if the first ruling could not), the next fix is told an earlier attempt sits in the worktree,
+and `bridge-fix run <name> --files … --verify …` records new gates on the flow and the agreement (validated like
+`decide`; a done flow is left alone) before the fix re-runs — `--files`/`--verify` left out keep what the flow has.
+Hop guard and `-p` egress gate as everywhere (see §5/§6/§8).
+Subagent: `peer-fix` (one stage per spawn).
