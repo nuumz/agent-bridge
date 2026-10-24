@@ -48,6 +48,9 @@ own first stderr line>` before the raw dump — scripts (`bridge-panel`) read th
   one simple command per call — 363 of 446 denials measured on 2026-09-26 were `for` loops, `VAR=…;` prefixes and
   heredocs the permission matcher cannot split. Builds (`mvn`) and `python3` stay denied in read-only runs.
 - Long prompts can be piped on stdin. `--dry-run` prints the resolved command line without running anything.
+- The peer runs with the caller's environment **minus the caller's session identity** (`CLAUDE_CODE_*`, `CLAUDECODE`,
+  `CLAUDE_SESSION_*`): a nested `claude` that inherits `CLAUDE_CODE_SESSION_ID` reports the parent's session as its own.
+  Credentials the peer itself needs (provider keys, `GH_TOKEN`) are passed through unchanged.
 - Default timeout 900 s; on expiry (or SIGTERM/SIGINT/SIGHUP to `ask-agent`) the peer's whole process group is killed —
   its tool/MCP children included — and the stderr tail is surfaced.
 
@@ -59,7 +62,7 @@ How the common options map onto each CLI:
 | `-m write` | `--permission-mode acceptEdits` | `--force` | `--allow-all-tools` + `--deny-tool=shell(git commit)` … |
 | git commit/push/tag denied by | `--disallowed-tools Bash(git commit:*)…` + PreToolUse hook | `permissions.deny` in `~/.cursor/cli-config.json` | `--deny-tool=shell(git …)` |
 | `-M model` | `--model` | `--model` (always passed: `auto` unless `-M`, so the app's last pick in cli-config.json never leaks in) | `--model=` |
-| `--session id` / `-c` | `--resume id` / `--continue` | `--resume id` / `--continue` | `--resume=id` / `--continue` |
+| `--session id` / `-c` | `--resume id --fork-session` / `--continue --fork-session` (the peer never writes into the session it resumes — with `-c` in your own directory that is yours) | `--resume id` / `--continue` | `--resume=id` / `--continue` |
 | `-w [name]` | `--worktree [name]` → `<repo>/.claude/worktrees/<name>` (locked) | `--worktree [name]` → `~/.cursor/worktrees/<repo>/<name>` | not supported (use `git worktree add` + `-d`) |
 | `--add-dir` | `--add-dir` | `--add-dir` | `--add-dir=` |
 | output parsed from | `--output-format stream-json --verbose` (last line = `result`: `result`, `session_id`, `usage`; earlier lines feed `bridge-watch`) | `--output-format stream-json` (`assistant` chunks, `result`) | `--output-format json` JSONL (`assistant.message` content, `result.sessionId` + `usage.premiumRequests`/`totalApiDurationMs`; `EDITED=` in the bridge line when `codeChanges.filesModified` is non-empty) |
@@ -102,7 +105,9 @@ it in the current turn** — never on the agent's own judgement.
 
 **No deep recursion.** One hop only: if you were invoked *by* the bridge, do the work yourself —
 never call a bridge command back. Enforced: `ask-agent` exports `AGENT_BRIDGE_HOP=1` to the peer and exits 3
-when it is already set; `ask-claude` additionally denies `Bash(ask-*:*)`.
+when the variable is present (any value — `AGENT_BRIDGE_HOP=` is still a hop) **or** when a registered bridged run is
+among its ancestor processes (a peer that scrubs its env is still inside the run); `bridge-board dispatch` refuses on
+the same two signals; `ask-claude` additionally denies `Bash(ask-*:*)`.
 
 **Run it detached from an agent shell.** Claude Code's Bash tool caps a foreground call at
 120 s (600 s max) — a foreground bridge call is
@@ -179,9 +184,11 @@ CLI spawns its own stdio server, so there is no daemon. Verified 2026-09-12 with
   `board_task_claim`, `board_task_done`. Identity is resolved by the server — `<agent>@primary`, `<agent>#<pid>` for an
   `ask-agent` run (pid = the peer CLI process, so every run — each dialog round included — is distinct),
   `<agent>:task<N>` for a dispatched task — by finding the run's CLI pid among its ancestors in the
-  `workers` table (cursor-agent does not forward env to MCP children), so an agent cannot impersonate another.
+  `workers` table (cursor-agent does not forward env to MCP children), so an agent cannot impersonate another. The
+`bridge-board` CLI resolves identity the same way: a shell inside a bridged run posts as that run, may not post
+`kind=decision`, open or close topics, or dispatch — whatever its env says.
 - **Nothing on the board spawns an agent.** `bridge-board dispatch --max-agents N --agents a,b [--allow-write DIRS]
-  [--include-peer-tasks] [--watch S]` is the only spawner (flock-serialised, refuses under `AGENT_BRIDGE_HOP=1`): one
+  [--include-peer-tasks] [--watch S]` is the only spawner (flock-serialised, refuses inside a bridged run): one
   live run per family, `mode=write` only inside `--allow-write` dirs, peer-queued tasks only on request. `ask-agent`
   registers every run in `workers` (also hand-started ones) so the cap counts all of them; a dead worker fails its task,
   an expired lease (1500 s) re-queues a claimed task that has no live worker.
@@ -189,7 +196,13 @@ CLI spawns its own stdio server, so there is no daemon. Verified 2026-09-12 with
   final answer, then `board_task_done` when it was dispatched (ask-agent closes the task from the parsed answer otherwise).
 - Claude needs `--allowed-tools mcp__bridge_board` and cannot use MCP tools in plan mode → with the board on, `-m ask|plan`
   run in `default` mode with `Edit,Write,MultiEdit,NotebookEdit` denied; Cursor needs `--approve-mcps`. `--no-board` restores
-  the old flags. Retention: `bridge-sync` runs `gc` — topics closed >14 days ago are deleted (`bridge-board close <topic>`).
+  the old flags.
+  Retention: a finished run closes its own topics — `bridge-panel` closes `panel:<name>` and its
+  `conv:panel-<name>-*` threads on report or abort, `bridge-work` closes `conv:work-<name>-*`, `bridge-live` closes
+  `live:<room>` when the last peer leaves (its peers are registered in `workers` like any bridged run)
+  and reopens it when one rejoins (the backlog is still there until gc).
+  `bridge-sync` runs `gc` — topics closed >14 days ago are deleted; the user closes anything else with
+  `bridge-board close <topic>`.
 
 ## 7. Files
 

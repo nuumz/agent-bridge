@@ -42,8 +42,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boardlib  # noqa: E402
 from bridgelib import ledger  # noqa: E402
 from bridgelib.adapters import ADAPTERS  # noqa: E402
-from bridgelib.core import (HOP_VAR, PEER_TALK_RULE, ROOT, STATE, detach, err_summary, quota_block,  # noqa: E402
-                            quota_hit, quota_mark)
+from bridgelib.core import (HOP_VAR, PEER_TALK_RULE, ROOT, STATE, detach, err_summary, hop_active,  # noqa: E402
+                            peer_env, quota_block, quota_hit, quota_mark)
 from bridgelib.runner import AGREE_RE, USER_AUTHOR, kill_tree  # noqa: E402
 
 LIVE = STATE / "live"
@@ -115,14 +115,21 @@ def intro(peer: str, room: str, role: str) -> str:
 
 
 def label(m: dict) -> str:
-    if m["kind"] == "decision":
-        return f"Moderator ({m['author']}, seq {m['seq']}): {m['body']}"
-    return f"[{m['author']} · seq {m['seq']}] {m['body']}"
+    """One room post as the peer sees it: the header is ours, the body is indented so a body line can never pass for a
+    header (another peer writing "Moderator (user:x): …" stays inside its own quote)."""
+    head = (f"Moderator ({m['author']}, seq {m['seq']}):" if m["kind"] == "decision"
+            else f"[{m['author']} · seq {m['seq']}]")
+    return head + "\n" + "\n".join("    " + ln for ln in m["body"].splitlines())
+
+
+def close_room_if_empty(conn, room: str) -> None:
+    if not room_peers(room):
+        boardlib.close_topic(conn, topic(room), missing_ok=True)
 
 
 # ----------------------------------------------------------------------------- start / broker
 def start(o) -> int:
-    if os.environ.get(HOP_VAR):
+    if hop_active():
         print(f"bridge-live: refusing — already inside a bridged run ({HOP_VAR}). One hop only.", file=sys.stderr)
         return 3
     prev = load_state(o.peer)
@@ -145,6 +152,7 @@ def start(o) -> int:
     (LIVE / o.peer).mkdir(parents=True, exist_ok=True)
     conn = boardlib.connect()
     tid = boardlib.topic_id(conn, topic(o.room), USER_AUTHOR)
+    boardlib.reopen_topic(conn, topic(o.room))          # closed when its last peer left; the backlog is still there
     # taken before the fork so a `send` right after `start` is not lost. A resume in the same room also gets what the
     # room said while the peer was away (from its last answered seq); a STOP in that backlog is history, not an order.
     stop_floor = conn.execute("SELECT COALESCE(MAX(seq),0) FROM messages WHERE topic_id=?", (tid,)).fetchone()[0]
@@ -172,7 +180,9 @@ def broker(o, after: int, stop_floor: int, resume: str | None, base: float) -> i
     def spawn() -> tuple[subprocess.Popen, queue.Queue]:
         p = subprocess.Popen(base_argv + (["--resume", session["id"]] if session["id"] else []), cwd=o.dir,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(err, "a"), text=True, bufsize=1,
-                             env={**os.environ, HOP_VAR: "1"}, process_group=0)
+                             env=peer_env(), process_group=0)
+        # registered like any bridged run, so a shell inside it is this peer to the board and cannot open a hop
+        boardlib.worker_register(conn, p.pid, me, "claude", None, str(peer_log))
         q: queue.Queue = queue.Queue()        # one queue per process: a killed process's EOF never reaches the next one
 
         def pump() -> None:                   # stdout → peer.jsonl; each `result` event closes one turn
@@ -278,6 +288,7 @@ def broker(o, after: int, stop_floor: int, resume: str | None, base: float) -> i
                 boardlib.post(conn, tid, me, f"turn {n} abandoned after {o.turn_timeout}s (--turn-timeout); {peer} "
                                              "restarted on its session — post again if it still matters", "system",
                               reply_to=turn["seq"])
+                boardlib.worker_unregister(conn, proc.pid)
                 proc, results = spawn()
                 first = not session["id"]             # no session yet = the intro never reached a transcript
                 st.update(status="ready", peer_pid=proc.pid)
@@ -300,8 +311,10 @@ def broker(o, after: int, stop_floor: int, resume: str | None, base: float) -> i
         st.update(status="stopped", reason=reason or "broker interrupted", pending=0, stopped=int(time.time()),
                   after=st["after"] if turn or pending else after, session=session["id"] or st.get("session"))
         save_state(peer, st)
+        boardlib.worker_unregister(conn, proc.pid)
         boardlib.post(conn, tid, me, f"{peer} left: {st['reason']} — {st['turns']} turns, ${total - base:.2f}", "system")
         print(f"[live] {peer}: stopped — {st['reason']}")
+        close_room_if_empty(conn, room)
     return 0
 
 

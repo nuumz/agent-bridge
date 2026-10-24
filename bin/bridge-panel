@@ -40,13 +40,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger  # noqa: E402
-from bridgelib.core import PEER_TALK_RULE, ROOT, STATE, detach, guarded_rc, lang_rule  # noqa: E402
+from bridgelib.core import PEER_TALK_RULE, ROOT, STATE, detach, guarded_rc, hop_active, lang_rule  # noqa: E402
 
 ROLES = ROOT / "roles"
 PANELS = STATE / "panel"
 ASK = ROOT / "bin" / "ask-agent"
 BOARD = ROOT / "bin" / "bridge-board"
-HOP_VAR = "AGENT_BRIDGE_HOP"
 DEFAULT_ROLES = ["root-cause", "contract-checker", "design-critic", "spec-reader"]  # spec-reader settled 4 disputes by
                                                                                     # running the code (measured 2026-09-12)
 MAX_SHARE = 6000     # chars of one finding shown to another worker / the leader
@@ -128,6 +127,16 @@ def ask_with_fallback(role: dict, conv: str, prompt: str, o, peers: list[str], u
 def post(topic: str, text: str, kind: str = "note") -> None:
     if BOARD.is_file():
         subprocess.run([str(BOARD), "post", topic, text, "-k", kind], capture_output=True, text=True)
+
+
+def close_panel_topics(name: str, roles: list[str]) -> None:
+    """A finished panel (report or abort) closes its own topics, so board_status stays short and gc can reclaim them."""
+    if not BOARD.is_file():
+        return
+    threads = [f"panel:{name}", f"conv:panel-{name}-leader", f"conv:panel-{name}-implementer"]
+    threads += [f"conv:panel-{name}-{r}{tail}" for r in roles for tail in ("", "-claude")]
+    for t in threads:
+        subprocess.run([str(BOARD), "close", t], capture_output=True, text=True)   # "not open" is fine
 
 
 def case_file(workspace: str, problem: str) -> tuple[str, list[str]]:
@@ -344,7 +353,7 @@ def write_rc(name: str, rc: int) -> int:
 
 
 def run(o) -> int:
-    if os.environ.get(HOP_VAR):
+    if hop_active():
         print("bridge-panel: refusing to run inside a bridged run (one hop only)", file=sys.stderr)
         return 3
     roles = load_roles()
@@ -448,6 +457,7 @@ def run(o) -> int:
         post(topic, f"Panel `{o.name}` aborted — {msg}")
         (out / "report.md").unlink(missing_ok=True)      # a stale report from an earlier run must not pass as this one's
         ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start)
+        close_panel_topics(o.name, chosen)
         return 4
     cites = verify_citations(o.dir, findings)
     (out / "citations.json").write_text(json.dumps(cites, ensure_ascii=False, indent=2))
@@ -527,6 +537,7 @@ def run(o) -> int:
         print(f"[panel] patch={out / 'patch.md'}", file=sys.stderr)
     post(topic, f"Report written: {out / 'report.md'}\n\n" + report[:3000])
     ledger_row(o, kind, findings, used, fallbacks, failed, 0, t_start)
+    close_panel_topics(o.name, chosen)
     print(head + report)
     print(f"\n[panel] report={out / 'report.md'} board={topic} threads=panel-{o.name}-*", file=sys.stderr)
     return 0
@@ -661,6 +672,8 @@ def synth(o) -> int:
     head = f"# Panel `{o.name}` — re-synthesised {stamp}\n\nLeader: {o.leader} · roles: {', '.join(findings)}\n\n"
     (out / "report.md").write_text(head + report + ("\n\n" + cite_md if cite_md else "") + "\n")
     print(head + report)
+    if rc in (0, 5):                      # the run's abort left its threads open for exactly this re-synthesis
+        close_panel_topics(o.name, list(findings))
     return rc
 
 

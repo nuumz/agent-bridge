@@ -27,13 +27,15 @@ import argparse
 import datetime as dt
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boardlib  # noqa: E402
 from bridgelib.adapters import ADAPTERS, Adapter  # noqa: E402
-from bridgelib.core import PEER_TALK_RULE, DISABLED, HOP_VAR, QUOTA_TTL, quota_block, version_of  # noqa: E402
+from bridgelib.core import (PEER_TALK_RULE, DISABLED, HOP_VAR, QUOTA_TTL, hop_active, quota_block,  # noqa: E402
+                            version_of)
 from bridgelib.runner import (AGREE_RE, CONV_DIR, USER_AUTHOR, BoardRun, Conv, execute, print_parsed,  # noqa: E402
                               protocol)
 
@@ -150,7 +152,9 @@ def main() -> int:
                     help="do not expose the bridge board to the peer (Claude then runs in plan mode)")
     ap.add_argument("--dry-run", action="store_true", help="print the resolved command line and exit")
     ap.add_argument("--list", action="store_true", help="show installed peers and conversations, then exit")
-    o = ap.parse_args()
+    # intermixed: `ask-agent claude -m ask "q"` puts options between the two positionals, which plain parse_args
+    # rejects on Python 3.11/3.12 (3.13 accepts it) — every panel worker and dispatch call has that shape
+    o = ap.parse_intermixed_args()
 
     if o.list:
         return list_agents()
@@ -170,9 +174,14 @@ def main() -> int:
     if not prompt:
         ap.error("empty prompt")
 
-    if os.environ.get(HOP_VAR):
-        print(f"ask-agent: refusing — already inside a bridged run ({HOP_VAR}={os.environ[HOP_VAR]}). "
-              "One hop only: do the work here.", file=sys.stderr)
+    try:
+        inside = hop_active() or boardlib.bridged_identity(boardlib.connect()) is not None
+    except sqlite3.Error as exc:               # the board is how we know we are not a peer: no answer, no run
+        print(f"ask-agent: cannot read the board to check the hop guard ({exc})", file=sys.stderr)
+        return 2
+    if inside:
+        print(f"ask-agent: refusing — already inside a bridged run ({HOP_VAR} set, or a registered run is an "
+              "ancestor). One hop only: do the work here.", file=sys.stderr)
         return 3
     if not Path(o.dir).is_dir():
         print(f"ask-agent: no such dir: {o.dir}", file=sys.stderr)

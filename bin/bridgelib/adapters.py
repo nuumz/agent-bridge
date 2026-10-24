@@ -93,16 +93,19 @@ class Claude(Adapter):
             a += ["--worktree"] + ([o.worktree] if o.worktree != "auto" else [])
         return a
 
+    # --fork-session: a resumed run gets a session id of its own, so a peer never writes into the session it resumes
+    # (with `-c` in the caller's own directory that is the caller's session). Conv stores the forked id, so a thread
+    # keeps resuming its latest id as before.
     def argv(self, o, prompt):
         a = self._base(o)
         if o.session:
-            a += ["--resume", o.session]
+            a += ["--resume", o.session, "--fork-session"]
         elif o.cont:
-            a += ["--continue"]
+            a += ["--continue", "--fork-session"]
         return a + ["--", prompt]
 
     def resume_argv(self, o, session, prompt):
-        return self._base(o) + ["--resume", session, "--", prompt]
+        return self._base(o) + ["--resume", session, "--fork-session", "--", prompt]
 
     def preamble(self, o):
         if o.mode == "write":

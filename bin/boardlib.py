@@ -13,7 +13,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from bridgelib.core import STATE
+from bridgelib.core import STATE, hop_active
 
 HOME = Path.home()
 BOARD_DIR = STATE / "board"
@@ -108,17 +108,27 @@ def ancestors(pid: int, depth: int = 8) -> list[int]:
     return out
 
 
+def bridged_identity(conn: sqlite3.Connection) -> tuple[str, int | None] | None:
+    """(identity, run deadline) of the bridged run this process belongs to, found by an ancestor pid registered in
+    `workers` — the one signal a peer cannot drop (its env it can scrub). None outside any bridged run.
+    Only live rows count: a run killed before it unregistered leaves its row, and its pid gets reused."""
+    rows = {r["pid"]: r for r in live_workers(conn)}
+    for pid in [os.getpid(), *ancestors(os.getpid())]:
+        if pid in rows:
+            return rows[pid]["identity"], rows[pid]["deadline"]
+    return None
+
+
 def resolve_identity(conn: sqlite3.Connection, env: dict[str, str]) -> tuple[str, bool, int | None]:
     """(identity, is_peer, run deadline epoch or None). A bridged run is recognised by an ancestor pid registered in
     `workers` (cursor-agent does not pass its env to MCP children, so env alone is not enough)."""
-    rows = {r["pid"]: r for r in conn.execute("SELECT pid, identity, deadline FROM workers")}
-    for pid in [os.getpid(), *ancestors(os.getpid())]:
-        if pid in rows:
-            return rows[pid]["identity"], True, rows[pid]["deadline"]
+    found = bridged_identity(conn)
+    if found:
+        return found[0], True, found[1]
     if env.get("AGENT_BRIDGE_IDENTITY"):
-        return env["AGENT_BRIDGE_IDENTITY"], bool(env.get("AGENT_BRIDGE_HOP")), None
+        return env["AGENT_BRIDGE_IDENTITY"], hop_active(env), None
     if env.get("AGENT_BRIDGE_AGENT"):
-        return f"{env['AGENT_BRIDGE_AGENT']}@primary", bool(env.get("AGENT_BRIDGE_HOP")), None
+        return f"{env['AGENT_BRIDGE_AGENT']}@primary", hop_active(env), None
     raise BoardError("no identity: set AGENT_BRIDGE_AGENT in the MCP server env (bridge-sync does this)")
 
 
@@ -308,10 +318,20 @@ def status(conn: sqlite3.Connection, me: str) -> dict:
     return {"me": me, "online": online, "topics": topics, "open_tasks": tasks, "running_workers": workers}
 
 
-def close_topic(conn: sqlite3.Connection, name: str) -> None:
+def close_topic(conn: sqlite3.Connection, name: str, missing_ok: bool = False) -> bool:
+    """Close an open topic; False (or BoardError without missing_ok) when there is no open topic of that name."""
     with tx(conn):
-        if conn.execute("UPDATE topics SET closed_at=? WHERE name=? AND closed_at IS NULL", (now(), name)).rowcount == 0:
-            raise BoardError(f"topic '{name}' is not open")
+        closed = conn.execute("UPDATE topics SET closed_at=? WHERE name=? AND closed_at IS NULL",
+                              (now(), name)).rowcount
+    if not closed and not missing_ok:
+        raise BoardError(f"topic '{name}' is not open")
+    return bool(closed)
+
+
+def reopen_topic(conn: sqlite3.Connection, name: str) -> None:
+    """A room a peer rejoins after its last member left: the backlog is still there until gc, so reopen it."""
+    with tx(conn):
+        conn.execute("UPDATE topics SET closed_at=NULL WHERE name=?", (name,))
 
 
 def gc(conn: sqlite3.Connection, days: int) -> int:

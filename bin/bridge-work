@@ -35,9 +35,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger, workskills  # noqa: E402
-from bridgelib.core import HOP_VAR, ROOT, STATE, detach, guarded_rc, lang_rule  # noqa: E402
+from bridgelib.core import ROOT, STATE, detach, guarded_rc, hop_active, lang_rule  # noqa: E402
 
 ASK = ROOT / "bin" / "ask-agent"
+BOARD = ROOT / "bin" / "bridge-board"
 WORK = STATE / "work"
 
 
@@ -57,6 +58,12 @@ def ask(peer: str, mode: str, cwd: str, prompt: str, timeout: int, conv: str, ki
 
 
 FALLBACK_RC = (7, 127, 4)   # out of quota · binary missing · peer disabled: the peer is unavailable, not wrong
+
+
+def close_threads(name: str) -> None:
+    """The run's board threads are done with it; closing them keeps board_status short and lets gc reclaim them."""
+    for suffix in ("impl", "impl-fallback", "review", "review-fallback"):
+        subprocess.run([str(BOARD), "close", f"conv:work-{name}-{suffix}"], capture_output=True, text=True)
 
 
 def ask_with_fallback(peer: str, mode: str, cwd: str, prompt: str, timeout: int, conv: str, kind: str) -> tuple[int, str, str, str]:
@@ -172,7 +179,7 @@ def write_rc(name: str, rc: int) -> int:
 
 
 def run(o) -> int:
-    if os.environ.get(HOP_VAR):
+    if hop_active():
         print("bridge-work: refusing inside a bridged run (one hop only)", file=sys.stderr)
         return 3
     repo = Path(o.dir).resolve()
@@ -344,6 +351,7 @@ def run(o) -> int:
         pass
     print(report)
     print(f"\n[work] report={out / 'report.md'} worktree={wt}", file=sys.stderr)
+    close_threads(o.name)
     return 0 if ok else 1
 
 
