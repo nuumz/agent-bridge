@@ -44,8 +44,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boardlib  # noqa: E402
 from bridgelib import ledger  # noqa: E402
 from bridgelib.adapters import ADAPTERS  # noqa: E402
-from bridgelib.core import (BOARD_PROTOCOL, HOP_VAR, PEER_TALK_RULE, ROOT, STATE, detach, err_summary,  # noqa: E402
-                            hop_active, peer_env, quota_block, quota_hit, quota_mark)
+from bridgelib.core import (BOARD_PROTOCOL, HOP_VAR, PEER_TALK_RULE, ROOT, STATE, bridge_owned, detach,  # noqa: E402
+                            err_summary, hop_active, peer_env, quota_block, quota_hit, quota_mark)
 from bridgelib.runner import AGREE_RE, USER_AUTHOR, kill_tree  # noqa: E402
 
 LIVE = STATE / "live"
@@ -222,7 +222,8 @@ def broker(o, after: int, stop_floor: int, resume: str | None, base: float) -> i
     conn = boardlib.connect()
     tid = boardlib.topic_id(conn, topic(room), USER_AUTHOR)
     agent = ADAPTERS["claude"]
-    opts = argparse.Namespace(mode=o.mode, model=o.model, add_dir=o.add_dir, deny=[], board=False, worktree=None)
+    opts = argparse.Namespace(mode=o.mode, model=o.model, add_dir=o.add_dir, deny=[], board=False, worktree=None,
+                              discard_ok=bridge_owned(o.dir))
     base_argv = [agent.resolve(), *agent._base(opts), "--input-format", "stream-json"]
     peer_log, err = LIVE / peer / "peer.jsonl", LIVE / peer / "peer.err"
     session = {"id": resume}                  # learnt from the stream (init event), so a respawn can --resume it
