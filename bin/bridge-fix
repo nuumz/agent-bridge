@@ -281,8 +281,7 @@ def close_card(fl: dict, ruling: str) -> None:
     board("post", t, f"ruled by {fl.get('decided_by', 'user')}: {ruling}", "-k", "done", "--to", "*",
           "--reply-to", str(fl["card_seq"]))
     board("close", t)
-    fl["card_closed"] = True
-    save(fl)
+    fl["card_closed"] = True                     # the caller saves the flow
 
 
 def decide(o) -> int:
@@ -363,6 +362,7 @@ def decide(o) -> int:
               file=sys.stderr)
     else:
         close_card(fl, ruling)
+        save(fl)
     if o.no_fix:
         return 0
     return fix(fl, o)
