@@ -1,0 +1,7 @@
+{"type":"system","subtype":"init","apiKeySource":"login","cwd":"/work","session_id":"fb-cursor-0001","model":"auto","permissionMode":"default"}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Review src/retry.py for retry bugs."}]},"session_id":"fb-cursor-0001"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Reading src/retry.py."}]},"session_id":"fb-cursor-0001"}
+{"type":"tool_call","subtype":"started","call_id":"call_1","tool_call":{"readToolCall":{"args":{"path":"/work/src/retry.py"}}},"session_id":"fb-cursor-0001"}
+{"type":"tool_call","subtype":"completed","call_id":"call_1","tool_call":{"readToolCall":{"args":{"path":"/work/src/retry.py"},"result":{"success":{"totalLines":40}}}},"session_id":"fb-cursor-0001"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The retry loop in src/retry.py:12 never backs off, and src/retry.py:30 swallows the timeout."}]},"session_id":"fb-cursor-0001"}
+{"type":"result","subtype":"success","duration_ms":9100,"duration_api_ms":8800,"is_error":false,"result":"Reading src/retry.py.The retry loop in src/retry.py:12 never backs off, and src/retry.py:30 swallows the timeout.","session_id":"fb-cursor-0001","request_id":"req_1","usage":{"inputTokens":22140,"outputTokens":310}}

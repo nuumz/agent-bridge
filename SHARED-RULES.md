@@ -121,6 +121,14 @@ exit verified with a stub CLI; parallel runs get distinct logs (pid in the stamp
 installed (the VS Code shim of the same name is still skipped); JSONL parsing verified on a real run 2026-09-26, so a
 Copilot run now has a session id — `--resume`/`--continue` themselves remain unverified. Failure paths (quota, crash,
 fallback, abort) are exercised with stub `cursor-agent`/`claude` scripts put first on PATH — cost-free and repeatable.
+Since 2026-10-24 the **adapter conformance kit** (`tests/test_adapter_conformance.py` over the stubs in
+`tests/fakebin/`) runs every adapter through one suite: the flags per mode in the CLI's own syntax, `--add-dir` /
+`-M` / `--session` / `-c` pass-through, parse of a fixture, and the whole `ask-agent` run — the `[bridge]` line, argv
+identical to `--dry-run`, the peer's environment (hop marker, identity, no caller session), crash → exit 1 with the
+peer's own first stderr line, quota → exit 7 + fail-fast + `--ignore-quota`, timeout → exit 143 with the whole process
+group gone, `[[ASK]]` → exit 5, and the `--list` version probe (a CLI whose `--version` says nothing shows
+`unknown version`). A renamed flag fails there, not in a run log. The kit's first run found that the Cursor read-only
+hold crashed on a machine with no `~/.cursor/` yet: the hold now creates the file and the last holder removes it again.
 
 ## 3. When to delegate (and when not to)
 
