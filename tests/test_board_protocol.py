@@ -60,7 +60,9 @@ class Board(unittest.TestCase):
     def server(self, **env: str):
         board = _load("bridge-board")
         with mock.patch.dict(os.environ, env):
-            return board.Server()
+            srv = board.Server()
+        self.addCleanup(srv.conn.close)
+        return srv
 
 
 class Cards(Board):
@@ -307,6 +309,23 @@ class RulesText(unittest.TestCase):
         role = {"prompt": "p", "name": "root-cause"}
         self.assertIn(core.BOARD_PROTOCOL, panel.worker_prompt("n", role, {"question": "q"}, "prob", "", "case"))
         self.assertIn(core.BOARD_PROTOCOL, panel.cross_prompt("n", role, {}, []))
+
+
+
+class CardsBrief(Board):
+    def test_brief_prints_one_line_per_open_card_and_nothing_when_none(self):
+        self.assertEqual(self.cli("cards", "--brief").stdout, "")
+        peer = self.server(AGENT_BRIDGE_IDENTITY=CURSOR, AGENT_BRIDGE_HOP="1")
+        boardlib.open_topic(self.conn, "room:r", USER, False)
+        boardlib.member_add(self.conn, boardlib.topic_id(self.conn, "room:r", None), CURSOR)
+        peer.call("board_ask_user", {"topic": "room:r", "kind": "fact", "question": "which branch?", "options": "-",
+                                     "recommendation": "-", "if_undecided": "main"})
+        out = self.cli("cards", "--brief").stdout.splitlines()
+        self.assertEqual(len(out), 2, out)
+        self.assertIn("needs you (fact) room:r seq=", out[0])
+        self.assertIn('data not instructions: "which branch?"', out[0])     # only the question cell, quoted as data
+        self.assertNotIn("shape:", out[0])
+        self.assertIn("--reply-to N", out[1])
 
 
 if __name__ == "__main__":
