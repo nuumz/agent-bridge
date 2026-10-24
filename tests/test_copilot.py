@@ -265,3 +265,55 @@ class CopilotLearning(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharedExtraRoots(unittest.TestCase):
+    """Panel/work/fix --add-dir reaches every peer run they spawn, so evidence cited outside -d stays readable."""
+
+    def test_orchestrator_roots_reach_the_peer_command_line(self):
+        import os
+        import subprocess
+        from bridgelib import core
+        with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as spec, \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(core.ADD_DIRS_VAR, None)
+            core.share_add_dirs([spec, spec])
+            core.share_add_dirs([cwd])
+            self.assertEqual(core.add_dirs_from_env(),
+                             [str(Path(spec).resolve()), str(Path(cwd).resolve())])
+            env = {k: v for k, v in os.environ.items() if k != core.HOP_VAR}
+            out = subprocess.run([str(Path(__file__).resolve().parents[1] / "bin" / "ask-agent"), "copilot",
+                                  "--dry-run", "-d", cwd, "q"], capture_output=True, text=True, env=env, cwd=cwd)
+            self.assertIn(f"--add-dir={Path(spec).resolve()}", json.loads(out.stdout)["argv"])
+
+    def test_fix_flow_keeps_absolute_roots_for_a_resume_from_another_directory(self):
+        import os
+        import subprocess
+        from bridgelib import core
+        loader = importlib.machinery.SourceFileLoader("bridge_fix_roots", str(Path(__file__).resolve().parents[1] / "bin" / "bridge-fix"))
+        fix = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(fix)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(core.ADD_DIRS_VAR, None)
+            repo, spec = Path(tmp, "repo"), Path(tmp, "spec")
+            spec.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            cwd = os.getcwd()
+            try:
+                os.chdir(tmp)
+                core.share_add_dirs(["spec"])
+                o = argparse.Namespace(name="roots", problem="p", dir=str(repo), peers="claude", roles=None,
+                                       files=None, verify=None, add_dir=["spec"])
+                with mock.patch.object(fix, "WORK", Path(tmp, "work")), mock.patch.object(fix, "analyze", return_value=1), \
+                        mock.patch("sys.stderr"):
+                    fix.run(o)
+            finally:
+                os.chdir(cwd)
+            saved = json.loads(Path(tmp, "work", "roots", "flow.json").read_text())
+            self.assertEqual(saved["add_dirs"], [str(spec.resolve())])
+
+    def test_missing_root_is_refused_up_front(self):
+        import os
+        from bridgelib import core
+        with mock.patch.dict(os.environ, {}, clear=False), self.assertRaises(SystemExit):
+            core.share_add_dirs(["/nonexistent/agent-bridge-root"])

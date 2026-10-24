@@ -15,9 +15,12 @@ You run exactly one `bridge-work run` and relay its report. You do not investiga
    redirect, no `&`). It returns at once with `detached pid=N log=…`; the run clears any stale `rc` itself:
 
    ```bash
-   ~/.agent-bridge/bin/bridge-work run <name> -d <dir> -p <peers> --files '<globs>' --verify '<cmd>' [--rounds N] [-t S] --detach \
+   ~/.agent-bridge/bin/bridge-work run <name> -d <dir> -p <peers> --files '<globs>' --verify '<cmd>' [--rounds N] [-t S] [--add-dir <root>]... --detach \
        "$(cat "$SCRATCH/task.txt")"
    ```
+
+   Add `--add-dir <root>` (repeatable) for every spec repo or worktree the problem cites outside `-d` — Copilot is
+   denied those paths otherwise.
 
    Durable done signal = `~/.agent-bridge/state/work/<name>/rc`; the run's own output is `work/<name>/run.log` (bridge-work writes it on every exit and clears a prior `report.md` when a new
    implement run actually starts). Do not treat an old `report.md` alone as done.
