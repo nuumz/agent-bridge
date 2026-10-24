@@ -1,9 +1,9 @@
 {
   "name": "agent-bridge",
-  "description": "Let Claude Code, Cursor Agent and GitHub Copilot CLI call each other: second opinions, role-based review panels, isolated implement→verify→review loops and a shared board. Wraps the CLIs you already have — no runtime, no keys, no commits.",
+  "description": "Let Claude Code, Cursor Agent, GitHub Copilot CLI and Codex CLI call each other: second opinions, role-based review panels, isolated implement→verify→review loops and a shared board. Wraps the CLIs you already have — no runtime, no keys, no commits.",
   "author": { "name": "nuumz", "url": "https://github.com/nuumz" },
   "homepage": "https://github.com/nuumz/agent-bridge",
   "repository": "https://github.com/nuumz/agent-bridge",
   "license": "MIT",
-  "keywords": ["multi-agent", "cursor", "copilot", "code-review", "orchestration", "mcp"]
+  "keywords": ["multi-agent", "cursor", "copilot", "codex", "code-review", "orchestration", "mcp"]
 }

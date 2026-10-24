@@ -29,7 +29,7 @@ KINDS = ("note", "question", "answer", "decision", "task", "system", "request", 
 CLOSING_KINDS = ("answer", "done", "blocked")   # a request stays open until one of these replies to it (OPEN_REQUEST)
 ROLES = ("leader", "member", "observer")
 TASK_MODES = ("ask", "plan", "write")
-FAMILIES = ("claude", "cursor", "copilot")   # a request addressed to a family is a turn: a task, run by dispatch
+FAMILIES = ("claude", "cursor", "copilot", "codex")   # a request addressed to a family is a turn: a task, run by dispatch
 
 # `addressee` is the column behind the `to` argument (TO is an SQLite keyword): NULL = broadcast, like every message
 # posted before the column existed; otherwise `*`, an agent identity, or `@<role>` of the topic's members.
@@ -415,7 +415,7 @@ OPEN_REQUEST = ("m.kind='request' AND NOT EXISTS (SELECT 1 FROM messages r WHERE
                 "m.addressee LIKE 'user:%')) AND (m.addressee='*' OR r.author=m.addressee OR r.author=m.author "
                 "OR (instr(m.author,'#')>0 AND instr(r.author,'#')>0 AND substr(m.author,1,instr(m.author,'#'))="
                 "substr(r.author,1,instr(r.author,'#'))) "     # a later run of the requester's own `<family>#<pid>` thread
-                "OR (m.addressee IN ('claude','cursor','copilot') AND (r.author LIKE m.addressee||'#%' OR "
+                "OR (m.addressee IN (" + ",".join(f"'{f}'" for f in FAMILIES) + ") AND (r.author LIKE m.addressee||'#%' OR "
                 "r.author LIKE m.addressee||':task%')) "      # a dispatched or hand-started run of that family
                 "OR (m.addressee LIKE 'user:%' AND r.author LIKE 'user:%') OR (m.addressee LIKE '@%' AND r.author IN "
                 "(SELECT agent FROM members b WHERE b.topic_id=m.topic_id AND b.role=substr(m.addressee, 2) "

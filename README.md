@@ -2,8 +2,9 @@
 
 [![test](https://github.com/nuumz/agent-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/nuumz/agent-bridge/actions/workflows/test.yml)
 
-Let the coding agents on one machine — **Claude Code**, **Cursor Agent**, and **GitHub Copilot CLI** — call each other,
-share a message board, and run multi-agent reviews and fixes. The bridge wraps those CLIs; it is not a new runtime.
+Let the coding agents on one machine — **Claude Code**, **Cursor Agent**, **GitHub Copilot CLI** and **OpenAI Codex
+CLI** — call each other, share a message board, and run multi-agent reviews and fixes. The bridge wraps those CLIs; it
+is not a new runtime.
 
 > **Document boundary.** This README owns install, first-run, and the command map.
 > Protocol (exit codes, hop guard, egress, session cards): [SHARED-RULES.md](SHARED-RULES.md).
@@ -13,7 +14,7 @@ share a message board, and run multi-agent reviews and fixes. The bridge wraps t
 > How it compares with other multi-agent tools: [docs/landscape.md](docs/landscape.md).
 > Changing the code: [CONTRIBUTING.md](CONTRIBUTING.md) (agents: [AGENTS.md](AGENTS.md)).
 
-- `ask-agent claude|cursor|copilot` — one command, one set of options (mode, model, dir, session, worktree, timeout)
+- `ask-agent claude|cursor|copilot|codex` — one command, one set of options (mode, model, dir, session, worktree, timeout)
   mapped onto each CLI's own flags; the answer comes back as text plus a `[bridge]` line (session id, tokens, log path).
 - `bridge-panel` — a leader plus role peers (root-cause, contract-checker, design-critic, …) answer in parallel,
   cross-examine each other's citations, and the leader writes one report.
@@ -51,6 +52,8 @@ peers allowed to see the repo.
   - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — `claude`
   - [Cursor CLI](https://docs.cursor.com/en/cli/overview) — `cursor-agent`
   - [GitHub Copilot CLI](https://github.com/github/copilot-cli) — `copilot`
+  - [OpenAI Codex CLI](https://github.com/openai/codex) — `codex` (adapter written from the CLI's source and passing
+    the conformance kit; not yet verified against a real `codex` run — see SHARED-RULES.md §2)
 - Optional: `tmux` for `bridge-watch --tmux`
 
 ## Install
@@ -176,7 +179,7 @@ after verifying analysis findings, and the work report's verify/review results f
 
 | Command | Purpose |
 |---|---|
-| `ask-agent`, `ask-claude`, `ask-cursor`, `ask-copilot` | run one task on a peer; `--conv` threads, `-w` worktree, `--dry-run` |
+| `ask-agent`, `ask-claude`, `ask-cursor`, `ask-copilot`, `ask-codex` | run one task on a peer; `--conv` threads, `-w` worktree, `--dry-run` |
 | `bridge-plan` | pick a playbook for a request, prepare its session card, learn from the outcome ledger |
 | `bridge-panel` | role-based multi-peer review with a leader and cross-examination |
 | `bridge-work` | implement → verify → review → fix loop in an isolated worktree; the reviewer's `BRIDGE_VERDICT=APPROVE\|REVISE` line decides the loop |

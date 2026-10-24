@@ -102,6 +102,28 @@ def render(peer: str, d: dict) -> tuple[str, str] | None:
         if t == "session.auto_mode_resolved":
             return "init", f"model={data.get('chosenModel', '?')}"
         return None
+    if peer == "codex":                                   # `codex exec --json`: thread / turn / item events
+        item = d.get("item") or {}
+        kind = item.get("type")
+        if t == "thread.started":
+            return "init", f"thread={d.get('thread_id', '?')}"
+        if t == "item.started" and kind == "command_execution":
+            return "tool", one_line(item.get("command", ""), 160)
+        if t == "item.started" and kind == "mcp_tool_call":
+            return "tool", f"{item.get('server')}.{item.get('tool')} {compact(item.get('arguments'))}"
+        if t == "item.completed" and kind == "command_execution":
+            ok = item.get("status") not in ("failed", "declined") and item.get("exit_code") in (0, None)
+            return "result", ("ok " if ok else "ERROR ") + one_line(item.get("aggregated_output", ""), 120)
+        if t == "item.completed" and kind == "agent_message" and item.get("text", "").strip():
+            return "text", one_line(item["text"], 160)
+        if t == "item.completed" and kind == "file_change":
+            return "tool", "edit " + ", ".join(c.get("path", "") for c in item.get("changes") or [])
+        if t == "turn.completed":
+            u = d.get("usage") or {}
+            return "done", f"ok in={u.get('input_tokens', '?')} out={u.get('output_tokens', '?')}"
+        if t in ("turn.failed", "error"):
+            return "error", one_line((d.get("error") or {}).get("message") or d.get("message", ""), 160)
+        return None
     return None
 
 

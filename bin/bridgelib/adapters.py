@@ -9,12 +9,13 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from .core import (BOARD_TOOLS, CURSOR_PULL, STATE, BRIDGE_CMDS, CLAUDE_READ_ONLY_BASH, CLAUDE_WORKTREE_BASH,
-                   CLAUDE_WRITE_BASH, DISABLED, GIT_DENY, GIT_DISCARD, HOME, find_bin, last_json, sum_keys)
+                   CLAUDE_WRITE_BASH, DISABLED, GIT_DENY, GIT_DISCARD, HOME, ROOT, find_bin, last_json, sum_keys)
 
 class Parsed:
     def __init__(self, result: str, session: str | None = None, tok_in: Any = "?", tok_out: Any = "?",
@@ -560,4 +561,114 @@ class Copilot(Adapter):
                       extra, metrics)
 
 
-ADAPTERS: dict[str, Adapter] = {a.name: a for a in (Claude(), Cursor(), Copilot())}
+class Codex(Adapter):
+    """OpenAI Codex CLI (`npm i -g @openai/codex`), driven as `codex exec --json`: JSONL events on stdout
+    (`thread.started` / `item.completed` / `turn.completed` …, from codex-rs `exec/src/exec_events.rs`). It has no
+    per-command deny flag: `--sandbox read-only` is the read-only line (no file writes, no network), `--sandbox
+    workspace-write` the write line — Codex keeps `.git/` of a writable root read-only inside that sandbox, so a
+    commit cannot land from a bridged run; the preamble says so and the hop guard stays. Flags are taken from
+    codex-rs `exec/src/cli.rs` (2026-10-24) and are not yet verified against a real CLI (SHARED-RULES §2)."""
+    name, binary = "codex", "codex"
+    rules_mirror = "~/.codex/AGENTS.md (Codex's global instructions; not written by bridge-sync yet)"
+    BOARD_SERVER = "bridge_board"
+    BOARD_BIN = ROOT / "bin" / "bridge-board"
+
+    @staticmethod
+    def _home() -> Path:
+        return Path(os.environ.get("CODEX_HOME") or (HOME / ".codex"))
+
+    def auth_hint(self):
+        try:
+            auth = json.loads((self._home() / "auth.json").read_text())
+            login = (auth.get("auth_mode") or ("api-key" if auth.get("OPENAI_API_KEY") else
+                                               ("chatgpt" if auth.get("tokens") else "unknown")))
+        except Exception:  # noqa: BLE001
+            login = "NONE (no auth.json)"
+        try:
+            model = tomllib.loads((self._home() / "config.toml").read_text()).get("model") or "default"
+        except Exception:  # noqa: BLE001
+            model = "default"
+        return f"login={login} model={model}"
+
+    def preamble(self, o):
+        if o.mode == "write":
+            return ("(Headless write run in Codex's workspace-write sandbox: edits inside the workspace"
+                    + (" and the granted extra roots" if o.add_dir else "") + " are allowed, there is no network, and "
+                    ".git/ stays read-only — never git commit/push/tag, and do not work around a denied path. Touch only "
+                    "the files the task names; run the task's verification command and report its actual output; leave "
+                    "everything uncommitted."
+                    + ("" if getattr(o, "discard_ok", False) else
+                       " This is the caller's checkout: do not git restore/checkout/switch/stash/reset/clean — their "
+                       "uncommitted work stays as it is.") + ")\n\n")
+        return ("(Headless read-only run in Codex's read-only sandbox: the file system cannot be written and there is no "
+                "network; shell commands that only read (git log/show/diff/blame, rg, cat, head, tail, sed -n, find, ls, "
+                "wc) work. Do not try to write or to reach the network — say what you could not check instead. Put the "
+                "answer in the reply body with file:line evidence.)\n\n")
+
+    def _base(self, o):
+        # every exec-level flag goes before a `resume` subcommand: `--json` and `--model` are global in clap terms,
+        # `--sandbox` / `--cd` / `--add-dir` / `-c` are not, so this order is the one that works for both forms
+        a = ["exec", "--json", "--skip-git-repo-check", "--cd", o.dir,
+             "--sandbox", "workspace-write" if o.mode == "write" else "read-only"]
+        if o.model:
+            a += ["--model", o.model]
+        for d in o.add_dir:
+            a += ["--add-dir", d]
+        if o.board:
+            # the board MCP rides on the run as `-c` overrides (values parse as TOML), so nothing is written to
+            # ~/.codex/config.toml; identity is still resolved by the server from the run's pid, never from this env
+            a += ["-c", f"mcp_servers.{self.BOARD_SERVER}.command={json.dumps(str(self.BOARD_BIN))}",
+                  "-c", f'mcp_servers.{self.BOARD_SERVER}.args=["serve"]',
+                  "-c", f'mcp_servers.{self.BOARD_SERVER}.env={{AGENT_BRIDGE_AGENT="{self.name}"}}']
+        return a
+
+    def argv(self, o, prompt):
+        a = self._base(o)
+        if o.session:
+            a += ["resume", o.session]
+        elif o.cont:
+            a += ["resume", "--last"]
+        return a + ["--", prompt]
+
+    def resume_argv(self, o, session, prompt):
+        return self._base(o) + ["resume", session, "--", prompt]
+
+    def parse(self, raw):
+        events = []
+        for line in raw.splitlines():
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(d, dict) and d.get("type"):
+                events.append(d)
+        if not events:                                   # not the JSONL we asked for: keep the text, call it an error only when empty
+            return Parsed(raw.strip(), is_error=not bool(raw.strip()))
+        thread = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), None)
+        items = [e.get("item") or {} for e in events if e.get("type") == "item.completed"]
+        text = "\n\n".join(t.strip() for t in (i.get("text", "") for i in items if i.get("type") == "agent_message")
+                           if t and t.strip())
+        done = [e for e in events if e.get("type") == "turn.completed"]
+        errors = [e.get("message", "") for e in events if e.get("type") == "error"] + \
+                 [(e.get("error") or {}).get("message", "") for e in events if e.get("type") == "turn.failed"]
+        u = (done[-1].get("usage") or {}) if done else {}
+        calls = [i for i in items if i.get("type") in ("command_execution", "mcp_tool_call")]
+        failures = [i for i in calls if i.get("status") in ("failed", "declined") or i.get("exit_code") not in (None, 0)]
+        edited = sorted({c.get("path") for i in items if i.get("type") == "file_change" and i.get("status") != "failed"
+                         for c in i.get("changes") or [] if c.get("path")})
+        metrics = {"tool_calls": len(calls), "tool_failures": len(failures),
+                   "permission_denials": sum(i.get("status") == "declined" for i in calls), "files_modified": len(edited)}
+        extra = (f"cached={u.get('cached_input_tokens', '?')} reasoning={u.get('reasoning_output_tokens', '?')} "
+                 f"tool_failures={len(failures)}")
+        if edited:
+            extra += f" EDITED={','.join(edited)}"
+        if errors:                                       # the peer's own words first: the [bridge] error line quotes them
+            text = "\n".join(m for m in errors if m) + ("\n\n" + text if text else "")
+        elif not done:
+            text = "Codex stream incomplete: no turn.completed event.\n\n" + text
+        is_error = bool(errors) or not done or not text
+        return Parsed(text or "(codex returned no agent message)", thread, u.get("input_tokens", "?"),
+                      u.get("output_tokens", "?"), is_error, extra, metrics)
+
+
+ADAPTERS: dict[str, Adapter] = {a.name: a for a in (Claude(), Cursor(), Copilot(), Codex())}

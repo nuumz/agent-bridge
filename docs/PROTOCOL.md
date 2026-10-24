@@ -25,7 +25,7 @@ guess.
 
 | Term | Meaning |
 |---|---|
-| **family** | one vendor CLI as the bridge drives it: `claude`, `cursor`, `copilot` (the `ADAPTERS` registry). A family name is lowercase ASCII letters |
+| **family** | one vendor CLI as the bridge drives it: `claude`, `cursor`, `copilot`, `codex` (the `ADAPTERS` registry; `boardlib.FAMILIES` for turns). A family name is lowercase ASCII letters |
 | **peer** | an agent of a family started by the bridge for one job (an `ask-agent` run, a dispatched turn, a live peer). A peer is always *inside* the bridge: hop guard on, no spawning |
 | **primary** | the interactive session of a family the user is typing into (`<family>@primary`). It may spend peer runs; a peer may not |
 | **user** | the human at the machine, `user:<name>`. The only author of a `decision`; the one every *card* is addressed to |
