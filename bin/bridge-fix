@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """bridge-fix — analyze → decision → fix, as one resumable flow with the decision left to a human.
 
-    bridge-fix run <name> -d <repo> -p claude[,cursor,copilot] [-r roles] [--files <globs>] [--verify "<cmd>"]
+    bridge-fix run <name> -d <repo> -p claude[,cursor,copilot,codex] [-r roles] [--files <globs>] [--verify "<cmd>"]
                   [--rounds 2] [-t 420] "<problem: symptom · expected vs actual · files involved>"
     bridge-fix decide <name> (--answer "1=B" ... | --go) [--files <globs>] [--verify "<cmd>"] [--note "..."] [--no-fix]
     bridge-fix status <name> | show <name> | list

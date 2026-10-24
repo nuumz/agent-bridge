@@ -259,7 +259,9 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
     if not binary:
         hint = {"copilot": "npm install -g @github/copilot  (or: brew install copilot-cli)",
                 "cursor": "curl https://cursor.com/install -fsS | bash",
-                "claude": "see https://claude.com/claude-code"}[agent.name]
+                "claude": "see https://claude.com/claude-code",
+                "codex": "npm install -g @openai/codex  (or: brew install --cask codex)"}.get(
+            agent.name, f"install the {agent.binary} CLI")
         print(f"ask-agent: {agent.binary} not on PATH — install: {hint}", file=sys.stderr)
         return 127, None, None
 

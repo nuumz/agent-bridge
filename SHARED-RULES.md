@@ -15,15 +15,17 @@ Owner-facing docs are in English; user-facing replies follow each agent's own la
 | Claude Code | `claude` | `ask-claude` | Long-context reasoning, spec/doc authoring, multi-file refactors, CodeGraph + MCP tooling |
 | Cursor Agent | `cursor-agent` | `ask-cursor` | Second opinion from another model family (the bridge starts it on `auto`; `-M` picks a model), isolated worktree runs |
 | Copilot CLI | `copilot` (`@github/copilot`) | `ask-copilot` | Bounded analysis/review, targeted implementation and improvements via `bridge-work`, GitHub-native tasks |
+| Codex CLI | `codex` (`@openai/codex`) | `ask-codex` | A third model family for a second opinion; sandboxed read-only analysis (`codex exec --sandbox read-only`, no network); not yet verified on a real CLI (§2) |
 
-`ask-agent --list` shows which peers are installed and logged in. All three `ask-*` commands are thin wrappers
-around `ask-agent <peer>`; every peer reads the same machine-wide rules (§5) and the same per-repo rules
-(`AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursor/rules/**`).
+`ask-agent --list` shows which peers are installed and logged in (version column: what `--version` says, or
+`unknown version` when it says nothing). The four `ask-*` commands are thin wrappers around `ask-agent <peer>`; every
+peer reads the same machine-wide rules (§5) and the same per-repo rules (`AGENTS.md`, `CLAUDE.md`,
+`.github/copilot-instructions.md`, `.cursor/rules/**`; Codex reads `AGENTS.md` only).
 
 ## 2. Bridge command
 
 ```bash
-ask-agent <claude|cursor|copilot> [-d dir] [-m ask|plan|write] [-M model] [-t sec] [-w [name]]
+ask-agent <claude|cursor|copilot|codex> [-d dir] [-m ask|plan|write] [-M model] [-t sec] [-w [name]]
           [--add-dir p]... [--deny tool]... [-c | --session id] [--json] [--dry-run] [--ignore-quota] "<prompt>"
 ask-agent --list
 ```
@@ -63,16 +65,28 @@ own first stderr line>` before the raw dump — scripts (`bridge-panel`) read th
 
 How the common options map onto each CLI:
 
-| Option | claude | cursor | copilot |
-|---|---|---|---|
-| `-m ask` / `plan` | `--permission-mode plan` | default agent mode + temporary global `Write(**)` deny (decision 2026-09-12; `-m write` refuses with exit 6 while held) / `--mode plan` | `--deny-tool=write --deny-tool=shell` |
-| `-m write` | `--permission-mode acceptEdits` (+ `--disallowed-tools Bash(git restore:*)…` outside a bridge-owned worktree) | `--force` + a temporary global deny `Shell(git commit)`/`push`/`tag` (+ `restore`/`checkout`/… outside a bridge-owned worktree) | `--allow-all-tools` + `--deny-tool=shell(git commit)` … (+ `shell(git restore)`… outside a bridge-owned worktree) |
-| git commit/push/tag denied by | `--disallowed-tools Bash(git commit:*)…` + PreToolUse hook | `permissions.deny` in `~/.cursor/cli-config.json` (a write run holds the three entries for its duration) | `--deny-tool=shell(git …)` |
-| `-M model` | `--model` | `--model` (always passed: `auto` unless `-M`, so the app's last pick in cli-config.json never leaks in) | `--model=` |
-| `--session id` / `-c` | `--resume id --fork-session` / `--continue --fork-session` (the peer never writes into the session it resumes — with `-c` in your own directory that is yours) | `--resume id` / `--continue` | `--resume=id` / `--continue` |
-| `-w [name]` | `--worktree [name]` → `<repo>/.claude/worktrees/<name>` (locked) | `--worktree [name]` → `~/.cursor/worktrees/<repo>/<name>` | not supported (use `git worktree add` + `-d`) |
-| `--add-dir` | `--add-dir` | `--add-dir` | `--add-dir=` |
-| output parsed from | `--output-format stream-json --verbose` (last line = `result`: `result`, `session_id`, `usage`; earlier lines feed `bridge-watch`) | `--output-format stream-json` (`assistant` chunks, `result`) | `--output-format json` JSONL (`assistant.message` content, `result.sessionId` + `usage.premiumRequests`/`totalApiDurationMs`; `EDITED=` in the bridge line when `codeChanges.filesModified` is non-empty) |
+| Option | claude | cursor | copilot | codex |
+|---|---|---|---|---|
+| `-m ask` / `plan` | `--permission-mode plan` | default agent mode + temporary global `Write(**)` deny (decision 2026-09-12; `-m write` refuses with exit 6 while held) / `--mode plan` | `--deny-tool=write --deny-tool=shell` | `exec --sandbox read-only` (no file writes, no network; read-only shell works) |
+| `-m write` | `--permission-mode acceptEdits` (+ `--disallowed-tools Bash(git restore:*)…` outside a bridge-owned worktree) | `--force` + a temporary global deny `Shell(git commit)`/`push`/`tag` (+ `restore`/`checkout`/… outside a bridge-owned worktree) | `--allow-all-tools` + `--deny-tool=shell(git commit)` … (+ `shell(git restore)`… outside a bridge-owned worktree) | `exec --sandbox workspace-write` (no network; `restore`/`checkout`/… are prompt-only outside a bridge-owned worktree — no deny flag) |
+| git commit/push/tag denied by | `--disallowed-tools Bash(git commit:*)…` + PreToolUse hook | `permissions.deny` in `~/.cursor/cli-config.json` (a write run holds the three entries for its duration) | `--deny-tool=shell(git …)` | the sandbox: Codex keeps `<root>/.git` of every writable root read-only in `workspace-write` (protected metadata paths `.git`, `.agents`, `.codex`, `.aws` in codex-rs `protocol/src/permissions.rs`), so a commit cannot land; `push` has no network |
+| `-M model` | `--model` | `--model` (always passed: `auto` unless `-M`, so the app's last pick in cli-config.json never leaks in) | `--model=` | `--model` |
+| `--session id` / `-c` | `--resume id --fork-session` / `--continue --fork-session` (the peer never writes into the session it resumes — with `-c` in your own directory that is yours) | `--resume id` / `--continue` | `--resume=id` / `--continue` | `exec … resume <thread_id>` / `exec … resume --last` (the exec-level flags stay before `resume`: `--sandbox`, `--cd`, `--add-dir` are not global there) |
+| `-w [name]` | `--worktree [name]` → `<repo>/.claude/worktrees/<name>` (locked) | `--worktree [name]` → `~/.cursor/worktrees/<repo>/<name>` | not supported (use `git worktree add` + `-d`) | not supported (use `git worktree add` + `-d`) |
+| `--add-dir` | `--add-dir` | `--add-dir` | `--add-dir=` | `--add-dir` (an extra *writable* root in `workspace-write`; reads need no grant) |
+| board MCP | `--allowed-tools mcp__bridge_board` (registered user-scope by `bridge-sync`) | `--approve-mcps` (`~/.cursor/mcp.json` by `bridge-sync`) | `~/.copilot/mcp-config.json` (not written yet) | `-c mcp_servers.bridge_board.command=… -c …args=["serve"] -c …env={AGENT_BRIDGE_AGENT="codex"}` on the run itself — nothing is written to `~/.codex/config.toml` |
+| output parsed from | `--output-format stream-json --verbose` (last line = `result`: `result`, `session_id`, `usage`; earlier lines feed `bridge-watch`) | `--output-format stream-json` (`assistant` chunks, `result`) | `--output-format json` JSONL (`assistant.message` content, `result.sessionId` + `usage.premiumRequests`/`totalApiDurationMs`; `EDITED=` in the bridge line when `codeChanges.filesModified` is non-empty) | `exec --json` JSONL (`thread.started.thread_id` = the session; `item.completed` items: `agent_message.text` is the answer, `command_execution` / `mcp_tool_call` the tool calls, `file_change.changes` → `EDITED=`; `turn.completed.usage` the tokens; a `turn.failed` / `error` message is the error line; no `turn.completed` = incomplete, not a success) |
+
+**Codex.** Every Codex run is `codex exec --json --skip-git-repo-check --cd <dir> --sandbox <mode>` (the bridge decides
+the directory, so the git-repo check is off). There is no per-command deny flag: the read-only sandbox is the read-only
+line, the workspace-write sandbox the write line, and `GIT_DISCARD` is prompt-only there (SECURITY.md). Codex reads the
+repo's `AGENTS.md` itself; `bridge-sync` does not yet mirror the machine-wide rules into `~/.codex/`. Quota: a
+`turn.failed` / `error` event or a stderr line saying "hit your usage limit" marks the peer (exit 7) like the others.
+Flags and event shapes were taken from codex-rs `exec/src/cli.rs`, `utils/cli/src/shared_options.rs`,
+`exec/src/exec_events.rs` and `protocol/src/permissions.rs` on 2026-10-24 and pass the adapter conformance kit; **no
+run against a real `codex` binary has been made yet** — the first one should confirm `resume <id>` after the exec-level
+flags, the `-c mcp_servers.*` overrides (documented TOML parsing, undocumented for `mcp_servers.*.command`) and that
+`--json` output is the stream above, then update this paragraph.
 
 **Copilot workspace bootstrap.** Each prompt names its resolved cwd, nearest git root (including a worktree's
 `.git` file), existing `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` / `.github/copilot-instructions.md` files from root
@@ -345,8 +359,8 @@ whatever its env says.
 ~/.agent-bridge/                 the checkout — source only
   bin/ask-agent       the bridge (python3); one adapter per peer CLI
   bin/ask-claude      = ask-agent claude        bin/ask-cursor  = ask-agent cursor
-  bin/ask-copilot     = ask-agent copilot
-  bin/bridgelib/      the pieces of ask-agent: core.py (paths, quota mark, helpers) · adapters.py (Claude/Cursor/Copilot)
+  bin/ask-copilot     = ask-agent copilot       bin/ask-codex   = ask-agent codex
+  bin/bridgelib/      the pieces of ask-agent: core.py (paths, quota mark, helpers) · adapters.py (Claude/Cursor/Copilot/Codex)
                       · runner.py (process group + timeout, board registration, threads, execute) · grill.py (grill-plan
                       recommend/card section for bridge-plan) · protocol.py (the message envelope of docs/PROTOCOL.md:
                       export + schema check); bridge-sync imports the peer table from here
