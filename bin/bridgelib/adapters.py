@@ -13,8 +13,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .core import (BOARD_TOOLS, CURSOR_PULL, STATE, BRIDGE_CMDS, CLAUDE_READ_ONLY_BASH, CLAUDE_WRITE_BASH, DISABLED,
-                   GIT_DENY, HOME, find_bin, last_json, sum_keys)
+from .core import (BOARD_TOOLS, CURSOR_PULL, STATE, BRIDGE_CMDS, CLAUDE_READ_ONLY_BASH, CLAUDE_WORKTREE_BASH,
+                   CLAUDE_WRITE_BASH, DISABLED, GIT_DENY, GIT_DISCARD, HOME, find_bin, last_json, sum_keys)
 
 class Parsed:
     def __init__(self, result: str, session: str | None = None, tok_in: Any = "?", tok_out: Any = "?",
@@ -68,6 +68,10 @@ class Claude(Adapter):
 
     def _base(self, o: argparse.Namespace) -> list[str]:
         deny = [f"Bash({c}:*)" for c in GIT_DENY] + [f"Bash({c}:*)" for c in BRIDGE_CMDS] + list(o.deny)
+        # the caller's checkout: their uncommitted work stays (discard_ok is set by ask-agent for -w / bridge/<name>)
+        protect = o.mode == "write" and not getattr(o, "discard_ok", False)
+        if protect:
+            deny += [f"Bash({c}:*)" for c in GIT_DISCARD]
         if o.board:
             # plan mode blocks every MCP tool (verified 2026-09-12): read-only runs use default mode + explicit edit denies
             mode = {"ask": "default", "plan": "default", "write": "acceptEdits"}[o.mode]
@@ -84,6 +88,8 @@ class Claude(Adapter):
         # write mode also pre-approves the build/test runners: headless claude denies any non-allowlisted Bash and a
         # denied `mvn test` turns an implement run into 30 turns of guessing (measured 2026-09-26)
         allowed += [f"Bash({c}:*)" for c in (CLAUDE_WRITE_BASH if o.mode == "write" else CLAUDE_READ_ONLY_BASH)]
+        if o.mode == "write" and not protect:
+            allowed += [f"Bash({c}:*)" for c in CLAUDE_WORKTREE_BASH]
         if allowed:
             a += ["--allowed-tools", ",".join(allowed)]
         if o.model:
@@ -114,7 +120,10 @@ class Claude(Adapter):
                     "cannot be approved, so use ONE simple command per Bash call — no `for` loops, no `VAR=…;` prefixes, "
                     "no `&&` chains. Pre-approved: the read-only set (rg, git log/show/diff, cat/sed -n, find, ls) plus build/"
                     "test runners (mvn, gradle, bun, npm test/run, npx, tsc, pytest, python -m pytest, ruff, go, cargo, make) "
-                    "and git add/restore. Touch only the files the task names; leave everything uncommitted.)\n\n")
+                    "and git add. Touch only the files the task names; leave everything uncommitted."
+                    + ("" if getattr(o, "discard_ok", False) else
+                       " This is the caller's checkout: git restore/checkout/switch/stash/reset/clean are denied — "
+                       "their uncommitted work stays as it is.") + ")\n\n")
         return ("(Headless read-only run: a denied command cannot be approved, so use ONE simple command per Bash call — "
                 "no `for` loops, no `VAR=…;` prefixes, no `&&` chains, no python heredocs. Pre-approved: rg, git "
                 "log/show/grep/diff/blame, cat/head/tail/sed -n, find, ls, wc, unzip -l/-p, javap, rtk read. Builds (mvn), "
@@ -198,6 +207,10 @@ class Cursor(Adapter):
         "Shell(dd)", "Shell(dd *)",
         "Shell(truncate)", "Shell(truncate *)",
     )
+    # a write run (`--force`: everything but the global deny) holds these instead: history stays the user's, and in
+    # the caller's checkout (not discard_ok) their uncommitted work stays
+    WRITE_ENTRIES = tuple(f"Shell({c}{s})" for c in GIT_DENY for s in ("", " *"))
+    DISCARD_ENTRIES = tuple(f"Shell({c}{s})" for c in GIT_DISCARD for s in ("", " *"))
     DENY_STATE = STATE / "cursor-deny.json"
     DENY_LOCK = STATE / "cursor-deny.lock"
     CLI_CONFIG = HOME / ".cursor" / "cli-config.json"
@@ -224,33 +237,43 @@ class Cursor(Adapter):
                 except json.JSONDecodeError:
                     pass
             state["pids"] = [q for q in state["pids"] if self._alive(q)]
+            state["ask"] = [q for q in state.get("ask", []) if q in state["pids"]]
             if not state["pids"] and state["added"]:          # holders died without cleanup — put the user's file back
                 self._deny_restore(state)
             result = fn(state)
             self.DENY_STATE.write_text(json.dumps(state))
             return result
 
-    def _deny_acquire(self) -> str:
+    def _deny_acquire(self, entries: tuple[str, ...] | None = None, what: str = "") -> str:
+        """Hold `entries` (default: the ask-mode set) in the global deny until the last holder leaves. Holds overlap:
+        each run adds what its set still lacks, the union is dropped when the last pid is gone."""
+        entries = entries or self.DENY_ENTRIES
+        what = what or "`Write(**)` + write-capable Shell denials"
+
         def fn(state):
-            if not state["pids"]:
-                text = self.CLI_CONFIG.read_text() if self.CLI_CONFIG.is_file() else "{}"
-                cfg = json.loads(text or "{}")
-                deny = cfg.setdefault("permissions", {}).setdefault("deny", [])
-                # Drop leftover Shell(*) from pre-2026-10-13 holds so read-only shell works; do not put it back on restore.
-                if self._LEGACY_SHELL_STAR in deny:
-                    deny[:] = [e for e in deny if e != self._LEGACY_SHELL_STAR]
-                    text = json.dumps(cfg, indent=2) + "\n"
-                    self.CLI_CONFIG.write_text(text)
-                missing = [e for e in self.DENY_ENTRIES if e not in deny]
-                if missing:                                     # never rewrite a file that already denies these
-                    deny.extend(missing)
-                    written = json.dumps(cfg, indent=2) + "\n"
-                    self.CLI_CONFIG.write_text(written)
-                    state.update(added=True, orig=text, written=written, entries=missing)
+            text = self.CLI_CONFIG.read_text() if self.CLI_CONFIG.is_file() else "{}"
+            cfg = json.loads(text or "{}")
+            deny = cfg.setdefault("permissions", {}).setdefault("deny", [])
+            # Drop leftover Shell(*) from pre-2026-10-13 holds so read-only shell works; do not put it back on restore.
+            if not state["pids"] and self._LEGACY_SHELL_STAR in deny:
+                deny[:] = [e for e in deny if e != self._LEGACY_SHELL_STAR]
+                text = json.dumps(cfg, indent=2) + "\n"
+                self.CLI_CONFIG.write_text(text)
+            missing = [e for e in entries if e not in deny]
+            if missing:                                         # never rewrite a file that already denies these
+                # cursor-agent rewrites this file itself; once it did between two holds, the byte-identical restore
+                # would put the first holder's snapshot back over that edit — drop only our entries then
+                edited = state["added"] and text != state["written"]
+                deny.extend(missing)
+                written = json.dumps(cfg, indent=2) + "\n"
+                self.CLI_CONFIG.write_text(written)
+                state.update(added=True, orig=state["orig"] if state["added"] else text,
+                             written="" if edited else written, entries=state.get("entries", []) + missing)
             if os.getpid() not in state["pids"]:
                 state["pids"].append(os.getpid())
-            return (f"cursor: default agent mode, `Write(**)` + write-capable Shell denials held "
-                    f"(Shell(*) not denied — git/rg/cat ok; holders: {state['pids']})")
+            if "Write(**)" in entries and os.getpid() not in state.setdefault("ask", []):
+                state["ask"].append(os.getpid())            # the holders a write run must not start under
+            return f"cursor: {what} held (Shell(*) not denied — git/rg/cat ok; holders: {state['pids']})"
         note = self._deny_state(fn)
         if not self._held:
             self._held = True
@@ -258,7 +281,8 @@ class Cursor(Adapter):
         return note
 
     def _deny_holders(self) -> list[int]:
-        return self._deny_state(lambda state: list(state["pids"]))
+        """Pids holding the ask-mode set — the one that would block a write run's edits; a write hold is not one."""
+        return self._deny_state(lambda state: list(state["ask"]))
 
     def finish(self, o):
         if not self._held:
@@ -267,6 +291,7 @@ class Cursor(Adapter):
 
         def fn(state):
             state["pids"] = [q for q in state["pids"] if q != os.getpid()]
+            state["ask"] = [q for q in state.get("ask", []) if q != os.getpid()]
             if not state["pids"] and state["added"]:
                 self._deny_restore(state)
         self._deny_state(fn)
@@ -301,6 +326,11 @@ class Cursor(Adapter):
                       f"Retry when they finish.",
                       file=sys.stderr)
                 raise SystemExit(6)
+            if not dry:
+                protect = not getattr(o, "discard_ok", False)
+                notes.append(self._deny_acquire(self.WRITE_ENTRIES + (self.DISCARD_ENTRIES if protect else ()),
+                                                "git commit/push/tag" + (" + restore/checkout/switch/stash/reset/clean "
+                                                                         "(the caller's checkout)" if protect else "")))
         top = subprocess.run(["git", "-C", o.dir, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
         root = Path(top.stdout.strip()) if top.returncode == 0 else Path(o.dir)
         rules = root / ".cursor" / "rules"
@@ -458,7 +488,7 @@ class Copilot(Adapter):
         a = ["--no-ask-user", "--output-format", "json"]
         if o.mode == "write":
             a += ["--allow-all-tools"]
-            for c in GIT_DENY:
+            for c in GIT_DENY + (() if getattr(o, "discard_ok", False) else GIT_DISCARD):
                 a += [f"--deny-tool=shell({c})", f"--deny-tool=shell({c}:*)"]
         else:
             a += ["--deny-tool=write", "--deny-tool=shell"]
