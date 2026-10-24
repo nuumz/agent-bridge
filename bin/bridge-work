@@ -81,9 +81,21 @@ def ask_with_fallback(peer: str, mode: str, cwd: str, prompt: str, timeout: int,
     return rc, answer, notes, peer
 
 
+# Models dress the line up — backticks, bold, a colon, lower case — so the parser accepts those and the verdict line
+# never counts against the shape check, whatever it says after BRIDGE_VERDICT.
+VERDICT_LINE_RE = re.compile(r"^[\s`*_]*BRIDGE_VERDICT\b.*$", re.I | re.M)
+VERDICT_RE = re.compile(r"^[\s`*_]*BRIDGE_VERDICT[\s`*_]*[=:][\s`*_]*(APPROVE|REVISE)[\s`*_.]*$", re.I | re.M)
+
+
+def review_verdict(review: str) -> str | None:
+    """The reviewer's machine-readable line — APPROVE or REVISE — or None when it wrote none."""
+    m = VERDICT_RE.search(review or "")
+    return m.group(1).upper() if m else None
+
+
 def review_valid(rc: int, review: str) -> bool:
     """A review counts only when the run finished (rc 0, not an [[ASK]]) and answered in the requested shape."""
-    text = review.strip()
+    text = VERDICT_LINE_RE.sub("", review or "").strip()
     is_table = any(re.fullmatch(r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?", ln.strip()) for ln in text.splitlines())
     return rc == 0 and (text.upper() == "NONE" or is_table)
 
@@ -144,7 +156,8 @@ def review_prompt(o, allowed: list[str], diff: str, verify_rc: int, verify_tail:
             + f"\nDiff:\n```diff\n{diff[:60000]}\n```\n\n"
             "Reply ONLY with a markdown table `file:line | finding | severity (high/medium/low) | must-fix (yes/no) | why`, "
             "or the single word NONE. must-fix=yes only for defects that make the change wrong, unsafe, or outside the task. "
-            "Write the answer in the reply body; do not narrate. " + lang_rule(o.task))
+            "Then end with exactly one line: `BRIDGE_VERDICT=APPROVE` when no row is must-fix=yes, else "
+            "`BRIDGE_VERDICT=REVISE`. Write the answer in the reply body; do not narrate. " + lang_rule(o.task))
 
 
 def must_fix(table: str, allowed: list[str], touched_files: list[str]) -> list[str]:
@@ -159,6 +172,19 @@ def must_fix(table: str, allowed: list[str], touched_files: list[str]) -> list[s
             continue
         rows.append(ln.strip())
     return rows
+
+
+def review_fixes(review: str, allowed: list[str], touched_files: list[str]) -> list[str]:
+    """What goes back to the implementer. The must-fix rows; and a REVISE verdict with no such row is itself one, so the
+    verdict line — not a reading of the prose — decides whether the loop continues."""
+    fixes = must_fix(review, allowed, touched_files)
+    if review_verdict(review) == "REVISE" and not fixes and not must_fix(review, [], touched_files):
+        # no must-fix row anywhere (a row the agreement filter dropped is not this case — the agreement wins); the
+        # implementer never sees the review, so the row carries what the reviewer wrote
+        said = " ".join(VERDICT_LINE_RE.sub("", review).split()).replace("|", "/")[:400]
+        fixes.append(f"| (review) | BRIDGE_VERDICT=REVISE without a must-fix=yes row — the reviewer wrote: {said} "
+                     "| high | yes | the verdict line decides |")
+    return fixes
 
 
 def finding_key(row: str) -> str:
@@ -343,6 +369,7 @@ def run(o) -> int:
     feedback = ""
     final_rc, final_tail, review, bad, diffstat = None, "", "", [], ""
     review_ok = False
+    last_verdict: str | None = None
     review_by = reviewer
     impl_by = implementer
     used: dict[str, set] = {"implementer": set(), "reviewer": set()}
@@ -374,13 +401,15 @@ def run(o) -> int:
         used["reviewer"].add(reviewer if rev_used == reviewer else f"{reviewer}→{rev_used}")
         review_by = rev_used
         review_ok = review_valid(rrc, review)
-        fixes = must_fix(review, allowed, files) if review_ok else []
+        last_verdict = review_verdict(review) if review_ok else None
+        fixes = review_fixes(review, allowed, files) if review_ok else []
         if not review_ok:
             print(f"[work] review not usable (rc={rrc}; needs a finished table or NONE) — the result cannot be READY",
                   file=sys.stderr)
         rep = repeated(rounds[-1].get("must_fix", []), fixes) if rounds else []
         rounds.append({"round": n, "impl": answer, "files": files, "outside": bad, "verify_rc": vrc, "verify": vtail,
-                       "review_rc": rrc, "review": review, "must_fix": fixes, "repeat_findings": rep})
+                       "review_rc": rrc, "review": review, "verdict": review_verdict(review), "must_fix": fixes,
+                       "repeat_findings": rep})
         (out / "rounds.json").write_text(json.dumps(rounds, ensure_ascii=False, indent=2))
         if vrc == 0 and not fixes and not bad:
             break                       # review_ok False here still ends the loop: a re-write would not fix a missing review
@@ -406,6 +435,7 @@ def run(o) -> int:
               f"{round((time.time() - t0) / 60, 1)} min"
               + (f" · switched implementer: {', '.join(switched)}" if switched else "") + f"\n\n## Task\n\n{o.task}\n\n"
               f"## Result\n\n- verify `{o.verify}` → {'not run (implementer failed)' if final_rc is None else f'exit {final_rc}'}\n- files: {', '.join(rounds[-1].get('files', [])) if rounds else '-'}\n"
+              + f"- review verdict: {last_verdict or ('none (no BRIDGE_VERDICT line — table rows decided)' if review_ok else 'no usable review')}\n"
               + (f"- **outside the allowed set**: {', '.join(bad)}\n" if bad else "")
               + f"\n```\n{diffstat or '(no diff)'}\n```\n\n### verify output (tail)\n\n```\n{final_tail}\n```\n\n"
               f"## Review ({review_label(review_by, impl_by)})\n\n{review or '(no review)'}\n\n"

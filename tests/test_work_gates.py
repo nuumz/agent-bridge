@@ -150,5 +150,40 @@ class GuardedRc(unittest.TestCase):
         self.assertEqual(got.get("rc"), 1)
 
 
+
+class ReviewVerdict(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bw = _load_bridge_work()
+
+    TABLE = "| file:line | finding | severity | must-fix | why |\n|---|---|---|---|---|\n| a.py:1 | x | low | no | y |"
+
+    def test_verdict_line_is_read_and_does_not_break_the_shape_check(self):
+        self.assertEqual(self.bw.review_verdict(self.TABLE + "\nBRIDGE_VERDICT=APPROVE\n"), "APPROVE")
+        self.assertEqual(self.bw.review_verdict("NONE\n  BRIDGE_VERDICT = REVISE "), "REVISE")
+        self.assertIsNone(self.bw.review_verdict(self.TABLE))
+        self.assertTrue(self.bw.review_valid(0, "NONE\nBRIDGE_VERDICT=APPROVE\n"))
+        self.assertTrue(self.bw.review_valid(0, "NONE\n`BRIDGE_VERDICT=APPROVE`\n"))   # dressed up — still not a shape failure
+        self.assertEqual(self.bw.review_verdict("NONE\n**bridge_verdict: revise**"), "REVISE")
+        self.assertFalse(self.bw.review_valid(0, "BRIDGE_VERDICT=APPROVE\n"))          # a verdict alone is not a review
+
+    def test_revise_without_a_must_fix_row_still_sends_the_implementer_back(self):
+        fixes = self.bw.review_fixes(self.TABLE + "\nBRIDGE_VERDICT=REVISE", [], ["a.py"])
+        self.assertEqual(len(fixes), 1)
+        self.assertIn("BRIDGE_VERDICT=REVISE", fixes[0])
+        self.assertIn("a.py:1 / x / low / no / y", fixes[0])                 # the implementer gets what the reviewer wrote
+        # a must-fix row the agreement filter dropped (file outside the allowed set, untouched) is not this case
+        outside = self.TABLE.replace("| a.py:1 | x | low | no |", "| other/b.py:3 | x | high | yes |")
+        self.assertEqual(self.bw.review_fixes(outside + "\nBRIDGE_VERDICT=REVISE", ["src/**"], ["src/a.py"]), [])
+        self.assertEqual(self.bw.review_fixes(self.TABLE + "\nBRIDGE_VERDICT=APPROVE", [], ["a.py"]), [])
+        yes = self.TABLE.replace("| low | no |", "| high | yes |")
+        self.assertEqual(len(self.bw.review_fixes(yes + "\nBRIDGE_VERDICT=APPROVE", [], ["a.py"])), 1)  # rows win
+
+    def test_review_prompt_asks_for_the_verdict_line(self):
+        o = mock.Mock(name="o", task="t", verify="make test")
+        o.name = "n"
+        self.assertIn("BRIDGE_VERDICT=REVISE", self.bw.review_prompt(o, ["a.py"], "diff", 0, "", []))
+
+
 if __name__ == "__main__":
     unittest.main()
