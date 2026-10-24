@@ -11,13 +11,17 @@ change checklist. This file is the short version.
   board registration), `ledger` (outcome ledger, playbook loader), `grill`, `evidence`, `workskills`. `bin/boardlib.py` is
   the SQLite board behind `bridge-board`.
 - `roles/`, `playbooks/`, `work-skills/` — markdown with a flat `key: value` frontmatter; loaded at run time, no code change
-  needed to add one. `agents/` — Claude Code subagent wrappers (`peer-*`), symlinked into `~/.claude/agents/` by `bridge-sync`.
+  needed to add one. `work-skills.local/` is git-ignored but loaded too, so a test that passes only because of a local
+  file there is a CI failure. `agents/` — Claude Code subagent wrappers (`peer-*`), symlinked into `~/.claude/agents/` by `bridge-sync`.
 - `.claude-plugin/` + `hooks/` — the Claude Code plugin, marketplace and hook manifests (`claude plugin validate .` must
   pass). Two warnings are expected: no `version` (on purpose — a pinned version would freeze plugin users on a cached copy
   until someone bumps it; without one the plugin tracks the commit) and `CLAUDE.md` at the root (it is for contributors'
   agents, not plugin context).
 - `tests/` — `unittest`, no third-party packages. Peer CLIs are stub scripts put first on `PATH`; `HOME` is a temp dir.
 - Runtime state is **never** in the checkout: `~/.agent-bridge/state/` (git-ignored). Tests must not read or write it.
+  State paths are import-time constants, so patching `HOME` in a test does nothing: patch the constant the code reads
+  (`ledger.LEDGER`, `boardlib.BOARD_DIR` / `DB_PATH`, `runner.CONV_DIR`, `core.STATE`) and give any subprocess its own
+  `HOME`. CI fails when the suite leaves anything under the runner's `~/.agent-bridge`.
 
 ## Working rules
 

@@ -8,11 +8,15 @@ Clone to `~/.agent-bridge` (see the [README](README.md#install)). No dependencie
 
 ```bash
 python3 -m unittest discover -s tests
+# once more the way CI sees it: a fresh clone and an empty HOME
+git clone -q . /tmp/ab && HOME=$(mktemp -d) python3 -m unittest discover -s /tmp/ab/tests
 ```
 
 - Standard library only — the bridge must run on a fresh machine with nothing to install.
 - Add a test for every branch you add or change in `bin/bridgelib/` or a pipeline gate; tests must not touch
-  `~/.agent-bridge` (use a temporary directory, as the existing tests do).
+  `~/.agent-bridge` — state paths are import-time constants, so patch the one the code reads (`ledger.LEDGER`,
+  `boardlib.BOARD_DIR` / `DB_PATH`, `runner.CONV_DIR`), not `HOME`; CI fails on anything left under the runner's
+  `~/.agent-bridge`.
 - Failure paths are exercised with stub `claude` / `cursor-agent` / `copilot` scripts put first on `PATH` — no real
   peer call, no cost.
 - A change to a rule, exit code or file layout updates [SHARED-RULES.md](SHARED-RULES.md) in the same pull request.
