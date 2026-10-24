@@ -18,9 +18,10 @@ from .core import (BOARD_TOOLS, STATE, BRIDGE_CMDS, CLAUDE_READ_ONLY_BASH, CLAUD
 
 class Parsed:
     def __init__(self, result: str, session: str | None = None, tok_in: Any = "?", tok_out: Any = "?",
-                 is_error: bool = False, extra: str = ""):
+                 is_error: bool = False, extra: str = "", metrics: dict[str, int | float] | None = None):
         self.result, self.session, self.tok_in, self.tok_out, self.is_error, self.extra = (
             result, session, tok_in, tok_out, is_error, extra)
+        self.metrics = metrics if metrics is not None else {}
 
 
 class Adapter:
@@ -390,6 +391,46 @@ class Copilot(Adapter):
         except Exception:  # noqa: BLE001
             return "no ~/.copilot/config.json"
 
+    def preamble(self, o):
+        cwd = Path(o.dir).resolve()
+        root = next((p for p in (cwd, *cwd.parents) if (p / ".git").exists()), None)
+        parents = [cwd]
+        while parents[-1] != (root or cwd):
+            parents.append(parents[-1].parent)
+        instructions = [
+            p / name for p in reversed(parents)
+            for name in ("AGENTS.md", "CLAUDE.md", "GEMINI.md", ".github/copilot-instructions.md")
+            if (p / name).is_file()
+        ]
+        roots = [cwd, *((cwd / Path(d).expanduser()).resolve() for d in o.add_dir)]
+        outside = " (outside file access — rerun with -d <repo root> or --add-dir to let the CLI read it)"
+        inventory = "\n".join(
+            f"- {p}" + ("" if any(p.is_relative_to(r) for r in roots) else outside) for p in instructions
+        ) or "- no repo-level instruction file found"
+        access = ", ".join(str(r) for r in roots)
+        mode = (
+            "Read-only: shell and file writes are denied, including builds/tests. Use native glob, rg and view tools; "
+            "do not attempt bash even for git status/diff. If the task requires shell evidence, report that limit."
+            if o.mode != "write" else
+            "Write: edit only the task's allowed file set, run its verification command, and report the actual output. "
+            "Do not stage, commit, push or tag. An analysis alone is not an implementation."
+        )
+        return (
+            f"(Bridge workspace bootstrap\nWorking directory: {cwd}\n"
+            f"Repository root: {root or '(not a git checkout)'}\n"
+            f"File access roots (not a grant beyond CLI permissions): {access}\n"
+            f"Existing instruction files to check before work:\n{inventory}\n"
+            "Copilot discovers personal instructions and skills itself; also follow applicable path-scoped repo rules. "
+            "This inventory is not proof they loaded. Do not create or copy instructions, or build a knowledge graph "
+            "just to prepare the workspace unless the task requests it.\n"
+            f"{mode}\n"
+            "Discover paths before reading them; do not guess a workspace layout. A denied tool/path cannot be approved "
+            "in this headless run: do not retry it or bypass it. Continue with authorized evidence; if essential evidence "
+            "is outside these roots, end with [[ASK]] naming the needed path and why. "
+            "Use the task's requested output format, cite file:line for findings, distinguish facts from hypotheses, "
+            "and name unverified checks. Do not delegate a task you can finish directly.)\n\n"
+        )
+
     def _base(self, o):
         # JSONL (`--output-format json`, CLI 1.0.88): `assistant.message` events carry the answer, the final `result`
         # event the session id + usage — before 2026-09-26 the bridge used `-s` plain text and Copilot runs had no
@@ -430,7 +471,7 @@ class Copilot(Adapter):
             if isinstance(d, dict) and d.get("type"):
                 events.append(d)
         if not events:                                   # older CLI or `-s` output: plain text
-            return Parsed(raw.strip())
+            return Parsed(raw.strip(), is_error=not bool(raw.strip()))
         final = [e for e in events if e.get("type") == "assistant.message"]
         answer = [(e.get("data") or {}).get("content", "") for e in final if (e.get("data") or {}).get("phase", "final_answer") == "final_answer"]
         text = "\n\n".join(t.strip() for t in answer if t and t.strip()) or \
@@ -438,12 +479,28 @@ class Copilot(Adapter):
         res = next((e for e in reversed(events) if e.get("type") == "result"), {})
         u = res.get("usage") or {}
         edited = ((u.get("codeChanges") or {}).get("filesModified")) or []
+        failures = [e.get("data") or {} for e in events
+                    if e.get("type") == "tool.execution_complete" and (e.get("data") or {}).get("success") is False]
+        metrics = {
+            "tool_calls": sum(e.get("type") == "tool.execution_start" for e in events),
+            "tool_failures": len(failures),
+            "permission_denials": sum((e.get("error") or {}).get("code") == "denied" for e in failures),
+        }
+        for source, target in (("premiumRequests", "premium_requests"), ("totalApiDurationMs", "api_duration_ms")):
+            if isinstance(u.get(source), (int, float)) and not isinstance(u[source], bool):
+                metrics[target] = u[source]
+        if isinstance((u.get("codeChanges") or {}).get("filesModified"), list):
+            metrics["files_modified"] = len(edited)
         extra = f"premium={u.get('premiumRequests', '?')} api={u.get('totalApiDurationMs', '?')}ms"
+        extra += f" tool_failures={metrics['tool_failures']} permission_denials={metrics['permission_denials']}"
         if edited:
             extra += f" EDITED={','.join(edited)}"
-        is_error = res.get("exitCode", 0) not in (0, None) or not text
+        is_error = not res or res.get("exitCode", 0) not in (0, None) or not text
+        if not res:
+            text = "Copilot stream incomplete: no terminal result event.\n\n" + text
         # the JSONL stream carries no token counts — premiumRequests is billing units, kept in `extra`, never tok_out
-        return Parsed(text or "(copilot returned no assistant message)", res.get("sessionId"), "?", "?", is_error, extra)
+        return Parsed(text or "(copilot returned no assistant message)", res.get("sessionId"), "?", "?", is_error,
+                      extra, metrics)
 
 
 ADAPTERS: dict[str, Adapter] = {a.name: a for a in (Claude(), Cursor(), Copilot())}

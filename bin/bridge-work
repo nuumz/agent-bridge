@@ -66,14 +66,29 @@ def close_threads(name: str) -> None:
         subprocess.run([str(BOARD), "close", f"conv:work-{name}-{suffix}"], capture_output=True, text=True)
 
 
-def ask_with_fallback(peer: str, mode: str, cwd: str, prompt: str, timeout: int, conv: str, kind: str) -> tuple[int, str, str, str]:
-    """Like ask(); when the peer is unavailable the role falls back to claude once (local, no egress). Returns the peer used."""
+def ask_with_fallback(peer: str, mode: str, cwd: str, prompt: str, timeout: int, conv: str, kind: str,
+                      peers: list[str]) -> tuple[int, str, str, str]:
+    """Like ask(); when the peer is unavailable the role falls back to claude once — only if -p allows claude
+    (-p is the egress gate). Returns the peer used."""
     rc, answer, notes = ask(peer, mode, cwd, prompt, timeout, conv, kind)
     if rc in FALLBACK_RC and peer != "claude":
+        if "claude" not in peers:
+            print(f"[work] {peer} unavailable (rc={rc}) — no fallback: claude is not in -p", file=sys.stderr)
+            return rc, answer, notes, peer
         print(f"[work] {peer} unavailable (rc={rc}) — falling back to claude for this step", file=sys.stderr)
         rc, answer, notes = ask("claude", mode, cwd, prompt, timeout, conv + "-fallback", kind)
         return rc, answer, notes, "claude"
     return rc, answer, notes, peer
+
+
+def review_valid(rc: int, review: str) -> bool:
+    """A review counts only when the run finished (rc 0, not an [[ASK]]) and answered in the requested shape."""
+    text = review.strip()
+    return rc == 0 and (text.upper() == "NONE" or any(ln.strip().startswith("|") for ln in text.splitlines()))
+
+
+def review_label(reviewer_used: str, implementer_used: str) -> str:
+    return reviewer_used + (" — self-review, not independent" if reviewer_used == implementer_used else "")
 
 
 def touched(wt: Path, base: str) -> list[str]:
@@ -286,11 +301,13 @@ def run(o) -> int:
     final_rc, final_tail, review, bad, diffstat = None, "", "", [], ""
     review_ok = False
     review_by = reviewer
+    impl_by = implementer
     used: dict[str, set] = {"implementer": set(), "reviewer": set()}
     for n in range(1, o.rounds + 1):
         print(f"[work] round {n}/{o.rounds}: {implementer} writes …", file=sys.stderr)
         rc, answer, notes, impl_used = ask_with_fallback(implementer, "write", str(wt), write_prompt(o, allowed, n, feedback, impl_add),
-                                                         o.timeout, f"work-{o.name}-impl", "implement")
+                                                         o.timeout, f"work-{o.name}-impl", "implement", peers)
+        impl_by = impl_used
         used["implementer"].add(implementer if impl_used == implementer else f"{implementer}→{impl_used}")
         if rc not in (0, 5):
             print(f"[work] implementer failed: {answer[:200]}", file=sys.stderr)
@@ -307,13 +324,14 @@ def run(o) -> int:
         print(f"[work] verify `{o.verify}` → exit {vrc}; files {files}{'; OUTSIDE allowed: ' + str(bad) if bad else ''}", file=sys.stderr)
         print(f"[work] {reviewer} reviews …", file=sys.stderr)
         rrc, review, _, rev_used = ask_with_fallback(reviewer, "ask", str(wt), review_prompt(o, allowed, diff, vrc, vtail, bad, rev_add),
-                                                     o.timeout, f"work-{o.name}-review", "review-change")
+                                                     o.timeout, f"work-{o.name}-review", "review-change", peers)
         used["reviewer"].add(reviewer if rev_used == reviewer else f"{reviewer}→{rev_used}")
         review_by = rev_used
-        review_ok = rrc in (0, 5)
+        review_ok = review_valid(rrc, review)
         fixes = must_fix(review, allowed, files) if review_ok else []
         if not review_ok:
-            print(f"[work] review failed (rc={rrc}) — the result cannot be READY without a review", file=sys.stderr)
+            print(f"[work] review not usable (rc={rrc}; needs a finished table or NONE) — the result cannot be READY",
+                  file=sys.stderr)
         rounds.append({"round": n, "impl": answer, "files": files, "outside": bad, "verify_rc": vrc, "verify": vtail,
                        "review_rc": rrc, "review": review, "must_fix": fixes})
         (out / "rounds.json").write_text(json.dumps(rounds, ensure_ascii=False, indent=2))
@@ -333,7 +351,7 @@ def run(o) -> int:
               f"## Result\n\n- verify `{o.verify}` → {'not run (implementer failed)' if final_rc is None else f'exit {final_rc}'}\n- files: {', '.join(rounds[-1].get('files', [])) if rounds else '-'}\n"
               + (f"- **outside the allowed set**: {', '.join(bad)}\n" if bad else "")
               + f"\n```\n{diffstat or '(no diff)'}\n```\n\n### verify output (tail)\n\n```\n{final_tail}\n```\n\n"
-              f"## Review ({review_by})\n\n{review or '(no review)'}\n\n"
+              f"## Review ({review_label(review_by, impl_by)})\n\n{review or '(no review)'}\n\n"
               + (f"### still must-fix\n\n" + "\n".join(rounds[-1]['must_fix']) + "\n\n" if rounds and rounds[-1].get("must_fix") else "")
               + f"## Implementer's last note\n\n{rounds[-1].get('impl', '') if rounds else ''}\n\n"
               f"## How to take it\n\n```bash\ngit -C {repo} diff {base_sha[:9]} bridge/{o.name}      # read the whole change\n"
@@ -345,6 +363,7 @@ def run(o) -> int:
         ledger.record({"type": "work", "name": o.name, "kind": "implement", "skill": skill["name"] if skill else None,
                        "peers": o.peers, "implementer": implementer,
                        "reviewer": reviewer, "used": {k: sorted(v) for k, v in used.items()}, "review_ok": review_ok,
+                       "self_review": review_by == impl_by,
                        "rounds": len(rounds), "verify_rc": final_rc, "ok": ok,
                        "outside": bad, "duration_s": round(time.time() - t0)})
     except Exception:  # noqa: BLE001
