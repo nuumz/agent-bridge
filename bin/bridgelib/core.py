@@ -41,6 +41,62 @@ def hop_active(env: dict | None = None) -> bool:
     """True inside a bridged run. Presence decides, not the value: `AGENT_BRIDGE_HOP=` must not open a second hop."""
     return HOP_VAR in (os.environ if env is None else env)
 
+
+# Extra readable roots an orchestrator (panel/work/fix) grants every peer run it spawns. Copilot and Cursor read only
+# under -d and --add-dir, so evidence a case cites in another repo was denied to them (2026-10 ledger: 156 denials).
+ADD_DIRS_VAR = "AGENT_BRIDGE_ADD_DIRS"
+
+
+def add_dirs_from_env() -> list[str]:
+    return [d for d in os.environ.get(ADD_DIRS_VAR, "").split(os.pathsep) if d]
+
+
+def share_add_dirs(dirs: list[str]) -> None:
+    """Export `--add-dir` roots so every ask-agent child (also after --detach) inherits them; a missing root exits."""
+    have = add_dirs_from_env()
+    for d in dirs:
+        p = Path(d).expanduser().resolve()
+        if not p.is_dir():
+            sys.exit(f"--add-dir: not a directory: {d}")
+        if str(p) not in have:
+            have.append(str(p))
+    if have:
+        os.environ[ADD_DIRS_VAR] = os.pathsep.join(have)
+
+
+CITED_PATH_RE = re.compile(r"(?P<q>[`'\"])(?P<quoted>~?/[^`'\"\n]+?)(?P=q)"            # quoted: may hold spaces
+                           r"|(?<![\w.~/-])(?P<bare>~?/[^\s`'\"<>|()\[\]{},;]+)")
+
+
+def cited_roots(text: str, cwd: str, granted: list[str]) -> list[str]:
+    """Git repo roots of absolute paths a prompt cites that the run cannot read yet. Only repos strictly under HOME
+    count — a scratch file, /etc or HOME itself is never granted this way — so a peer reads what its caller pointed at."""
+    home = HOME.resolve()
+    have = [Path(cwd).resolve(), *(Path(cwd, d).expanduser().resolve() for d in granted)]
+    roots: list[str] = []
+    for m in CITED_PATH_RE.finditer(text):
+        cited = (m.group("quoted") or m.group("bare")).rstrip(".:")
+        p = Path(re.sub(r"(:\d+(-\d+)?)+$", "", cited).rstrip(".:")).expanduser()
+        p = next((a for a in (p, *p.parents) if a.exists()), None)
+        if p is None:
+            continue
+        p = p.resolve()
+        if not p.is_relative_to(home) or any(p.is_relative_to(h) for h in have):
+            continue
+        state = STATE.resolve()
+        if p.is_relative_to(state):        # bridge artifacts: that one panel/work folder, never the ledger or other runs
+            d = p if p.is_dir() else p.parent
+            root = d if len(d.relative_to(state).parts) >= 2 and d.relative_to(state).parts[0] != "runs" else None
+        elif p.is_relative_to(ROOT) or p.is_relative_to(state.parent):
+            root = None                    # the bridge checkout itself: its rules are not case evidence
+        else:
+            root = next((a for a in (p, *p.parents)
+                         if a != home and a.is_relative_to(home) and (a / ".git").exists()), None)
+        if root and str(root) not in roots:
+            roots.append(str(root))
+            have.append(root)
+    return roots
+
 def guarded_rc(name: str, write_rc: Callable[[str, int], int], body: Callable[[], int]) -> int:
     """Run `body` with SIGTERM → exit 143; always write_rc(name, rc), including on SIGTERM.
 

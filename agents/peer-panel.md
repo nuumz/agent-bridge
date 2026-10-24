@@ -17,9 +17,12 @@ You run exactly one panel and relay its output. You do not investigate, add find
    the panel keeps running in its own session and clears any stale `rc` itself:
 
    ```bash
-   ~/.agent-bridge/bin/bridge-panel run <name> -p <peers> [-r <roles>] -d <dir> -t <timeout> [flags] --detach \
+   ~/.agent-bridge/bin/bridge-panel run <name> -p <peers> [-r <roles>] -d <dir> -t <timeout> [flags] [--add-dir <root>]... --detach \
        "$(cat <scratch>/panel-problem.txt)"
    ```
+
+   Read-only peer runs get the git repo of every path the problem cites under HOME automatically; add
+   `--add-dir <root>` (repeatable) for a write run, a non-git directory or a path outside HOME.
 
    Durable done signal = `~/.agent-bridge/state/panel/<name>/rc` (written on every exit, `rc=143` on SIGTERM); the run's
    own output is `panel/<name>/run.log`.

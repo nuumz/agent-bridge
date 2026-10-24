@@ -35,7 +35,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger, workskills  # noqa: E402
-from bridgelib.core import ROOT, STATE, detach, guarded_rc, hop_active, lang_rule  # noqa: E402
+from bridgelib.core import ROOT, STATE, detach, guarded_rc, hop_active, lang_rule, share_add_dirs  # noqa: E402
 
 ASK = ROOT / "bin" / "ask-agent"
 BOARD = ROOT / "bin" / "bridge-board"
@@ -440,6 +440,8 @@ def main() -> int:
     r.add_argument("name")
     r.add_argument("task")
     r.add_argument("-d", "--dir", default=os.getcwd(), help="repo root (the worktree is created under it)")
+    r.add_argument("--add-dir", action="append", default=[],
+                   help="extra root the implementer and reviewer may read, e.g. a spec repo (repeatable)")
     r.add_argument("--detach", action="store_true",
                    help="fork to the background at once: prints `detached pid=N log=work/<name>/run.log`; wait with "
                         "`bridge-work`'s sibling `bridge-wait work <name>`")
@@ -458,6 +460,7 @@ def main() -> int:
     sub.add_parser("list")
     sub.add_parser("skills", help="list work-skill packs under ~/.agent-bridge/work-skills/")
     o = ap.parse_args()
+    share_add_dirs(getattr(o, "add_dir", []))
     if o.cmd == "show":
         f = WORK / o.name / "report.md"
         print(f.read_text() if f.is_file() else f"no report at {f}")

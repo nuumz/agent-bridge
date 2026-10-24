@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger  # noqa: E402
 from bridgelib.evidence import cite_score, citation_table, low_evidence, verify_citations  # noqa: E402
 from bridgelib.core import (BOARD_PROTOCOL, PEER_TALK_RULE, ROOT, STATE, detach, guarded_rc, hop_active,  # noqa: E402
-                            lang_rule)
+                            lang_rule, share_add_dirs)
 
 ROLES = ROOT / "roles"
 PANELS = STATE / "panel"
@@ -641,6 +641,8 @@ def main() -> int:
     r.add_argument("-p", "--peers", required=True, help="peers the user allows, e.g. claude,cursor (egress control)")
     r.add_argument("-r", "--roles", help=f"worker roles (default: {','.join(DEFAULT_ROLES)})")
     r.add_argument("-d", "--dir", default=os.getcwd())
+    r.add_argument("--add-dir", action="append", default=[],
+                   help="extra root every peer run may read, e.g. a spec repo the case cites (repeatable)")
     r.add_argument("-t", "--timeout", type=int, default=420, help="seconds per peer run (default 420)")
     r.add_argument("--leader", help="peer family for the leader (default: the leader role's peer)")
     r.add_argument("--leader-role", default="leader")
@@ -669,12 +671,14 @@ def main() -> int:
     x.add_argument("name")
     x.add_argument("-p", "--peers", required=True)
     x.add_argument("-d", "--dir", default=os.getcwd())
+    x.add_argument("--add-dir", action="append", default=[])
     x.add_argument("-t", "--timeout", type=int, default=420)
     x.add_argument("--detach", action="store_true")
     y = sub.add_parser("synth", help="re-run only the synthesis from a panel's saved findings (1 peer run)")
     y.add_argument("name")
     y.add_argument("-p", "--peers", required=True)
     y.add_argument("-d", "--dir", default=os.getcwd())
+    y.add_argument("--add-dir", action="append", default=[])
     y.add_argument("-t", "--timeout", type=int, default=420)
     y.add_argument("--leader", default="claude")
     y.add_argument("--leader-role", default="leader")
@@ -682,6 +686,7 @@ def main() -> int:
     s = sub.add_parser("show")
     s.add_argument("name")
     o = ap.parse_args()
+    share_add_dirs(getattr(o, "add_dir", []))
     if o.cmd == "roles":
         for n, m in load_roles().items():
             fb = f" (fallback: {m['fallback_peer']})" if m.get("fallback_peer") else ""

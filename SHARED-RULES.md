@@ -75,7 +75,16 @@ creating a context tree. This is an inventory, not proof of loaded instructions.
 `--add-dir`; the peer must not retry a denied tool or bypass a denied path. Essential missing access uses `[[ASK]]`.
 Instruction files above cwd and outside every `--add-dir` root are listed as outside file access. Note that Copilot's
 `--add-dir` also loads that root's `.github/skills` and `.github/agents` as trusted configuration — grant only roots
-whose repo config you trust.
+whose repo config you trust. `bridge-panel run|fix|synth`, `bridge-work run` and `bridge-fix run` take the same
+repeatable `--add-dir` and export it as `AGENT_BRIDGE_ADD_DIRS` (path-separated), which every `ask-agent` child adds to
+its own `--add-dir` list; `bridge-fix` keeps it in `flow.json` for later stages. Pass the spec/worktree roots a case
+cites outside `-d`: replaying a denied panel prompt on 2026-10-24, the run with the spec root granted cited 13
+`file:line` it found itself (spec included) against 5 without it and 3 in the original run.
+In `ask`/`plan` mode `ask-agent` also grants, by itself, what the prompt cites: for each absolute path outside the
+granted roots it adds the path's git repo root when that root lies strictly under HOME, or — for a path under
+`state/` — only that one `state/<kind>/<name>` folder (never the ledger, `runs/` or the bridge checkout). Each grant is
+printed as `[bridge] add-dir (cited in prompt): <root>`. Write mode never widens on its own; scratch files, non-git
+directories and paths outside HOME still need an explicit `--add-dir` or must be inlined in the prompt.
 
 Copilot JSONL must end with a `result` event to count as a completed stream (legacy plain-text output is still
 accepted). Tool failures can be recovered during a run, so they produce a warning and operational metrics, not an
