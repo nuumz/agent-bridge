@@ -389,7 +389,9 @@ def run(o) -> int:
         print(f"[panel] {r} FAILED — excluded from the shared record: {failed[r][:160]}", file=sys.stderr)
     (out / "findings.json").write_text(json.dumps(findings, ensure_ascii=False, indent=2))
     (out / "status.json").write_text(json.dumps({"answered": used, "fallbacks": fallbacks, "failed": failed,
-                                                 "asked_back": list(needs_input)}, ensure_ascii=False, indent=2))
+                                                 "asked_back": list(needs_input),
+                                                 "degraded": bool(fallbacks or failed or needs_input)},
+                                                ensure_ascii=False, indent=2))
     need = 1 if o.allow_single else 2
     if len(findings) < need:
         # A "panel" of one voice (or none) reads like a panel and misleads — 5 such reports shipped before 2026-09-26.
@@ -461,6 +463,10 @@ def run(o) -> int:
     head = (f"# Panel `{o.name}` — {stamp}\n\nLeader: {leader_peer} · roles: {roles_line} · "
             f"cross-examination: {'no' if o.no_cross else 'yes'} · first pass "
             f"{'saw' if o.hypothesis else 'blind to'} the leader's hypothesis · dir: {o.dir}\n\n")
+    contrib = contribution_line(findings, used, fallbacks, failed, needs_input)
+    head += f"> **Voices** — {contrib}\n\n"
+    if fallbacks or failed or needs_input:
+        print(f"[panel] DEGRADED — {contrib}", file=sys.stderr)
     if fallbacks:
         head += ("> Roles answered by their fallback peer (the role's own peer failed):\n"
                  + "".join(f"> - {r}: {t}\n" for r, t in fallbacks.items()) + "\n")
@@ -491,6 +497,27 @@ def run(o) -> int:
     print(head + report)
     print(f"\n[panel] report={out / 'report.md'} board={topic} threads=panel-{o.name}-*", file=sys.stderr)
     return 0
+
+
+def contribution_line(findings: dict, used: dict, fallbacks: dict, failed: dict, needs_input: dict) -> str:
+    """One line a reader checks before trusting a report: who really answered, who answered through a fallback peer,
+    who failed, who asked back. A panel of one real voice and two fallbacks must not read like three."""
+    real = [f"{r} ({used.get(r, '?')})" for r in findings if r not in fallbacks and r not in needs_input]
+    parts = [f"contributed: {', '.join(real) or 'none'}"]
+    degraded = {r: t for r, t in fallbacks.items() if r not in failed and r not in needs_input}   # fallback that answered
+    if degraded:
+        parts.append("degraded: " + ", ".join(f"{r} ({t.split(' (')[0]})" for r, t in degraded.items()))
+    if failed:
+        parts.append("failed: " + ", ".join(failed))
+    if needs_input:
+        parts.append("asked back: " + ", ".join(needs_input))
+    return " · ".join(parts)
+
+
+def voices_from_status(findings: dict, status: dict) -> str:
+    """The Voices line for a report rebuilt by `synth`, from the status.json the run left behind."""
+    return contribution_line(findings, status.get("answered", {}), status.get("fallbacks", {}), status.get("failed", {}),
+                             {r: "" for r in status.get("asked_back", [])})
 
 
 def ledger_row(o, kind: str, findings: dict, used: dict, fallbacks: dict, failed: dict, rc: int, t_start: float,
@@ -623,7 +650,9 @@ def synth(o) -> int:
     print(f"[panel] re-synthesising `{o.name}` from {len(findings)} saved findings …", file=sys.stderr)
     rc, report = ask(o.leader, f"panel-{o.name}-leader", synth_prompt(o.name, problem, findings, cross, cite_md, low), o)
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    status = json.loads((out / "status.json").read_text()) if (out / "status.json").is_file() else {}
     head = (f"# Panel `{o.name}` — re-synthesised {stamp}\n\nLeader: {o.leader} · roles: {', '.join(findings)}\n\n"
+            f"> **Voices** — {voices_from_status(findings, status)}\n\n"
             + (f"> {low_evidence_line(low)}\n\n" if low else ""))
     (out / "report.md").write_text(head + report + ("\n\n" + cite_md if cite_md else "") + "\n")
     print(head + report)
