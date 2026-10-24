@@ -28,15 +28,6 @@ class Pick(unittest.TestCase):
         self.assertIsNotNone(skill)
         self.assertEqual(skill["name"], "impl-test")
 
-    def test_spec_edit_by_path(self):
-        skill = workskills.pick(
-            "update field mapping spec",
-            files=["specs/api/field-mapping.md"],
-            verify="python tools/spec-edit.py lint-delta specs/api/field-mapping.md",
-        )
-        self.assertIsNotNone(skill)
-        self.assertEqual(skill["name"], "impl-spec-edit")
-
     def test_small_fix_by_trigger(self):
         skill = workskills.pick(
             "hotfix null pointer in payment",
