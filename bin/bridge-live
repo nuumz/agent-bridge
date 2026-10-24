@@ -436,6 +436,10 @@ def send(o) -> int:
     if o.no_wait:
         print(f"[live] posted seq={seq} on {topic(o.room)} ({', '.join(peers)})")
         return 0
+    if o.to in boardlib.FAMILIES:          # a turn: queued as that family's task, answered by a dispatched run
+        print(f"[live] posted seq={seq} on {topic(o.room)} as a {o.to} turn — start it with "
+              f"`bridge-board dispatch --agents {o.to}`; the answer lands on the board as reply_to={seq}")
+        return 0
     want = send_targets(conn, tid, o.to, {identity(p) for p in peers})   # only who the post reaches is awaited
     if not want:
         print(f"[live] posted seq={seq}; no running peer in room {o.room!r} is {o.to} — nothing to wait for",
