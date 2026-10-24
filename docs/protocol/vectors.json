@@ -1,0 +1,226 @@
+{
+  "description": "Test vectors for docs/protocol/envelope.schema.json and the invariants in docs/PROTOCOL.md. `valid` envelopes must pass bridgelib.protocol.check with no error; each `invalid` one must fail, and `why` names the rule it breaks. tests/test_protocol.py runs them; another implementation of the envelope should run them too.",
+  "valid": [
+    {
+      "name": "note to everyone, no header, no citation",
+      "envelope": {"v": 1, "topic": "room:design", "seq": 1, "author": "user:alice", "kind": "note", "to": null,
+                   "reply_to": null, "created_at": 1761300000, "body": "Let us settle the retry policy today.",
+                   "headers": {}, "citations": []}
+    },
+    {
+      "name": "request to an identity with a checkable shape",
+      "envelope": {"v": 1, "topic": "room:design", "seq": 2, "author": "claude@primary", "kind": "request", "to": "cursor#4120",
+                   "reply_to": null, "created_at": 1761300010,
+                   "body": "shape: table file:line · claim · evidence\n\nList every caller of post() in bin/boardlib.py.",
+                   "headers": {"shape": "table file:line · claim · evidence"}, "citations": []}
+    },
+    {
+      "name": "answer in shape, closing the request, with citations",
+      "envelope": {"v": 1, "topic": "room:design", "seq": 3, "author": "cursor#4120", "kind": "answer", "to": "claude@primary",
+                   "reply_to": 2, "created_at": 1761300090,
+                   "body": "| file:line | claim | evidence |\n|---|---|---|\n| bin/bridge-board.py:222 | board_post calls post() | `B.post(self.conn, tid, ...)` |\n| bin/bridgelib/runner.py:196 | Conv.card posts a request | lines 196-197 |",
+                   "headers": {}, "citations": [{"path": "bin/bridge-board.py", "line": 222}, {"path": "bin/bridgelib/runner.py", "line": 196}]}
+    },
+    {
+      "name": "blocked with a missing line and a default",
+      "envelope": {"v": 1, "topic": "room:design", "seq": 4, "author": "copilot:task7", "kind": "blocked", "to": "claude@primary",
+                   "reply_to": 2, "created_at": 1761300100,
+                   "body": "missing: read access to ~/src/other-repo (not under --add-dir); default: answer from this repo only after one more wait",
+                   "headers": {"missing": "read access to ~/src/other-repo (not under --add-dir); default: answer from this repo only after one more wait"},
+                   "citations": []}
+    },
+    {
+      "name": "decision card to the user",
+      "envelope": {"v": 1, "topic": "fix:retry", "seq": 1, "author": "bridge-fix", "kind": "request", "to": "user:alice",
+                   "reply_to": null, "created_at": 1761300200,
+                   "body": "card: decision\nshape: decision\ndue: 2026-10-24 17:00\n\n| question | options | recommendation | if undecided |\n|---|---|---|---|\n| cap retries at 3 or 5? | 3 / 5 | 3 | 3 at 17:00 |",
+                   "headers": {"card": "decision", "shape": "decision", "due": "2026-10-24 17:00"}, "citations": []}
+    },
+    {
+      "name": "the user's decision closing the card",
+      "envelope": {"v": 1, "topic": "fix:retry", "seq": 2, "author": "user:alice", "kind": "decision", "to": null,
+                   "reply_to": 1, "created_at": 1761300300, "body": "3", "headers": {}, "citations": []}
+    },
+    {
+      "name": "fact card from a live peer, due omitted",
+      "envelope": {"v": 1, "topic": "live:critic", "seq": 9, "author": "claude@live:critic", "kind": "request", "to": "user:alice",
+                   "reply_to": null, "created_at": 1761300400,
+                   "body": "card: fact\nshape: fact\n\n| question | options | recommendation | if undecided |\n|---|---|---|---|\n| which environment showed the timeout? | - | - | assume uat |",
+                   "headers": {"card": "fact", "shape": "fact"}, "citations": []}
+    },
+    {
+      "name": "turn: a request to a family with dir and mode",
+      "envelope": {"v": 1, "topic": "room:design", "seq": 5, "author": "user:alice", "kind": "request", "to": "cursor",
+                   "reply_to": null, "created_at": 1761300500,
+                   "body": "shape: file:line findings\ndir: /home/alice/src/myrepo\nmode: ask\n\nReview src/payment/ for retry bugs.",
+                   "headers": {"shape": "file:line findings", "dir": "/home/alice/src/myrepo", "mode": "ask"}, "citations": []}
+    },
+    {
+      "name": "request to a role, answered later by whoever holds it",
+      "envelope": {"v": 1, "topic": "panel:rc-timeout", "seq": 3, "author": "claude#5150", "kind": "request", "to": "@root-cause",
+                   "reply_to": null, "created_at": 1761300600, "body": "shape: json\n\nWhich call sets the deadline?",
+                   "headers": {"shape": "json"}, "citations": []}
+    },
+    {
+      "name": "done summary to everyone before a close",
+      "envelope": {"v": 1, "topic": "room:design", "seq": 6, "author": "claude@primary", "kind": "done", "to": "*",
+                   "reply_to": null, "created_at": 1761300700,
+                   "body": "Retry cap is 3 (user decision seq 2 on fix:retry). Evidence bin/bridgelib/runner.py:76-79. Nothing open.",
+                   "headers": {}, "citations": [{"path": "bin/bridgelib/runner.py", "line": 76, "end_line": 79}]}
+    },
+    {
+      "name": "handoff with a hop identity",
+      "envelope": {"v": 1, "topic": "conv:design-x", "seq": 4, "author": "claude@hop", "kind": "handoff", "to": "copilot#88",
+                   "reply_to": null, "created_at": 1761300800, "body": "The mapper tests are yours. I keep the parser.",
+                   "headers": {}, "citations": []}
+    },
+    {
+      "name": "the board's own task log row",
+      "envelope": {"v": 1, "topic": "room:design", "seq": 7, "author": "board", "kind": "task", "to": null,
+                   "reply_to": null, "created_at": 1761300900,
+                   "body": "task #12 queued by user:alice for cursor (ask): Review src/payment/ for retry bugs. — request seq 5",
+                   "headers": {}, "citations": []}
+    },
+    {
+      "name": "system row after a reopen",
+      "envelope": {"v": 1, "topic": "dm:claude@primary+user:alice", "seq": 8, "author": "user:alice", "kind": "system", "to": null,
+                   "reply_to": null, "created_at": 1761301000, "body": "reopened by user:alice", "headers": {}, "citations": []}
+    },
+    {
+      "name": "minimal: only the required fields",
+      "envelope": {"v": 1, "topic": "tasks", "seq": 1, "author": "cursor@primary", "kind": "question", "body": "Who owns the ledger?"}
+    },
+    {
+      "name": "a header key the spec does not list is carried as a string",
+      "envelope": {"v": 1, "topic": "room:design", "seq": 8, "author": "cursor#4120", "kind": "note", "to": null, "reply_to": null,
+                   "created_at": 1761301100, "body": "prio: high\n\nOne more caller found.", "headers": {"prio": "high"}, "citations": []}
+    }
+  ],
+  "invalid": [
+    {
+      "name": "wrong version",
+      "why": "v must be 1",
+      "envelope": {"v": 2, "topic": "t", "seq": 1, "author": "user:alice", "kind": "note", "body": "x"}
+    },
+    {
+      "name": "unknown field",
+      "why": "additionalProperties is false on the envelope",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "note", "body": "x", "signature": "abc"}
+    },
+    {
+      "name": "unknown kind",
+      "why": "kind is one of the ten kinds",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "reply", "body": "x"}
+    },
+    {
+      "name": "seq zero",
+      "why": "seq is 1-based",
+      "envelope": {"v": 1, "topic": "t", "seq": 0, "author": "user:alice", "kind": "note", "body": "x"}
+    },
+    {
+      "name": "author with a space",
+      "why": "an identity has no whitespace",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "claude primary", "kind": "note", "body": "x"}
+    },
+    {
+      "name": "author that is a bare user:",
+      "why": "user: alone names nobody",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:", "kind": "note", "body": "x"}
+    },
+    {
+      "name": "author starting with @",
+      "why": "@role is an addressee form, never an author",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "@leader", "kind": "note", "body": "x"}
+    },
+    {
+      "name": "to with an upper-case role",
+      "why": "a role is a lowercase slug",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "note", "to": "@Leader", "body": "x"}
+    },
+    {
+      "name": "reply_to zero",
+      "why": "reply_to names a seq, which is 1-based",
+      "envelope": {"v": 1, "topic": "t", "seq": 2, "author": "user:alice", "kind": "answer", "reply_to": 0, "body": "x"}
+    },
+    {
+      "name": "request without to",
+      "why": "a request without an owner is a note",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "request", "body": "shape: table\n\nx"}
+    },
+    {
+      "name": "request without shape",
+      "why": "a request needs a shape: header line",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "request", "to": "*", "body": "please list callers"}
+    },
+    {
+      "name": "shape after a blank line is body text, not a header",
+      "why": "the header block ends at the first blank line",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "request", "to": "*", "body": "please\n\nshape: table"}
+    },
+    {
+      "name": "blocked without missing",
+      "why": "a blocked needs a missing: header line",
+      "envelope": {"v": 1, "topic": "t", "seq": 2, "author": "cursor#1", "kind": "blocked", "to": "user:alice", "reply_to": 1, "body": "cannot do it"}
+    },
+    {
+      "name": "blocked with an empty missing",
+      "why": "`-`, `none`, `n/a` are not a reason",
+      "envelope": {"v": 1, "topic": "t", "seq": 2, "author": "cursor#1", "kind": "blocked", "to": "user:alice", "reply_to": 1, "body": "missing: n/a\nstuck"}
+    },
+    {
+      "name": "decision by an agent",
+      "why": "only user:* posts a decision",
+      "envelope": {"v": 1, "topic": "t", "seq": 2, "author": "claude@primary", "kind": "decision", "reply_to": 1, "body": "3"}
+    },
+    {
+      "name": "task row by an agent",
+      "why": "task rows are the board's own log",
+      "envelope": {"v": 1, "topic": "t", "seq": 2, "author": "claude@primary", "kind": "task", "body": "task #1 queued"}
+    },
+    {
+      "name": "headers that do not match the body",
+      "why": "headers is derived from body",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "note", "body": "shape: table\n\nx", "headers": {}}
+    },
+    {
+      "name": "citations that do not match the body",
+      "why": "citations is derived from body",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "note", "body": "see bin/boardlib.py:10", "citations": []}
+    },
+    {
+      "name": "citation line zero",
+      "why": "a cited line is 1-based",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "note", "body": "x", "citations": [{"path": "a.py", "line": 0}]}
+    },
+    {
+      "name": "card not addressed to the user",
+      "why": "a card is a request to user:*",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "claude#1", "kind": "request", "to": "cursor#2", "body": "card: fact\nshape: fact\n\n| q | o | r | u |"}
+    },
+    {
+      "name": "card whose shape is not its kind",
+      "why": "a card's shape equals its card kind",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "claude#1", "kind": "request", "to": "user:alice", "body": "card: fact\nshape: table\n\n| q | o | r | u |"}
+    },
+    {
+      "name": "card with a kind outside decision|fact",
+      "why": "card is decision or fact",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "claude#1", "kind": "request", "to": "user:alice", "body": "card: question\nshape: question\n\n| q | o | r | u |"}
+    },
+    {
+      "name": "turn mode outside ask|plan|write",
+      "why": "mode is ask, plan or write",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "request", "to": "cursor", "body": "shape: table\nmode: yolo\n\nx"}
+    },
+    {
+      "name": "empty topic",
+      "why": "topic is a non-empty string",
+      "envelope": {"v": 1, "topic": "", "seq": 1, "author": "user:alice", "kind": "note", "body": "x"}
+    },
+    {
+      "name": "body that is not a string",
+      "why": "body is text",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "note", "body": ["x"]}
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/nuumz/agent-bridge/main/docs/protocol/envelope.schema.json",
+  "title": "agent-bridge message envelope, version 1",
+  "description": "One message between agents on the bridge, as docs/PROTOCOL.md defines it: what a board row is when it leaves the board (`bridge-board read --json`) and what any other transport must deliver. `body` is the message; `headers` and `citations` are derived from it and must agree with it (bridgelib.protocol.check verifies that, the schema cannot).",
+  "type": "object",
+  "required": ["v", "topic", "seq", "author", "kind", "body"],
+  "additionalProperties": false,
+  "properties": {
+    "v": {
+      "description": "Envelope version. An additive change keeps 1; a change that makes a valid v1 envelope invalid bumps it.",
+      "const": 1
+    },
+    "topic": {
+      "description": "The thread this message belongs to. Reserved prefixes: conv:, panel:, live:, dm:, room:, fix: (see PROTOCOL.md §7).",
+      "type": "string",
+      "minLength": 1
+    },
+    "seq": {
+      "description": "Position in the topic, 1-based, assigned by the transport, never reused inside an open topic.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "author": {
+      "description": "Who posted it — an identity the transport resolved, never one the author claimed (PROTOCOL.md §2).",
+      "$ref": "#/$defs/identity"
+    },
+    "kind": {
+      "description": "What the message does in the exchange (PROTOCOL.md §5). task and system are the transport's own bookkeeping.",
+      "enum": ["note", "question", "answer", "decision", "task", "system", "request", "handoff", "done", "blocked"]
+    },
+    "to": {
+      "description": "Whom it is for: null or * = everyone in the topic; @<role> = the members holding that role; an identity; a bare family name (claude, cursor, copilot) on a request = a turn for a peer that is not running.",
+      "anyOf": [
+        {"type": "null"},
+        {"const": "*"},
+        {"$ref": "#/$defs/role_ref"},
+        {"$ref": "#/$defs/identity"}
+      ]
+    },
+    "reply_to": {
+      "description": "seq of the message this one answers, in the same topic. An answer/done/blocked that replies to a request closes it when it comes from the request's owner or requester.",
+      "anyOf": [
+        {"type": "null"},
+        {"type": "integer", "minimum": 1}
+      ]
+    },
+    "created_at": {
+      "description": "Unix time (seconds) the transport accepted the message.",
+      "anyOf": [
+        {"type": "null"},
+        {"type": "integer", "minimum": 0}
+      ]
+    },
+    "body": {
+      "description": "The message text: optional header lines (`key: value`, up to the first blank or non-header line), then free text. Markdown is allowed; a code fence is not an answer (PROTOCOL.md §4, §8).",
+      "type": "string"
+    },
+    "headers": {
+      "description": "Derived: the header lines of body, keys lower-cased. Known keys are listed; others are allowed and carried as strings.",
+      "type": "object",
+      "properties": {
+        "shape": {"description": "request: what the answer must look like; tokens a script checks: table, file:line, json, diff, patch, decision, command.", "type": "string"},
+        "missing": {"description": "blocked: what the author lacks, and the default it will take if nobody answers. `-`, `none`, `n/a` do not count.", "type": "string"},
+        "card": {"description": "A card to the human: decision (a choice only they own) or fact (information nobody else has).", "enum": ["decision", "fact"]},
+        "due": {"description": "card: when the default applies.", "type": "string"},
+        "dir": {"description": "turn: the workspace the dispatched run starts in (stored resolved).", "type": "string"},
+        "mode": {"description": "turn: the run's mode; write needs dir.", "enum": ["ask", "plan", "write"]},
+        "owner": {"description": "Informational: the identity the requester expects to answer.", "type": "string"}
+      },
+      "additionalProperties": {"type": "string"}
+    },
+    "citations": {
+      "description": "Derived: every `path.ext:line[-end]` the body cites, in order, each once — the evidence the file:line rule is judged on. Resolution against a workspace is not part of the envelope.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "line"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "line": {"type": "integer", "minimum": 1},
+          "end_line": {"type": "integer", "minimum": 1}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "identity": {
+      "description": "user:<name> | <family>@primary | <family>#<pid> | <family>:task<N> | <family>@live:<peer> | <family>@hop | board | a script slug. No whitespace, no `+`, not starting with @ or *, never a bare `user:`.",
+      "type": "string",
+      "pattern": "^(?!user:$)[^\\s+@*][^\\s+]*$"
+    },
+    "role_ref": {
+      "description": "@<role>: leader, member, observer, or a persona slug such as root-cause.",
+      "type": "string",
+      "pattern": "^@[a-z][a-z0-9-]*$"
+    }
+  }
+}

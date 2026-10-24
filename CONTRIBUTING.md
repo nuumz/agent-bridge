@@ -20,6 +20,9 @@ git clone -q . /tmp/ab && HOME=$(mktemp -d) python3 -m unittest discover -s /tmp
 - Failure paths are exercised with stub `claude` / `cursor-agent` / `copilot` scripts put first on `PATH` — no real
   peer call, no cost.
 - A change to a rule, exit code or file layout updates [SHARED-RULES.md](SHARED-RULES.md) in the same pull request.
+  A change to the message envelope (a field, a kind, a header key, the identity grammar, the request lifecycle)
+  updates [docs/PROTOCOL.md](docs/PROTOCOL.md), `docs/protocol/envelope.schema.json` and `docs/protocol/vectors.json`
+  with it — add a vector for the new behaviour; `tests/test_protocol.py` fails when the three disagree with the board.
 - Scripts stay LF (`.gitattributes` enforces it) and executable (`git update-index --chmod=+x`).
 
 ## Commits

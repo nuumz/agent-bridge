@@ -8,8 +8,9 @@ change checklist. This file is the short version.
 
 - `bin/` — one executable per command, Python 3.11+, **standard library only**. `bin/bridgelib/` is the shared library:
   `core` (paths, constants, hop guard, quota), `adapters` (one class per peer CLI), `runner` (execute a peer run, threads,
-  board registration), `ledger` (outcome ledger, playbook loader), `grill`, `evidence`, `workskills`. `bin/boardlib.py` is
-  the SQLite board behind `bridge-board`.
+  board registration), `ledger` (outcome ledger, playbook loader), `grill`, `evidence`, `workskills`, `protocol` (the
+  message envelope of `docs/PROTOCOL.md`: export and schema check). `bin/boardlib.py` is the SQLite board behind
+  `bridge-board`.
 - `roles/`, `playbooks/`, `work-skills/` — markdown with a flat `key: value` frontmatter; loaded at run time, no code change
   needed to add one. `work-skills.local/` is git-ignored but loaded too, so a test that passes only because of a local
   file there is a CI failure. `agents/` — Claude Code subagent wrappers (`peer-*`), symlinked into `~/.claude/agents/` by `bridge-sync`.
@@ -29,6 +30,9 @@ change checklist. This file is the short version.
 - A behaviour change in `bin/bridgelib/` or in a pipeline gate (`bridge-work`, `bridge-fix`, `bridge-panel`) comes with a
   test that is red without it. Exercise failure paths through a stub peer binary, never a real CLI (cost, egress).
 - A change to an exit code, a rule, a prompt protocol string or a file layout updates `SHARED-RULES.md` in the same change.
+  A change to the message envelope — a field, a kind, a header key, the identity grammar, who may close a request —
+  updates `docs/PROTOCOL.md`, `docs/protocol/envelope.schema.json` and `docs/protocol/vectors.json` too;
+  `tests/test_protocol.py` holds them to the board and fails on drift.
 - Do not add a dependency, a build step, a daemon, or a second place for state. Extend the existing adapter / loader before
   adding a layer; see "Adding a peer adapter" in CONTRIBUTING.md for the contract.
 - Scripts stay LF and executable. Commits follow Conventional Commits and are never made without the maintainer asking.
