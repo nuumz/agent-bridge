@@ -143,6 +143,12 @@ IDENTITY_VAR = "AGENT_BRIDGE_IDENTITY"
 TASK_VAR = "AGENT_BRIDGE_TASK"
 BOARD_TOOLS = "mcp__bridge_board"            # Claude Code permission rule: every tool of the bridge_board MCP server
 GIT_DENY = ("git commit", "git push", "git tag")
+# verbs that move or discard uncommitted work. SHARED-RULES §4 lets a write-mode peer share the caller's checkout for
+# files the caller is not touching, so in that checkout these are denied; a worktree the bridge owns (`-w`, or
+# bridge-work's branch `bridge/<name>`) keeps them — a failed attempt there may be discarded (bridge-work anti_pattern).
+GIT_DISCARD = ("git restore", "git checkout", "git switch", "git stash", "git reset", "git clean",
+               # every deny below is a command prefix, and these option forms put the verb after the prefix
+               "git -C", "git -c", "git --git-dir", "git --work-tree")
 BRIDGE_CMDS = ("ask-agent", "ask-claude", "ask-cursor", "ask-copilot")
 # peers switched off on this machine (reason shown by --list and on any attempt); delete the entry to re-enable
 DISABLED: dict[str, str] = {}
@@ -211,12 +217,27 @@ LANG_RULE = lang_rule()      # default (user's native language) for callers that
 CLAUDE_WRITE_BASH = CLAUDE_READ_ONLY_BASH + (
     "mvn", "./mvnw", "gradle", "./gradlew", "bun", "npm test", "npm run", "npx", "pnpm test", "pnpm run", "tsc",
     "pytest", "python -m pytest", "python3 -m pytest", "python3 -m unittest", "ruff", "go test", "go build", "cargo test",
-    "cargo build", "make", "git add", "git restore", "git checkout --", "git stash list", "mkdir", "touch", "cp", "mv",
+    "cargo build", "make", "git add", "mkdir", "touch", "cp", "mv",
     # the rtk PreToolUse hook rewrites runners before the permission check (`python3 -m pytest` → `rtk pytest`), so the
     # rewritten forms must be allowed too or the peer sees "requires approval" (measured 2026-09-26)
     "rtk pytest", "rtk tsc", "rtk gradlew", "rtk cargo", "rtk go", "rtk make", "rtk ruff", "rtk npm", "rtk npx", "rtk pnpm",
     "rtk jest", "rtk vitest", "rtk mypy", "rtk test", "rtk lint", "rtk run",
 )
+# pre-approved on top of CLAUDE_WRITE_BASH only in a worktree the bridge owns (GIT_DISCARD is denied elsewhere)
+CLAUDE_WORKTREE_BASH = ("git restore", "git checkout --", "git stash list")
+
+
+def bridge_owned(path: str) -> bool:
+    """True in a worktree bridge-work created: its branch is `bridge/<name>` (README, bridge-work step 1)."""
+    r = subprocess.run(["git", "-C", path, "symbolic-ref", "--short", "-q", "HEAD"], capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip().startswith("bridge/")
+
+
+def dirty_paths(path: str) -> list[str]:
+    """Tracked paths with uncommitted changes (staged or not); [] outside a git checkout."""
+    r = subprocess.run(["git", "-C", path, "status", "--porcelain", "--untracked-files=no"],
+                       capture_output=True, text=True)
+    return [ln[3:] for ln in r.stdout.splitlines() if ln.strip()] if r.returncode == 0 else []
 
 
 

@@ -33,6 +33,13 @@ Exit codes: 0 ok · 1 peer error · 2 usage · 3 hop guard · 4 disabled · 5 pe
 own first stderr line>` before the raw dump — scripts (`bridge-panel`) read that line, never the dump.
 
 - **Default mode is `ask` — read-only.** `plan` is read-only too. Only `-m write` may touch files.
+  **A write run in your checkout cannot move or discard your uncommitted work**: `git restore` / `checkout` / `switch` /
+  `stash` / `reset` / `clean` are denied there on every peer (Claude and Copilot by their deny lists, Cursor by a
+  temporary global deny held for the run). A worktree the bridge owns — `-w`, or bridge-work's branch `bridge/<name>` —
+  keeps them, so a failed attempt there can be discarded. `ask-agent` prints `[bridge] write mode in your checkout: N
+  uncommitted path(s)` when the tree is dirty; `-w` isolates the run. The denies are command prefixes, so the option
+  forms `git -C …` / `git -c …` / `--git-dir` / `--work-tree` are denied with them. Cursor's hold is the machine-global
+  `~/.cursor/cli-config.json`, so every cursor-agent running meanwhile loses the same verbs until the run ends.
   Claude `-m write` = `acceptEdits`: file edits are auto-approved, but a shell command runs only if it is
   allowlisted in `~/.claude/settings.json` (headless `-p` auto-denies every permission prompt). Cursor
   `-m write` = `--force`: everything runs except its `permissions.deny` list.
@@ -59,8 +66,8 @@ How the common options map onto each CLI:
 | Option | claude | cursor | copilot |
 |---|---|---|---|
 | `-m ask` / `plan` | `--permission-mode plan` | default agent mode + temporary global `Write(**)` deny (decision 2026-09-12; `-m write` refuses with exit 6 while held) / `--mode plan` | `--deny-tool=write --deny-tool=shell` |
-| `-m write` | `--permission-mode acceptEdits` | `--force` | `--allow-all-tools` + `--deny-tool=shell(git commit)` … |
-| git commit/push/tag denied by | `--disallowed-tools Bash(git commit:*)…` + PreToolUse hook | `permissions.deny` in `~/.cursor/cli-config.json` | `--deny-tool=shell(git …)` |
+| `-m write` | `--permission-mode acceptEdits` (+ `--disallowed-tools Bash(git restore:*)…` outside a bridge-owned worktree) | `--force` + a temporary global deny `Shell(git commit)`/`push`/`tag` (+ `restore`/`checkout`/… outside a bridge-owned worktree) | `--allow-all-tools` + `--deny-tool=shell(git commit)` … (+ `shell(git restore)`… outside a bridge-owned worktree) |
+| git commit/push/tag denied by | `--disallowed-tools Bash(git commit:*)…` + PreToolUse hook | `permissions.deny` in `~/.cursor/cli-config.json` (a write run holds the three entries for its duration) | `--deny-tool=shell(git …)` |
 | `-M model` | `--model` | `--model` (always passed: `auto` unless `-M`, so the app's last pick in cli-config.json never leaks in) | `--model=` |
 | `--session id` / `-c` | `--resume id --fork-session` / `--continue --fork-session` (the peer never writes into the session it resumes — with `-c` in your own directory that is yours) | `--resume id` / `--continue` | `--resume=id` / `--continue` |
 | `-w [name]` | `--worktree [name]` → `<repo>/.claude/worktrees/<name>` (locked) | `--worktree [name]` → `~/.cursor/worktrees/<repo>/<name>` | not supported (use `git worktree add` + `-d`) |
@@ -170,8 +177,8 @@ Decide before any `-m write` delegation:
 | Situation | Rule |
 |---|---|
 | Peer task is read-only (`ask`/`plan`) | Run in the same directory — no isolation needed |
-| Peer writes files you are **not** touching this turn | Same directory is fine; state the file set in the prompt |
-| Peer writes files you **are** touching, or you cannot enumerate them | `-m write -w <name>` → isolated git worktree (claude/cursor), then diff and merge deliberately; copilot: `git worktree add` yourself and pass `-d` |
+| Peer writes files you are **not** touching this turn | Same directory is fine; state the file set in the prompt. The peer cannot restore/checkout/switch/stash/reset/clean there, so your uncommitted work stays |
+| Peer writes files you **are** touching, or you cannot enumerate them | `-m write -w <name>` → isolated git worktree (claude/cursor), then diff and merge deliberately; copilot: `git worktree add -b bridge/<name> <path>` yourself and pass `-d` (the `bridge/` branch marks it as the peer's own, so discarding there stays allowed) |
 | Both agents need the same files | Do **not** parallelize — run sequentially |
 
 Always name the allowed file set explicitly in a write prompt ("touch only `<paths>`"), and after a

@@ -44,8 +44,8 @@ for _stream in (sys.stdout, sys.stderr):
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boardlib  # noqa: E402
 from bridgelib.adapters import ADAPTERS, Adapter  # noqa: E402
-from bridgelib.core import (PEER_TALK_RULE, DISABLED, HOP_VAR, QUOTA_TTL, add_dirs_from_env, cited_roots,  # noqa: E402
-                            hop_active, quota_block, version_of)
+from bridgelib.core import (PEER_TALK_RULE, DISABLED, HOP_VAR, QUOTA_TTL, add_dirs_from_env, bridge_owned,  # noqa: E402
+                            cited_roots, dirty_paths, hop_active, quota_block, version_of)
 from bridgelib.runner import (AGREE_RE, CONV_DIR, USER_AUTHOR, BoardRun, Conv, execute, print_parsed,  # noqa: E402
                               protocol)
 
@@ -198,6 +198,12 @@ def main() -> int:
         print(f"ask-agent: no such dir: {o.dir}", file=sys.stderr)
         return 2
     o.dir = str(Path(o.dir).resolve())
+    # a peer may discard work only in a worktree the bridge owns; in the caller's checkout GIT_DISCARD is denied
+    o.discard_ok = o.worktree is not None or bridge_owned(o.dir)
+    if o.mode == "write" and not o.discard_ok and (dirty := dirty_paths(o.dir)):
+        print(f"[bridge] write mode in your checkout: {len(dirty)} uncommitted path{'s' if len(dirty) > 1 else ''} "
+              f"({', '.join(dirty[:5])}{', …' if len(dirty) > 5 else ''}) — the peer cannot git restore/checkout/"
+              f"switch/stash/reset/clean them; -w isolates it", file=sys.stderr)
     if o.mode != "write":                  # a write grant stays explicit; reading what the prompt cites does not
         for root in cited_roots(prompt, o.dir, o.add_dir):
             o.add_dir.append(root)
