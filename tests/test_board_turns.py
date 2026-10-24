@@ -61,8 +61,9 @@ class Turns(unittest.TestCase):
         seq = boardlib.post(self.conn, self.tid, USER, f"dir: {self.tmp.name}\nmode: plan\n{REQUEST}", "request",
                             to="cursor")
         (t,) = self.tasks()
+        resolved = str(Path(self.tmp.name).resolve())                 # macOS: /var/… is a link to /private/var/…
         self.assertEqual((t["assignee"], t["mode"], t["dir"], t["origin"], t["request_seq"], t["status"]),
-                         ("cursor", "plan", self.tmp.name, "user", seq, "queued"))
+                         ("cursor", "plan", resolved, "user", seq, "queued"))
         self.assertEqual(t["title"], "List every caller of post().")                   # the first non-header line
         self.assertIn(f"request seq {seq}", self.conn.execute("SELECT body FROM messages WHERE kind='task'").fetchone()[0])
         self.assertEqual(boardlib.open_requests_to(self.conn, self.tid, CURSOR_RUN), 1)   # the run sees it as its own
@@ -169,7 +170,7 @@ class Turns(unittest.TestCase):
             started = board.dispatch_once(self.conn, o, ["cursor", "claude"], [], "/bin/ask-agent")
         self.assertEqual(started, ["#1→cursor"])
         argv = popen.call_args.args[0]
-        self.assertEqual(argv[:6], ["/bin/ask-agent", "cursor", "-d", self.tmp.name, "-m", "ask"])
+        self.assertEqual(argv[:6], ["/bin/ask-agent", "cursor", "-d", str(Path(self.tmp.name).resolve()), "-m", "ask"])
         prompt = argv[-1]
         self.assertIn(f"request seq {seq} on that topic, from {USER}", prompt)
         self.assertIn(f"reply_to={seq}", prompt)
