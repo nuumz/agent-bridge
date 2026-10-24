@@ -165,6 +165,7 @@ class Waiting(Board):
         board = _load("bridge-board")
         with mock.patch.dict(os.environ, {"AGENT_BRIDGE_AGENT": "claude"}):
             srv = board.Server()
+            self.addCleanup(srv.conn.close)
         out = srv.call("board_wait", {"topic": "no-such-topic", "timeout_s": 1})
         self.assertTrue(out["isError"], out)
         self.assertEqual(srv.waits, 0)
@@ -183,6 +184,7 @@ class Waiting(Board):
         r1 = boardlib.post(self.conn, tid, USER, REQUEST, "request", to=CURSOR)
         with mock.patch.dict(os.environ, {"AGENT_BRIDGE_IDENTITY": CURSOR, "AGENT_BRIDGE_HOP": "1"}):
             peer = board.Server()
+            self.addCleanup(peer.conn.close)
         self.assertIn("kind=request", peer.call("board_read", {"topic": "room:r", "mine": True})["content"][0]["text"])
         peer.call("board_post", {"topic": "room:r", "body": DONE, "kind": "done", "reply_to": r1})
         out = peer.call("board_wait", {"topic": "room:r", "timeout_s": 1})
@@ -359,8 +361,10 @@ class ServerAndCli(Board):
         board = _load("bridge-board")
         with mock.patch.dict(os.environ, {"AGENT_BRIDGE_AGENT": "claude"}):
             lead = board.Server()
+            self.addCleanup(lead.conn.close)
         with mock.patch.dict(os.environ, {"AGENT_BRIDGE_IDENTITY": CURSOR, "AGENT_BRIDGE_HOP": "1"}):
             peer = board.Server()
+            self.addCleanup(peer.conn.close)
         self.assertEqual((lead.me, lead.peer, peer.me, peer.peer), (PRIMARY, False, CURSOR, True))
         text = lambda out: out["content"][0]["text"]  # noqa: E731
         self.assertTrue(peer.call("board_open", {"name": "room:r"})["isError"])

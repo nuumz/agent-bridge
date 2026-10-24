@@ -52,7 +52,8 @@ class BridgeWait(unittest.TestCase):
     def test_fix_rc_file_and_report_location(self):
         d = self.root / "f1"; d.mkdir()
         (d / "rc").write_text("0\n")                       # bridge-work's file must NOT satisfy a fix wait
-        self.assertEqual(self._run(["fix", "f1", "--max", "1"], alive=True), 75)
+        with mock.patch("builtins.print"):
+            self.assertEqual(self._run(["fix", "f1", "--max", "1"], alive=True), 75)
         (d / "fix.rc").write_text("3\n")
         (self.root / "fix-f1").mkdir(); (self.root / "fix-f1" / "report.md").write_text("x")
         with mock.patch("builtins.print") as pr:
@@ -68,7 +69,8 @@ class BridgeWait(unittest.TestCase):
 
     def test_dead_is_1(self):
         (self.root / "p3").mkdir()
-        self.assertEqual(self._run(["panel", "p3", "--max", "1", "--interval", "0.2"], alive=False), 1)
+        with mock.patch("builtins.print"):
+            self.assertEqual(self._run(["panel", "p3", "--max", "1", "--interval", "0.2"], alive=False), 1)
 
     def test_max_clamped_without_unsafe(self):
         d = self.root / "p4"; d.mkdir(); (d / "rc").write_text("0\n")
