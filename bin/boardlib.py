@@ -24,7 +24,7 @@ LEASE_S = 1500            # claim lease: ask-agent default timeout (900 s) + rec
 WAIT_BUDGET = 8           # board_wait calls one server process may make before it must stop waiting
 PEER_OPEN_TASKS = 5       # queued+claimed tasks a peer-origin identity may hold per topic
 KINDS = ("note", "question", "answer", "decision", "task", "system", "request", "handoff", "done", "blocked")
-CLOSING_KINDS = ("answer", "done", "blocked")   # a request stays open until one of these replies to it
+CLOSING_KINDS = ("answer", "done", "blocked")   # a request stays open until one of these replies to it (OPEN_REQUEST)
 ROLES = ("leader", "member", "observer")
 TASK_MODES = ("ask", "plan", "write")
 
@@ -200,12 +200,25 @@ def header(body: str) -> dict[str, str]:
 
 
 IDENTITY = re.compile(r"[^\s+@*][^\s+]*")    # claude@primary, cursor#41, claude:task3, user:x — no blanks, no `+`
+ROLE_RE = re.compile(r"[a-z][a-z0-9-]*")      # leader | member | observer, or a panel/live persona like root-cause
+NO_VALUE = ("", "-", "none", "n/a", "na", "?")
 
 
 def identity(name: str, what: str = "agent") -> str:
     if not IDENTITY.fullmatch(name) or name == "user:":
         raise BoardError(f"{what} must be an agent identity like claude@primary or cursor#41 (got {name!r})")
     return name
+
+
+def user_identity() -> str:
+    """The human at this machine, as the CLI and the cards address them."""
+    return f"user:{os.environ.get('USER', 'user')}"
+
+
+def role_name(role: str) -> str:
+    if not ROLE_RE.fullmatch(role or ""):
+        raise BoardError(f"a role is a lowercase slug like leader, member, observer or root-cause (got {role!r})")
+    return role
 
 
 def addressee(to: str | None) -> str | None:
@@ -215,9 +228,7 @@ def addressee(to: str | None) -> str | None:
     if to == "*":
         return to
     if to.startswith("@"):
-        if to[1:] not in ROLES:
-            raise BoardError(f"to=@<role> must name one of {ROLES}")
-        return to
+        return "@" + role_name(to[1:])
     return identity(to, "to")
 
 
@@ -233,6 +244,9 @@ def post(conn: sqlite3.Connection, tid: int, author: str, body: str, kind: str =
             raise BoardError("kind=request needs to=<agent|@role|*>: a request without an owner is a note")
         if not header(body).get("shape"):
             raise BoardError("kind=request needs a `shape: <what the answer must look like>` header line")
+    if kind == "blocked" and header(body).get("missing", "").strip().lower() in NO_VALUE:
+        raise BoardError("kind=blocked needs a `missing: <what you lack>` header line — if what you lack is a "
+                         "decision or a fact only the user has, send a card (board_ask_user) instead")
     if reply_to is not None and conn.execute("SELECT 1 FROM messages WHERE topic_id=? AND seq=?",
                                              (tid, reply_to)).fetchone() is None:
         raise BoardError(f"reply_to={reply_to} is not a message of this topic")
@@ -255,11 +269,13 @@ def _for_me(me: str, roles: list[str]) -> tuple[str, tuple]:
     return sql, (me, *roles, me)
 
 
-# a request is closed only by an answer/done/blocked from its addressee (the agent, a member holding the @role, or
-# anyone when it was for everyone) or from the requester — a third party's reply does not take it off the owner's list
+# a request is closed only by an answer/done/blocked from its addressee (the agent, a member holding the @role, any
+# user:* for a card to the user, or anyone when it was for everyone) or from the requester — a third party's reply
+# does not take it off the owner's list; the user's `decision` closes a card only (on an agent's request it steers)
 OPEN_REQUEST = ("m.kind='request' AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.topic_id=m.topic_id "
-                "AND r.reply_to=m.seq AND r.kind IN ('answer','done','blocked') AND (m.addressee='*' "
-                "OR r.author=m.addressee OR r.author=m.author OR (m.addressee LIKE '@%' AND r.author IN "
+                "AND r.reply_to=m.seq AND (r.kind IN ('answer','done','blocked') OR (r.kind='decision' AND "
+                "m.addressee LIKE 'user:%')) AND (m.addressee='*' OR r.author=m.addressee OR r.author=m.author "
+                "OR (m.addressee LIKE 'user:%' AND r.author LIKE 'user:%') OR (m.addressee LIKE '@%' AND r.author IN "
                 "(SELECT agent FROM members b WHERE b.topic_id=m.topic_id AND b.role=substr(m.addressee, 2) "
                 "AND b.left_at IS NULL))))")
 MSG_COLS = 'm.seq, m.author, m.kind, m.body, m.reply_to, m.created_at, m.addressee AS "to"'
@@ -299,10 +315,43 @@ def others_after(conn: sqlite3.Connection, tid: int, me: str, after_seq: int, me
                         (tid, after_seq, me, *args)).fetchone() is not None
 
 
+def reaching(conn: sqlite3.Connection, tid: int, me: str, after_seq: int, upto: int,
+             roles: list[str] | None = None) -> list[dict]:
+    """Other agents' posts in (after_seq, upto] that reach `me` (see _for_me), oldest first; no cursor is moved — the
+    feed loop of a live peer, which keeps its own high-water mark."""
+    sql, args = _for_me(me, roles or [])
+    rows = conn.execute(f"SELECT {MSG_COLS} FROM messages m WHERE m.topic_id=? AND m.seq>? AND m.seq<=? "
+                        f"AND m.author<>? AND {sql} ORDER BY m.seq", (tid, after_seq, upto, me, *args)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ----------------------------------------------------------------------------- cards to the user
+def card(kind: str, rows: list[tuple[str, str, str, str]], due: str | None = None) -> str:
+    """The one shape in which an agent asks the human: `decision` (a choice only they own) or `fact` (information
+    nobody else has). Header lines a parser reads, then the table question · options · recommendation · if undecided.
+    The user answers with kind=decision (a decision) or kind=answer (a fact), reply_to the card's seq."""
+    if kind not in ("decision", "fact"):
+        raise BoardError("a card is a decision or a fact")
+    if not rows:
+        raise BoardError("a card needs at least one question")
+    cell = lambda s: " ".join((s or "-").split()).replace("|", "/")  # noqa: E731 — one line per cell, no pipes
+    head = f"card: {kind}\nshape: {kind}\n" + (f"due: {cell(due)}\n" if due else "")   # one line: no forged header
+    table = "| question | options | recommendation | if undecided |\n|---|---|---|---|\n" + "\n".join(
+        f"| {cell(q)} | {cell(opt)} | {cell(rec)} | {cell(und)} |" for q, opt, rec, und in rows)
+    return head + "\n" + table
+
+
+def user_cards(conn: sqlite3.Connection) -> list[dict]:
+    """Every open request addressed to the user across open topics, oldest first — the one list a human answers."""
+    rows = conn.execute(f"SELECT t.name AS topic, {MSG_COLS} FROM messages m JOIN topics t ON t.id=m.topic_id "
+                        f"WHERE t.closed_at IS NULL AND m.addressee LIKE 'user:%' AND {OPEN_REQUEST} "
+                        "ORDER BY m.created_at, m.id").fetchall()
+    return [dict(r) for r in rows]
+
+
 # ----------------------------------------------------------------------------- members / dm / room
 def member_add(conn: sqlite3.Connection, tid: int, agent: str, role: str = "member") -> None:
-    if role not in ROLES:
-        raise BoardError(f"role must be one of {ROLES}")
+    role_name(role)
     with tx(conn):
         conn.execute("INSERT INTO members(topic_id, agent, role, joined_at, left_at) VALUES(?,?,?,?,NULL) "
                      "ON CONFLICT(topic_id, agent) DO UPDATE SET role=excluded.role, joined_at=excluded.joined_at, "

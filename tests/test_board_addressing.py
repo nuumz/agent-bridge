@@ -98,7 +98,7 @@ class Posting(Board):
         boardlib.post(self.conn, tid, USER, "none", to="")
         rows = [r[0] for r in self.conn.execute("SELECT addressee FROM messages ORDER BY seq")]
         self.assertEqual(rows, ["*", CURSOR, "@leader", None])
-        for bad in ("@boss", "two words"):
+        for bad in ("@Boss", "@x y", "two words"):
             with self.assertRaises(boardlib.BoardError):
                 boardlib.post(self.conn, tid, USER, "x", to=bad)
 
@@ -119,7 +119,7 @@ class Posting(Board):
             boardlib.post(self.conn, tid, CURSOR, "answer to nothing", "answer", reply_to=99)
 
     def test_identities_are_checked_wherever_they_enter(self):
-        for bad in ("*x", "\tcursor", "cursor#41\n", "@x", "a+b", "user:", "two words"):
+        for bad in ("*x", "\tcursor", "cursor#41\n", "@X", "@", "a+b", "user:", "two words"):
             with self.subTest(bad), self.assertRaises(boardlib.BoardError):
                 boardlib.addressee(bad)
         for ok in ("claude@primary", "cursor#41", "claude:task3", "user:nuumz", "claude-A", "*", "@leader"):
@@ -211,10 +211,11 @@ class Reading(Board):
         self.assertEqual(self.conn.execute("SELECT seq FROM cursors WHERE agent=?", (CURSOR,)).fetchone()[0], r4)
         opened, _ = boardlib.read(self.conn, tid, CURSOR, None, open_requests=True)  # from the start, cursor ignored
         self.assertEqual([m["seq"] for m in opened], [r1])
-        boardlib.post(self.conn, tid, COPILOT, "not mine to close", "blocked", reply_to=r1)  # a third party: still open
+        # a third party's reply does not close it
+        boardlib.post(self.conn, tid, COPILOT, "missing: access\nnot mine to close", "blocked", reply_to=r1)
         self.assertEqual([m["seq"] for m in boardlib.read(self.conn, tid, CURSOR, None, open_requests=True)[0]], [r1])
         self.assertEqual(self.conn.execute("SELECT seq FROM cursors WHERE agent=?", (CURSOR,)).fetchone()[0], r4)
-        boardlib.post(self.conn, tid, CURSOR, "blocked: no repo access", "blocked", reply_to=r1)
+        boardlib.post(self.conn, tid, CURSOR, "missing: repo access", "blocked", reply_to=r1)
         self.assertEqual(boardlib.read(self.conn, tid, CURSOR, None, open_requests=True)[0], [])
         r5 = boardlib.post(self.conn, tid, USER, REQUEST, "request", to="@member")        # a role: any holder closes it
         boardlib.post(self.conn, tid, COPILOT, "on it, done", "done", reply_to=r5)
