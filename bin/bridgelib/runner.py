@@ -17,9 +17,8 @@ from typing import Any
 import boardlib
 
 from .adapters import Adapter, Parsed
-from .core import (STATE, HOP_VAR, IDENTITY_VAR, QUOTA_TTL, RUNS, TASK_VAR, err_summary, peer_env, quota_block,
-                   quota_clear,
-                   quota_hit, quota_mark)
+from .core import (BOARD_PROTOCOL, STATE, HOP_VAR, IDENTITY_VAR, QUOTA_TTL, RUNS, TASK_VAR, err_summary, peer_env,
+                   quota_block, quota_clear, quota_hit, quota_mark)
 
 CONV_DIR = STATE / "conv"
 ASK_RE = re.compile(r"^\s*\[\[ASK\]\]\s*(.+?)\s*$", re.M)
@@ -36,9 +35,9 @@ def protocol(conv: Conv | None) -> str:
         return PROTOCOL
     return (f"\n\n(Bridge protocol: write the answer in the reply body itself, do not narrate. This thread is board topic "
             f"'{conv.topic_name}' — board_read it for history; the bridge posts your reply there for you, so do NOT "
-            f"board_post your answer. If you need something only the caller can provide: board_post kind=question on that "
-            f"topic, then board_wait for the answer; if nothing arrives after two waits or the wait is refused, end with "
-            f"one line `[[ASK]] <question>` and stop.)")
+            f"board_post your answer. If you need something only the caller can provide: board_ask_user (a fact card) on "
+            f"that topic, then board_wait for the answer; if nothing arrives after two waits or the wait is refused, end "
+            f"with one line `[[ASK]] <the same question>` and stop. {BOARD_PROTOCOL})")
 
 
 def kill_tree(proc: subprocess.Popen, sig: int = signal.SIGTERM, grace: int = 10) -> None:
@@ -143,6 +142,7 @@ class Conv:
         # board mirror: every turn is also a message on topic conv:<name>, so peers can board_read the thread,
         # `bridge-board tail conv:<name>` follows it live, and the user can steer a dialog by posting there
         self.board, self.topic_name, self.topic = board, f"conv:{name}", None
+        self.last_author: str | None = None   # the peer identity of the latest reply mirrored (for its ask-back card)
         if board is not None:
             self.topic = boardlib.topic_id(board, self.topic_name, USER_AUTHOR)
             self.seen = board.execute("SELECT COALESCE(MAX(seq),0) FROM messages WHERE topic_id=?", (self.topic,)).fetchone()[0]
@@ -164,9 +164,35 @@ class Conv:
             f.write(f"### {n}. {frm} → {to}\n\n{text.strip()}\n\n")
         self.state_path.write_text(json.dumps(self.state, indent=2))
         if self.topic is not None and author and not self._already_posted(author, text):
-            boardlib.post(self.board, self.topic, author, text.strip(), "answer" if peer else "note")
+            # the caller's next message answers the card the peer left open, if any — so `--conv` closes it
+            card = None if peer else self.open_card()
+            boardlib.post(self.board, self.topic, author, text.strip(), "answer" if (peer or card) else "note",
+                          card["seq"] if card else None)
+        if peer and author:
+            self.last_author = author
         if self.topic is not None and not peer:  # a request was just recorded: the run starts after this seq
             self.mark = self.board.execute("SELECT COALESCE(MAX(seq),0) FROM messages WHERE topic_id=?", (self.topic,)).fetchone()[0]
+
+    def open_card(self, family: str | None = None) -> dict | None:
+        """The newest open card to the user on this thread — optionally one posted by a run of `family` (cursor,
+        claude, …: each run is a new `<family>#<pid>` identity, the question is the same) — else None."""
+        if self.topic is None:
+            return None
+        who = "AND m.author LIKE ? " if family else ""
+        row = self.board.execute(f"SELECT m.seq, m.author, m.body FROM messages m WHERE m.topic_id=? {who}"
+                                 f"AND m.addressee LIKE 'user:%' AND {boardlib.OPEN_REQUEST} ORDER BY m.seq DESC LIMIT 1",
+                                 (self.topic, *((family + "%",) if family else ()))).fetchone()
+        return dict(row) if row else None
+
+    def ask_user(self, author: str, question: str, how: str) -> int | None:
+        """The peer's [[ASK]] as a fact card to the user on the thread's topic, so it shows in `bridge-board cards`
+        with every other open card; None without a board or while a card of this peer is still open there (it asked
+        with board_ask_user already, or an earlier run's card was never answered)."""
+        if self.topic is None or self.open_card(re.split(r"[#@:]", author)[0]):
+            return None
+        body = boardlib.card("fact", [(question, "-", "-", f"the run stopped (exit 5); nothing proceeds until "
+                                                            f"answered — {how} \"<answer>\" (closes this card)")])
+        return boardlib.post(self.board, self.topic, author, body, "request", None, boardlib.user_identity())
 
     def _already_posted(self, author: str, text: str) -> bool:
         """True when `author` posted this text itself during the run (a peer that ignored 'do NOT board_post')."""
@@ -315,5 +341,10 @@ def print_parsed(agent: Adapter, p: Parsed, log: Path | None, conv: Conv | None)
     if m:
         how = f"ask-agent {agent.name} --conv {conv.name}" if conv else f"ask-agent {agent.name} --session {p.session}"
         print(f"[bridge] the peer asks back: {m.group(1)}\n[bridge] answer with: {how} \"<answer>\"", file=sys.stderr)
+        if conv:
+            seq = conv.ask_user(conv.last_author or f"{agent.name}@hop", m.group(1), how)
+            if seq:
+                print(f"[bridge] card posted on {conv.topic_name} seq={seq} (see `bridge-board cards`)",
+                      file=sys.stderr)
         return 5
     return 0

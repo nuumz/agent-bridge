@@ -4,8 +4,8 @@
     bridge-live start <peer> [--room R] [--role ROLE] [-d DIR] [-m ask|plan|write] [-M model] [--add-dir D]
                       [--max-turns 20] [--budget 5] [--idle 1800] [--turn-timeout 600] [--fresh]
                       detach a broker that holds one `claude -p` stream-json process (resumes the peer's last session)
-    bridge-live send <room> "<message>" [--wait 600] [--until-quiet] [--no-wait]
-                      post on topic live:<room>; print each peer's answer (--until-quiet: the whole exchange)
+    bridge-live send <room> "<message>" [--to X] [-k note|question|request|decision] [--wait 600] [--until-quiet]
+                      [--no-wait]   post on topic live:<room>; print each peer's answer (--until-quiet: the whole exchange)
     bridge-live stop <peer|room>                             end one peer, or every peer in a room
     bridge-live ls                                           live peers: room, role, status, turns, cost
 
@@ -13,12 +13,14 @@ Why: ask-agent starts a new CLI per turn, so every turn re-writes ~43 k tokens o
 long-lived process answers the next message from a warm cache (measured 2026-10-05: turn 1 $0.34, turns 2–5 $0.01–0.03).
 Claude only — cursor-agent and copilot have no streaming-stdin mode and stay turn-based (`ask-agent --conv`).
 
-Room: the board topic live:<room> (default room = the peer's name). Every peer in a room is fed every message another
-participant posts — the caller's notes, a user:* decision (as a Moderator line), and the other peers' answers, labelled
-with their author — batched into one turn when several arrived while it was busy. The reply goes back to the room as
-kind=answer, reply_to = the last message it answered. So two peers in one room argue by themselves; the caller can post
-into the room at any time. A peer that ended its last reply with [[AGREE]] is not woken by answers that only agree back,
-which is how a room goes quiet. A user:* decision containing [[STOP]] ends every peer in the room.
+Room: the board topic live:<room> (default room = the peer's name); the caller is its leader, each peer a member under
+its --role (so `--to @design-critic` reaches it). A peer is fed what reaches it — posts addressed to it, to its role
+or to everyone, and replies to its own posts: the caller's notes, a user:* decision (as a Moderator line), the other
+peers' answers, labelled with their author — batched into one turn when several arrived while it was busy. The reply
+goes back as kind=answer, reply_to = the last message it answered, addressed to that message's author unless that is
+the user. So two peers in one room argue between themselves; the caller can post into the room at any time and reads
+everything. A peer that ended its last reply with [[AGREE]] is not woken by answers that only agree back, which is how
+a room goes quiet. A user:* decision containing [[STOP]] ends every peer in the room.
 
 Guards per peer: --max-turns, --budget (USD spent since this start), --idle, --turn-timeout. `start` again with the same
 peer name resumes its last session (context kept; within the 1 h cache TTL the rules stay cached) unless --fresh.
@@ -42,13 +44,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boardlib  # noqa: E402
 from bridgelib import ledger  # noqa: E402
 from bridgelib.adapters import ADAPTERS  # noqa: E402
-from bridgelib.core import (HOP_VAR, PEER_TALK_RULE, ROOT, STATE, detach, err_summary, hop_active,  # noqa: E402
-                            peer_env, quota_block, quota_hit, quota_mark)
+from bridgelib.core import (BOARD_PROTOCOL, HOP_VAR, PEER_TALK_RULE, ROOT, STATE, detach, err_summary,  # noqa: E402
+                            hop_active, peer_env, quota_block, quota_hit, quota_mark)
 from bridgelib.runner import AGREE_RE, USER_AUTHOR, kill_tree  # noqa: E402
 
 LIVE = STATE / "live"
 ROLES = ROOT / "roles"
-FED_KINDS = ("note", "question", "decision", "answer")
+FED_KINDS = ("note", "question", "decision", "answer", "request", "handoff", "done", "blocked")
 
 
 def topic(room: str) -> str:
@@ -109,17 +111,53 @@ def intro(peer: str, room: str, role: str) -> str:
     persona = f"{role_prompt(role)}\n\n" if role else ""
     return (f"{persona}(Live session: you are `{peer}` in room `{room}`. You stay running; messages arrive over time from "
             "the caller and from other agents in the room, each labelled [author] when it is not the caller's plain "
-            "request. Everything posted in the room is delivered to you here, so do not try to read the board yourself. "
-            "Answer in the reply body, at most 250 words, no narration. Answer what was asked or said to you; "
-            "when nothing is left for you to add or dispute, end with a line [[AGREE]]. " + PEER_TALK_RULE + ")\n\n")
+            "request. Everything addressed to you, to your role or to everyone is delivered to you here, so do not "
+            "try to read the board yourself. Answer in the reply body, at most 250 words, no narration. Answer what "
+            "was asked or said to you; when nothing is left for you to add or dispute, end with a line [[AGREE]]. "
+            + PEER_TALK_RULE + " " + BOARD_PROTOCOL + ")\n\n")
 
 
 def label(m: dict) -> str:
     """One room post as the peer sees it: the header is ours, the body is indented so a body line can never pass for a
     header (another peer writing "Moderator (user:x): …" stays inside its own quote)."""
-    head = (f"Moderator ({m['author']}, seq {m['seq']}):" if m["kind"] == "decision"
-            else f"[{m['author']} · seq {m['seq']}]")
+    to = f" → {m['to']}" if m.get("to") else ""
+    head = (f"Moderator ({m['author']}, seq {m['seq']}){to}:" if m["kind"] == "decision"
+            else f"[{m['author']} · {m['kind']} · seq {m['seq']}{to}]")
     return head + "\n" + "\n".join("    " + ln for ln in m["body"].splitlines())
+
+
+def answer_to(batch: list[dict]) -> str | None:
+    """Whom a live peer's answer is addressed to: the one agent whose posts it answers — so two peers' exchange stays
+    between them instead of waking the whole room. Everyone (None) when the batch came from several authors or from
+    the user, who reads everything anyway."""
+    authors = {m["author"] for m in batch}
+    if len(authors) != 1:
+        return None
+    author = authors.pop()
+    return None if author.startswith("user:") else author
+
+
+def reply_target(batch: list[dict]) -> int:
+    """The seq a live peer's answer replies to: the latest `request` in the batch (so the request closes), else the
+    last post fed."""
+    for m in reversed(batch):
+        if m["kind"] == "request":
+            return m["seq"]
+    return batch[-1]["seq"]
+
+
+def role_slug(role: str | None) -> str:
+    """A persona name as the peer's board role; the privileged board roles (leader, …) are never minted from one."""
+    return role if role and boardlib.ROLE_RE.fullmatch(role) and role not in boardlib.ROLES else "member"
+
+
+def send_targets(conn, tid: int, to: str | None, live: set[str]) -> set[str]:
+    """Which live peers a `send` waits for: all of them, one identity, or the holders of `@<role>`."""
+    if not to or to == "*":
+        return live
+    if to.startswith("@"):
+        return {m["agent"] for m in boardlib.members(conn, tid) if m["role"] == to[1:]} & live
+    return {to} & live
 
 
 def close_room_if_empty(conn, room: str) -> None:
@@ -153,6 +191,9 @@ def start(o) -> int:
     conn = boardlib.connect()
     tid = boardlib.topic_id(conn, topic(o.room), USER_AUTHOR)
     boardlib.reopen_topic(conn, topic(o.room))          # closed when its last peer left; the backlog is still there
+    if not any(m["role"] == "leader" for m in boardlib.members(conn, tid)):
+        boardlib.member_add(conn, tid, USER_AUTHOR, "leader")       # the caller leads a live room
+    boardlib.member_add(conn, tid, identity(o.peer), role_slug(o.role))  # @<role> mentions reach this peer
     # taken before the fork so a `send` right after `start` is not lost. A resume in the same room also gets what the
     # room said while the peer was away (from its last answered seq); a STOP in that backlog is history, not an order.
     stop_floor = conn.execute("SELECT COALESCE(MAX(seq),0) FROM messages WHERE topic_id=?", (tid,)).fetchone()[0]
@@ -221,14 +262,18 @@ def broker(o, after: int, stop_floor: int, resume: str | None, base: float) -> i
     saved, timed_out = (0, "ready"), False
     try:
         while not reason:
-            for r in conn.execute("SELECT seq, author, kind, body FROM messages WHERE topic_id=? AND seq>? AND author<>? "
-                                  "ORDER BY seq", (tid, after, me)).fetchall():
-                after = r["seq"]
-                if r["kind"] == "decision" and r["author"].startswith("user:") and "[[STOP]]" in r["body"]:
-                    if r["seq"] > stop_floor:         # a backlog STOP is the one that ended an earlier start
-                        reason = f"stopped by {r['author']}"
-                elif r["kind"] in FED_KINDS:
-                    pending.append(dict(r))
+            # only what reaches this peer — addressed to it, its role, everyone, or a reply to it — is fed; the rest
+            # of the room's traffic moves the high-water mark without a turn
+            top = conn.execute("SELECT COALESCE(MAX(seq),0) FROM messages WHERE topic_id=?", (tid,)).fetchone()[0]
+            if top > after:
+                roles = boardlib.my_roles(conn, tid, me)
+                for r in boardlib.reaching(conn, tid, me, after, top, roles):
+                    if r["kind"] == "decision" and r["author"].startswith("user:") and "[[STOP]]" in r["body"]:
+                        if r["seq"] > stop_floor:         # a backlog STOP is the one that ended an earlier start
+                            reason = f"stopped by {r['author']}"
+                    elif r["kind"] in FED_KINDS:
+                        pending.append(r)
+                after = top
             if reason:
                 break
             if turn is None and pending:
@@ -247,7 +292,8 @@ def broker(o, after: int, stop_floor: int, resume: str | None, base: float) -> i
                         first = False
                     proc.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n")
                     proc.stdin.flush()
-                    turn = {"seq": batch[-1]["seq"], "t0": time.time(), "body": text}
+                    turn = {"seq": reply_target(batch), "t0": time.time(), "body": text, "to": answer_to(batch),
+                            "last": batch[-1]["seq"]}
                     st["status"] = "busy"
                     print(f"[live] {peer}: turn {st['turns'] + 1} ← seq {', '.join(str(m['seq']) for m in batch)}")
             if (len(pending), st["status"]) != saved:              # `send --until-quiet` reads status + pending
@@ -261,11 +307,11 @@ def broker(o, after: int, stop_floor: int, resume: str | None, base: float) -> i
             if ev is None:
                 reason = f"peer exited rc={proc.poll()}: {err_summary(err, 'no stderr')}"
             elif ev and turn:
-                st["after"], timed_out = turn["seq"], False   # answered up to here; later ones are still queued
+                st["after"], timed_out = turn["last"], False  # fed up to here; later ones are still queued
                 total = record_turn(peer, room, st, ev, turn, total, base, peer_log)
                 answer = ev.get("result") or "(the peer returned no text)"
                 agreed = bool(AGREE_RE.search(answer))
-                boardlib.post(conn, tid, me, answer, "answer", reply_to=turn["seq"])
+                boardlib.post(conn, tid, me, answer, "answer", reply_to=turn["seq"], to=turn.get("to"))
                 print(f"[live] {peer}: turn {st['turns']} done in {time.time() - turn['t0']:.1f}s, "
                       f"${total - base:.3f} this start{' [[AGREE]]' if agreed else ''}")
                 quota = quota_hit(answer) if ev.get("is_error") else None
@@ -287,7 +333,7 @@ def broker(o, after: int, stop_floor: int, resume: str | None, base: float) -> i
                 record_abandoned(room, st, turn, peer_log)
                 boardlib.post(conn, tid, me, f"turn {n} abandoned after {o.turn_timeout}s (--turn-timeout); {peer} "
                                              "restarted on its session — post again if it still matters", "system",
-                              reply_to=turn["seq"])
+                              reply_to=turn["last"])
                 boardlib.worker_unregister(conn, proc.pid)
                 proc, results = spawn()
                 first = not session["id"]             # no session yet = the intro never reached a transcript
@@ -313,6 +359,7 @@ def broker(o, after: int, stop_floor: int, resume: str | None, base: float) -> i
         save_state(peer, st)
         boardlib.worker_unregister(conn, proc.pid)
         boardlib.post(conn, tid, me, f"{peer} left: {st['reason']} — {st['turns']} turns, ${total - base:.2f}", "system")
+        boardlib.member_remove(conn, tid, me)
         print(f"[live] {peer}: stopped — {st['reason']}")
         close_room_if_empty(conn, room)
     return 0
@@ -362,11 +409,19 @@ def send(o) -> int:
         return 2
     conn = boardlib.connect()
     tid = boardlib.topic_id(conn, topic(o.room), USER_AUTHOR)
-    seq = boardlib.post(conn, tid, USER_AUTHOR, o.message, "note")
+    try:
+        seq = boardlib.post(conn, tid, USER_AUTHOR, o.message, o.kind, to=o.to)
+    except boardlib.BoardError as exc:
+        print(f"bridge-live: {exc}", file=sys.stderr)
+        return 2
     if o.no_wait:
         print(f"[live] posted seq={seq} on {topic(o.room)} ({', '.join(peers)})")
         return 0
-    want = {identity(p) for p in peers}
+    want = send_targets(conn, tid, o.to, {identity(p) for p in peers})   # only who the post reaches is awaited
+    if not want:
+        print(f"[live] posted seq={seq}; no running peer in room {o.room!r} is {o.to} — nothing to wait for",
+              file=sys.stderr)
+        return 1
     shown, last_new, deadline = seq, time.time(), time.time() + o.wait
     answered: set[str] = set()
     while time.time() < deadline:
@@ -445,6 +500,9 @@ def main() -> int:
     m = sub.add_parser("send")
     m.add_argument("room")
     m.add_argument("message")
+    m.add_argument("--to", help="one peer (claude@live:<peer>), @<role>, or * (default: everyone in the room)")
+    m.add_argument("-k", "--kind", default="note", choices=["note", "question", "request", "decision"],
+                   help="request needs `shape:` as its first line; decision steers (user only)")
     m.add_argument("--wait", type=int, default=600, help="seconds to wait (exit 124 when the room is still talking)")
     m.add_argument("--until-quiet", action="store_true", help="print the whole exchange until every peer is idle")
     m.add_argument("--no-wait", action="store_true")

@@ -28,12 +28,30 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import boardlib  # noqa: E402 — card text only; every post goes through the bridge-board CLI (identity resolved there)
 from bridgelib import grill as grill_plan, ledger  # noqa: E402
 from bridgelib.core import ROOT, STATE, detach, guarded_rc, hop_active  # noqa: E402
 
 BIN = ROOT / "bin"
+BOARD = BIN / "bridge-board"
 WORK = STATE / "work"
 PANELS = STATE / "panel"
+CARD_AUTHOR = "bridge-fix"            # the script speaks for itself on the board; the user answers as user:*
+
+
+def board(*args: str) -> str:
+    """One `bridge-board` CLI call; '' when the board is unavailable or refuses (the flow never depends on it)."""
+    if not BOARD.is_file():
+        return ""
+    r = subprocess.run([str(BOARD), *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"[fix] board: {r.stderr.strip()[-200:]}", file=sys.stderr)
+        return ""
+    return r.stdout.strip()
+
+
+def fix_topic(name: str) -> str:
+    return f"fix:{name}"
 DEFAULT_ROLES = "as-built-realist,spec-reader,design-critic"     # playbook defect-root-cause
 
 
@@ -187,6 +205,46 @@ def decide_card(fl: dict) -> None:
           f"  bridge-fix decide {fl['name']} --answer '1=<option>' [--answer '2=…'] --files '<globs>' --verify '<cmd>'\n"
           f"  bridge-fix decide {fl['name']} --go --files … --verify …      # take every recommendation as given\n",
           file=sys.stderr)
+    if fl.get("card_seq"):
+        return                            # a resumed flow: the card is already on the board
+    seq = post_card(fl)
+    if seq:
+        fl["card_seq"] = seq
+        save(fl)
+        print(f"  card: {fix_topic(fl['name'])} seq={seq} (every open card: `bridge-board cards`)\n", file=sys.stderr)
+
+
+def card_rows(fl: dict) -> list[tuple[str, str, str, str]]:
+    """The panel's decision table as card rows; a flow with no decision gets one row for `--go`."""
+    rows = table_rows(section(Path(fl["report"]).read_text(), "Decisions for the user")) if fl.get("report") else []
+    out = [(r[0], r[1] if len(r) > 1 else "-", r[2] if len(r) > 2 else "-",
+            r[3] if len(r) > 3 else "the fix waits; `bridge-fix decide --go` takes the recommendation") for r in rows]
+    return out or [(f"fix `{fl['name']}`: proceed as the panel recommends?", "go | rule otherwise",
+                    "go", "the fix waits until `bridge-fix decide`")]
+
+
+def post_card(fl: dict) -> int | None:
+    """The decision card as a request to the user on topic fix:<name>, so it shows beside every other open card."""
+    body = boardlib.card("decision", card_rows(fl))
+    body += f"\n\nagreement: {fl['agreement']}\nanswer: bridge-fix decide {fl['name']} --answer '1=…' | --go"
+    out = board("post", fix_topic(fl["name"]), body, "-k", "request", "--to", boardlib.user_identity(),
+                "--as", CARD_AUTHOR)
+    m = re.search(r"seq (\d+)", out)
+    return int(m.group(1)) if m else None
+
+
+def close_card(fl: dict, ruling: str) -> None:
+    """The ruling on the board: a decision (steers), a done reply that closes the card, then the topic."""
+    t = fix_topic(fl["name"])
+    if not fl.get("card_seq"):
+        return
+    if not board("post", t, f"ruling on fix `{fl['name']}`: {ruling}", "-k", "decision"):
+        print("[fix] the ruling did not reach the board (only the user posts a decision) — the card stays open",
+              file=sys.stderr)
+        return
+    board("post", t, f"ruled by {fl.get('decided_by', 'user')}: {ruling}", "-k", "done", "--to", "*",
+          "--reply-to", str(fl["card_seq"]))
+    board("close", t)
 
 
 def decide(o) -> int:
@@ -257,6 +315,8 @@ def decide(o) -> int:
                "decided_by": os.environ.get("USER", "user")})
     save(fl)
     print(f"[fix] ruling recorded in {f}", file=sys.stderr)
+    close_card(fl, "GO — every recommendation as written" if not answers else
+               "; ".join(f"{i}={a}" for i, a in sorted(answers.items())))
     if o.no_fix:
         return 0
     return fix(fl, o)
@@ -296,9 +356,6 @@ def fix(fl: dict, o) -> int:
 # ---------------------------------------------------------------- run / status
 
 def run(o) -> int:
-    if hop_active():
-        print("bridge-fix: refusing inside a bridged run (one hop only)", file=sys.stderr)
-        return 3
     fl = load(o.name)
     if fl is None:
         if not o.problem:
@@ -361,6 +418,9 @@ def main() -> int:
     sub.add_parser("list")
     o = ap.parse_args()
     if o.cmd in ("run", "decide"):
+        if hop_active():                  # a peer neither starts a flow nor rules on one
+            print("bridge-fix: refusing inside a bridged run (one hop only)", file=sys.stderr)
+            return 3
         clear_fix_rc(o.name)
         if o.detach:
             detach(WORK / o.name / "fix.log")

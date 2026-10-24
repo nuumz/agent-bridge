@@ -7,7 +7,9 @@
     bridge-board read   <topic> [--after N] [-n 50] [--mine] [--open-requests]   print messages
     bridge-board tail   <topic>                           follow a topic (Ctrl-C to stop)
     bridge-board open   dm:<a>+<b> | room:<name>          a 1:1 thread (both sides members) or a room (opener leads)
-    bridge-board join   <topic> <agent> [-r leader|member|observer] | leave <topic> [agent]
+    bridge-board join   <topic> <agent> [-r leader|member|observer|<role>] | leave <topic> [agent]
+    bridge-board cards                                    every open card (request to user:*) across topics — answer
+                                                          each with post <topic> "…" -k decision|answer --reply-to N
     bridge-board task add "<title>" [-b body] [-t topic] [-a cursor|claude|any] [-m ask|plan|write] [-d dir] [-p prio]
     bridge-board task list | cancel <id>
     bridge-board dispatch [--max-agents 2] [--agents cursor,claude] [--allow-write DIR,...]
@@ -53,9 +55,10 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "board_post", "description": "Post a message to a topic (created on demand unless you are a bridged peer). "
      "Post BEFORE you wait for a reply. kind: note|question|answer|request|handoff|done|blocked (decision is reserved "
-     "for the user). `to` addresses it: an agent identity, @leader|@member|@observer of the topic, or * (everyone); "
-     "omitted = everyone. A request needs `to` and a `shape: <what the answer must look like>` header line, and stays "
-     "open until its owner (or the requester) replies answer|done|blocked to its seq.",
+     "for the user). `to` addresses it: an agent identity, @<role> of the topic's members (leader, member, observer or "
+     "a persona like root-cause), or * (everyone); omitted = everyone. A request needs `to` and a `shape: <what the "
+     "answer must look like>` header line, and stays open until its owner (or the requester) replies "
+     "answer|done|blocked to its seq. A blocked post needs a `missing: <what you lack>` header line.",
      "inputSchema": {"type": "object", "required": ["topic", "body"], "properties": {
          "topic": {"type": "string"}, "body": {"type": "string"},
          "kind": {"type": "string", "enum": ["note", "question", "answer", "request", "handoff", "done", "blocked"],
@@ -88,11 +91,22 @@ TOOLS = [
      "topic with. room:<name> is a group topic; only the user or the primary opens one and becomes its leader. "
      "Returns the canonical name.",
      "inputSchema": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}},
-    {"name": "board_join", "description": "Add an agent to a topic with a role (leader|member|observer), or change its "
-     "role. Leader or user only.",
+    {"name": "board_join", "description": "Add an agent to a topic with a role (leader|member|observer, or a persona "
+     "slug like root-cause that @role mentions reach), or change its role. Leader or user only.",
      "inputSchema": {"type": "object", "required": ["topic", "agent"], "properties": {
          "topic": {"type": "string"}, "agent": {"type": "string"},
-         "role": {"type": "string", "enum": ["leader", "member", "observer"], "default": "member"}}}},
+         "role": {"type": "string", "default": "member"}}}},
+    {"name": "board_ask_user", "description": "Ask the human the one way they answer: a card. kind=decision for a "
+     "choice only they own, kind=fact for information nobody else has. Give the question, the options, your "
+     "recommendation and what happens if nobody decides; the card is posted as a request to the user on the topic "
+     "(shape decision|fact) and they reply kind=decision (a decision) or kind=answer (a fact) to its seq. Keep working "
+     "on what does not depend on the answer; say in your done which part rests on the default.",
+     "inputSchema": {"type": "object", "required": ["topic", "kind", "question", "options", "recommendation",
+                                                    "if_undecided"], "properties": {
+         "topic": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact"]},
+         "question": {"type": "string"}, "options": {"type": "string"}, "recommendation": {"type": "string"},
+         "if_undecided": {"type": "string", "description": "the default you will take, and when"},
+         "due": {"type": "string"}}}},
     {"name": "board_leave", "description": "Leave a topic yourself, or (leader/user) remove another member.",
      "inputSchema": {"type": "object", "required": ["topic"], "properties": {
          "topic": {"type": "string"}, "agent": {"type": "string", "description": "default: you"}}}},
@@ -193,6 +207,16 @@ class Server:
     def board_close(self, topic: str) -> dict:
         B.close_topic_as(self.conn, topic, self.me)
         return {"topic": topic, "closed": True}
+
+    def board_ask_user(self, topic: str, kind: str, question: str, options: str, recommendation: str,
+                       if_undecided: str, due: str | None = None) -> dict:
+        tid = B.topic_id(self.conn, topic, self.creator())
+        body = B.card(kind, [(question, options, recommendation, if_undecided)], due)
+        to = B.user_identity()
+        seq = B.post(self.conn, tid, self.me, body, "request", None, to)
+        return {"topic": topic, "seq": seq, "to": to,
+                "note": f"the user answers with kind={'decision' if kind == 'decision' else 'answer'} reply_to={seq}; "
+                        "board_wait (mention) on the topic, and carry on with what does not depend on it"}
 
     def board_task_add(self, title: str, body: str, topic: str = "tasks", assignee: str = "any", mode: str = "ask",
                        dir: str | None = None, priority: int = 0) -> dict:  # noqa: A002 — MCP argument name
@@ -362,14 +386,18 @@ def main() -> int:
     sub.add_parser("serve")
     sub.add_parser("status")
     p = sub.add_parser("post"); p.add_argument("topic"); p.add_argument("text"); p.add_argument("-k", "--kind", default="note", choices=B.KINDS)
-    p.add_argument("--to", help="agent identity | @leader|@member|@observer | * (default: everyone)")
+    p.add_argument("--to", help="agent identity | @<role> | * (default: everyone)")
+    p.add_argument("--reply-to", type=int, help="seq of the message you answer (closes a request or a card)")
+    p.add_argument("--as", dest="as_", metavar="NAME", help="author name for a script posting on the user's behalf "
+                   "(bridge-fix); never user:*, never inside a bridged run")
+    sub.add_parser("cards")
     p = sub.add_parser("read"); p.add_argument("topic"); p.add_argument("--after", type=int); p.add_argument("-n", type=int, default=50)
     p.add_argument("--mine", action="store_true", help="only what reaches you")
     p.add_argument("--open-requests", action="store_true", help="requests their owner has not closed")
     p = sub.add_parser("tail"); p.add_argument("topic")
     p = sub.add_parser("open"); p.add_argument("name", help="dm:<a>+<b> or room:<name>")
     p = sub.add_parser("join"); p.add_argument("topic"); p.add_argument("agent")
-    p.add_argument("-r", "--role", default="member", choices=B.ROLES)
+    p.add_argument("-r", "--role", default="member", help="leader | member | observer | a persona slug")
     p = sub.add_parser("leave"); p.add_argument("topic"); p.add_argument("agent", nargs="?")
     p = sub.add_parser("close"); p.add_argument("topic")
     p = sub.add_parser("gc"); p.add_argument("--days", type=int, default=14); p.add_argument("--quiet", action="store_true")
@@ -402,12 +430,27 @@ def main() -> int:
         me = os.environ.get("AGENT_BRIDGE_IDENTITY") or f"{os.environ.get('AGENT_BRIDGE_AGENT', 'peer')}@hop"
         peer = True
     else:
-        me, peer = f"user:{os.environ.get('USER', 'user')}", False
+        me, peer = B.user_identity(), False
     try:
         if o.cmd == "status":
             print(json.dumps(B.status(conn, me), ensure_ascii=False, indent=1))
         elif o.cmd == "post":
-            print("seq", B.post(conn, B.topic_id(conn, o.topic, None if peer else me), me, o.text, o.kind, to=o.to))
+            author = me
+            if o.as_:                       # a script on the user's side speaking for itself: never a peer or the user
+                if peer:
+                    raise B.BoardError("--as is not for a bridged run: it posts as itself")
+                if not B.ROLE_RE.fullmatch(o.as_):   # a bare slug: never user:*, never an agent (@, #, :)
+                    raise B.BoardError("--as names a script (a lowercase slug like bridge-fix), never a user or an agent")
+                author = o.as_
+            tid = B.topic_id(conn, o.topic, None if peer else me)
+            print("seq", B.post(conn, tid, author, o.text, o.kind, o.reply_to, o.to))
+        elif o.cmd == "cards":
+            cards = B.user_cards(conn)
+            for c in cards:
+                print(f"[{c['topic']} seq={c['seq']} from={c['author']} to={c['to']}]\n"
+                      + "\n".join("    " + ln for ln in c["body"].splitlines()))
+            print(f"-- {len(cards)} open card(s); answer: bridge-board post <topic> \"…\" -k decision|answer "
+                  "--reply-to N")
         elif o.cmd == "read":
             tid = B.topic_id(conn, o.topic, None)
             msgs, nxt = B.read(conn, tid, me, o.after, o.n, o.mine, o.open_requests, B.my_roles(conn, tid, me))
