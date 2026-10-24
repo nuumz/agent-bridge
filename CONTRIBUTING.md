@@ -63,7 +63,16 @@ A peer is one class in `bin/bridgelib/adapters.py` registered in `ADAPTERS`. The
   `SHARED-RULES.md` are generated from them in spirit, not in code — update the table.
 
 Then: a `PEERS` entry in `bin/bridge-sync` (rules file, header, skills dir) if the CLI reads user-level instructions;
-`DISABLED` in `core.py` is where a machine switches a peer off. Tests go through a stub executable: a shell script named
-like the binary, put first on `PATH`, that records its argv and prints a canned result in the CLI's real output format
-— see `tests/test_copilot.py` and `tests/test_cursor_deny.py`. Cover: read-only flags for `ask`, the git denies for
-`write`, `parse` on a real captured transcript, and one failure path (non-zero exit, quota message).
+`DISABLED` in `core.py` is where a machine switches a peer off; the family name in `boardlib.FAMILIES` so a board
+`request` can address it as a turn.
+
+**Conformance.** `tests/test_adapter_conformance.py` runs every adapter in `ADAPTERS` through the same checks against
+the stub CLIs in `tests/fakebin/` (one executable per binary, driven by `FAKEBIN_*` variables — see
+`tests/fakebin/_fakebin.py`): the flags per mode in the CLI's own syntax, `--add-dir` / `-M` / `--session` / `-c`
+pass-through, `parse` on the fixture, and the whole run through `ask-agent` — the `[bridge]` line, argv identical to
+`--dry-run`, the peer's environment, a crash, a quota message (exit 7, fail-fast, `--ignore-quota`), a timeout that
+kills the process group, an ask-back (exit 5), the version probe. A new family needs three things there, and the suite
+names the one that is missing: `tests/fakebin/<binary>` (copy a neighbour), `tests/fakebin/fixtures/<binary>.jsonl` (the
+CLI's machine-readable output for one run, with the canned answer `_fakebin.ANSWER` in it), and one row in `EXPECT`
+(the read-only and write flags, how a git command is denied or which config entries are held, a quota line, how the
+resume / model / add-dir options look). Keep family-specific behaviour out of the suite itself — it goes in the row.

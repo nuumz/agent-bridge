@@ -322,4 +322,6 @@ family answers), and budget headers. A transport that adds them is a new `v`, or
 
 Another implementation (a new transport, a script in another language) is conformant when it passes the vectors and
 the requirements of §10.1. To add a vendor: an adapter class (CONTRIBUTING.md), its family name in `boardlib.FAMILIES`
-so turns can address it, and a vector per new behaviour. The envelope itself does not change.
+so turns can address it, its stub and fixture under `tests/fakebin/` with a row in the `EXPECT` table of
+`tests/test_adapter_conformance.py` (the adapter conformance kit: the same spawn / parse / failure-path suite every
+family passes), and a vector per new behaviour. The envelope itself does not change.

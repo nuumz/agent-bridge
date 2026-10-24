@@ -26,8 +26,8 @@ Also landed 2026-10-24, outside the borrowed list: **the message protocol as a s
 (identities, envelope, header lines, kinds, request lifecycle, topics, markers, what a transport must enforce),
 `protocol/envelope.schema.json`, `protocol/vectors.json`, `bridge-board read --json`, and `tests/test_protocol.py`
 holding spec, schema and board to each other. It is the first of four steps toward a protocol a fourth vendor can
-implement without reading SHARED-RULES.md: next the adapter conformance kit (#11), then a fourth family through it,
-then an A2A transport (#16) when a cross-machine peer exists.
+implement without reading SHARED-RULES.md; the adapter conformance kit (#11) is the second, landed the same day. Next a
+fourth family through the kit, then an A2A transport (#16) when a cross-machine peer exists.
 
 ## Next (M) — cheaper, safer runs
 
@@ -38,7 +38,7 @@ then an A2A transport (#16) when a cross-machine peer exists.
 | 8 | **Stall supervisor** in panel/work: per-peer log mtime; past the threshold send one nudge on the thread, then mark the role `stalled` in `status.json` and continue | Gas Town witness, agent-of-empires status detection | one quiet peer blocks the whole run until timeout |
 | 9 | **Stance per role and vendor-blind cross-examination**: `--stance role=for\|against\|neutral` (default neutral); the leader sees answers without vendor names and must justify every departure from them in a "raw answers vs. synthesis" section | PAL `consensus`, llm-council [#3](https://github.com/karpathy/llm-council/issues/3) | same-family sycophancy; chairman over-influence |
 | 10 | **Advisory path leases on the board**: `board_lease paths[] ttl exclusive reason`; `bridge-work` checks them before writing; expired leases are swept, never force-broken | mcp_agent_mail, Paperclip execution lock | two peers editing one file in parallel runs |
-| 11 | **Adapter conformance kit**: `tests/fakebin/{claude,cursor-agent,copilot}` stubs that record argv and replay captured real output; one parametrised suite (spawn, parse, timeout, non-zero exit, `--add-dir` pass-through, deny flags per mode) every adapter must pass; version probe per CLI with a clear "unknown version" note | vibe-kanban `qa_mock.rs`, rulesync CONTRIBUTING checklist | adding a CLI, and finding out about a renamed flag from a run log |
+| 11 | ✅ 2026-10-24 **Adapter conformance kit**: `tests/fakebin/{claude,cursor-agent,copilot}` stubs that record argv and replay the CLIs' output shapes (`FAKEBIN_*` scripts a failure); one parametrised suite (`tests/test_adapter_conformance.py`: spawn, parse, timeout kill of the process group, non-zero exit, quota, ask-back, `--add-dir`/`-M`/session pass-through, read-only vs write flags per mode, config hold) every adapter in `ADAPTERS` must pass, with one `EXPECT` row per family; `--list` says `unknown version` when a `--version` probe yields nothing. Its first run found the Cursor hold crashing on a HOME without `~/.cursor/` | vibe-kanban `qa_mock.rs`, rulesync CONTRIBUTING checklist | adding a CLI, and finding out about a renamed flag from a run log |
 | 12 | **Opt-in review gate** as a Claude Code `Stop` hook: a read-only review by another vendor of the uncommitted diff, blocking the stop on severity ≥ HIGH, with a round cap and a usage warning | codex-plugin-cc `--enable-review-gate` | "review from blank context" done by hand |
 
 ## Later (M–L) — reach

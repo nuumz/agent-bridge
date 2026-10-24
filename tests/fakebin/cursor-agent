@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""Stub `cursor-agent` for tests — see _fakebin.py."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _fakebin  # noqa: E402
+
+raise SystemExit(_fakebin.main("cursor-agent"))
