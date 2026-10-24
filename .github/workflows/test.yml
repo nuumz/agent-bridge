@@ -24,3 +24,5 @@ jobs:
           done
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+      - name: Tests left the runner's HOME alone (AGENTS.md — runtime state is never read or written by tests)
+        run: test ! -e ~/.agent-bridge

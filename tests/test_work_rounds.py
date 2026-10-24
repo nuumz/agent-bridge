@@ -10,6 +10,7 @@ from pathlib import Path
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 sys.path.insert(0, str(BIN))
+from bridgelib import ledger  # noqa: E402
 
 
 def _load():
@@ -101,6 +102,7 @@ class Loop(unittest.TestCase):
             with mock.patch.object(w, "WORK", Path(d) / "work"), mock.patch.object(w, "ask_with_fallback", ask), \
                     mock.patch.object(w, "verify", verify), mock.patch.object(w, "close_threads", lambda n: None), \
                     mock.patch.object(w, "touched", lambda wt, b: ["src/x.py"]), \
+                    mock.patch.object(ledger, "LEDGER", Path(d) / "ledger.jsonl"), \
                     mock.patch("sys.stderr"), mock.patch("sys.stdout"):
                 w.run(o)
             rounds_json = (Path(d) / "work" / "w" / "rounds.json").read_text()

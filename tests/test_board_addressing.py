@@ -18,6 +18,7 @@ sys.path.insert(0, str(BIN))
 
 import boardlib  # noqa: E402
 import importlib.machinery  # noqa: E402
+from bridgelib import ledger  # noqa: E402
 import importlib.util  # noqa: E402
 
 USER, PRIMARY, CURSOR, COPILOT = "user:tester", "claude@primary", "cursor#41", "copilot#42"
@@ -41,6 +42,7 @@ class Board(unittest.TestCase):
         self.board_dir = Path(self.tmp.name) / ".agent-bridge" / "state" / "board"
         self.patches = [mock.patch.object(boardlib, "BOARD_DIR", self.board_dir),
                         mock.patch.object(boardlib, "DB_PATH", self.board_dir / "board.db"),
+                        mock.patch.object(ledger, "LEDGER", self.board_dir / "ledger.jsonl"),   # _score_reply logs here
                         mock.patch.dict(os.environ, {"HOME": self.tmp.name, "USER": "tester"})]
         for p in self.patches:
             p.start()
