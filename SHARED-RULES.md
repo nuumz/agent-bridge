@@ -16,6 +16,7 @@ Owner-facing docs are in English; user-facing replies follow each agent's own la
 | Cursor Agent | `cursor-agent` | `ask-cursor` | Second opinion from another model family (the bridge starts it on `auto`; `-M` picks a model), isolated worktree runs |
 | Copilot CLI | `copilot` (`@github/copilot`) | `ask-copilot` | Bounded analysis/review, targeted implementation and improvements via `bridge-work`, GitHub-native tasks |
 | Codex CLI | `codex` (`@openai/codex`) | `ask-codex` | A third model family for a second opinion; sandboxed read-only analysis (`codex exec --sandbox read-only`, no network); not yet verified on a real CLI (§2) |
+| A2A remote | `bridge-a2a` (the bridge's own client, to any Agent2Agent server — another bridge, or anything that serves an agent card) | `ask-agent a2a` | An agent on another machine: a second bridge's peers, or a non-bridge A2A agent; its own rails apply there (`docs/PROTOCOL.md` §10.4, SECURITY.md) |
 
 `ask-agent --list` shows which peers are installed and logged in (version column: what `--version` says, or
 `unknown version` when it says nothing). The four `ask-*` commands are thin wrappers around `ask-agent <peer>`; every
@@ -25,7 +26,7 @@ peer reads the same machine-wide rules (§5) and the same per-repo rules (`AGENT
 ## 2. Bridge command
 
 ```bash
-ask-agent <claude|cursor|copilot|codex> [-d dir] [-m ask|plan|write] [-M model] [-t sec] [-w [name]]
+ask-agent <claude|cursor|copilot|codex|a2a> [-d dir] [-m ask|plan|write] [-M model] [-t sec] [-w [name]]
           [--add-dir p]... [--deny tool]... [-c | --session id] [--json] [--dry-run] [--ignore-quota] "<prompt>"
 ask-agent --list
 ```
@@ -87,6 +88,17 @@ Flags and event shapes were taken from codex-rs `exec/src/cli.rs`, `utils/cli/sr
 run against a real `codex` binary has been made yet** — the first one should confirm `resume <id>` after the exec-level
 flags, the `-c mcp_servers.*` overrides (documented TOML parsing, undocumented for `mcp_servers.*.command`) and that
 `--json` output is the stream above, then update this paragraph.
+
+**A2A (remote).** `ask-agent a2a` runs `bridge-a2a send --url $AGENT_BRIDGE_A2A_URL --mode <mode> --timeout <t-5>
+[--model M] [--add-dir D] [--context <id>|last] -- <prompt>`: the bridge's own client fetches the remote agent card,
+sends one `message/send` and polls `tasks/get` until a terminal state, printing JSON Lines (`card`, `task` per state,
+`result`) that the adapter parses — `result.text` is the answer, `result.context_id` the session (`--session` /
+`--conv` continue that context; `-c` continues the last one used for that URL), a state other than `completed` is
+the error line (`[a2a] <state>: <the peer's message>` on stderr, so a usage-limit message there marks the quota like
+the others). The token is read from `AGENT_BRIDGE_A2A_TOKEN` only, never passed on a command line, and never appears in
+`--dry-run` or a run log. No deny flag and no hold: the bridge sends text, a mode and a shape — the remote's own rails
+apply. `-w` is not supported; `--add-dir` is a hint the remote may ignore. The server side (`bridge-a2a serve`) is in
+§6 and `docs/PROTOCOL.md` §10.4; verified end to end in `tests/test_a2a.py` against the real binary on loopback.
 
 **Copilot workspace bootstrap.** Each prompt names its resolved cwd, nearest git root (including a worktree's
 `.git` file), existing `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` / `.github/copilot-instructions.md` files from root
@@ -261,6 +273,11 @@ CLI spawns its own stdio server, so there is no daemon. Verified 2026-09-12 with
 lines, kinds, addressing, the request lifecycle, topics, body markers, what a transport must enforce — with a JSON
 Schema and test vectors under `docs/protocol/` (`tests/test_protocol.py` holds spec, schema and board to each other);
 `bridge-board read <topic> --json` prints a topic as one envelope per line. This section stays the operational view.
+**Across machines:** `bridge-a2a serve` (off by default; loopback unless `--bind`; one bearer token per client,
+`bridge-a2a client add <name>`) lets a remote A2A agent post on the board as `a2a:<name>`, leader of its own topic
+`a2a:<name>` only: its `message/send` is a `request` there addressed to a family from the operator's `--peers`, i.e. a
+turn that waits for a human's `dispatch`; it reads and withdraws its own requests and nothing else. The mapping is
+`docs/PROTOCOL.md` §10.4; `to=a2a` on this board is a turn to the remote agent of `AGENT_BRIDGE_A2A_URL`.
 
 - Tools: `board_status`, `board_post`, `board_read`, `board_wait` (long-poll ≤120 s, 8 waits per session — a refused call
   does not count), `board_open`, `board_join`, `board_leave`, `board_close`, `board_task_add`, `board_task_claim`,
@@ -360,7 +377,10 @@ whatever its env says.
   bin/ask-agent       the bridge (python3); one adapter per peer CLI
   bin/ask-claude      = ask-agent claude        bin/ask-cursor  = ask-agent cursor
   bin/ask-copilot     = ask-agent copilot       bin/ask-codex   = ask-agent codex
-  bin/bridgelib/      the pieces of ask-agent: core.py (paths, quota mark, helpers) · adapters.py (Claude/Cursor/Copilot/Codex)
+  bin/bridge-a2a      A2A transport: `serve` (the bridge as an Agent2Agent agent over HTTP, loopback + bearer tokens),
+                      `send` (the client `ask-agent a2a` runs), `client add|list|remove`, `card`, `stop`, `status`
+  bin/bridgelib/      the pieces of ask-agent: core.py (paths, quota mark, helpers) · adapters.py (Claude/Cursor/Copilot/Codex/A2A)
+                      · a2a.py (the A2A ↔ board mapping, server handler and client)
                       · runner.py (process group + timeout, board registration, threads, execute) · grill.py (grill-plan
                       recommend/card section for bridge-plan) · protocol.py (the message envelope of docs/PROTOCOL.md:
                       export + schema check); bridge-sync imports the peer table from here
@@ -388,6 +408,7 @@ whatever its env says.
   work/<name>/        one folder per bridge-work / bridge-fix run (report.md, rounds.json, agreement.md)
   conv/<name>/        multi-turn threads (transcript + peer session ids)
   live/<peer>/        bridge-live broker state and stream
+  a2a/                clients.json (bearer tokens, 0600) · server.json (the running server) · last-context.json · server.log
   board/              board.db (+ dispatch/ logs)
   mirror/             user-rules.md (canonical stripped rules) · agent-bridge.md (protocol note for peers)
   quota/              per-peer exhausted-plan marks

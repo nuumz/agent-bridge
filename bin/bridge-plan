@@ -272,7 +272,7 @@ def citations() -> dict[str, int]:
         if not root.is_dir():
             continue
         r = subprocess.run(["rg", "-o", "-I", "--no-heading", "-g", "*.md",
-                            r"peer review:\s*(panel\s+[\w.-]+|claude|cursor|copilot|codex|ask-\w+)", str(root)],
+                            r"peer review:\s*(panel\s+[\w.-]+|claude|cursor|copilot|codex|a2a|ask-\w+)", str(root)],
                            capture_output=True, text=True)
         for line in r.stdout.splitlines():
             key = re.sub(r"^peer review:\s*", "", line.strip())
@@ -412,7 +412,7 @@ def role_of(r: dict) -> str | None:
     conv, panel = r.get("conv") or "", r.get("panel")
     if not panel or not conv.startswith(f"panel-{panel}-"):
         return None
-    return re.sub(r"-(claude|cursor|copilot|codex)$", "", conv[len(f"panel-{panel}-"):])
+    return re.sub(r"-(claude|cursor|copilot|codex|a2a)$", "", conv[len(f"panel-{panel}-"):])
 
 
 def mark(o) -> int:

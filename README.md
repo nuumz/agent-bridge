@@ -14,7 +14,7 @@ is not a new runtime.
 > How it compares with other multi-agent tools: [docs/landscape.md](docs/landscape.md).
 > Changing the code: [CONTRIBUTING.md](CONTRIBUTING.md) (agents: [AGENTS.md](AGENTS.md)).
 
-- `ask-agent claude|cursor|copilot|codex` — one command, one set of options (mode, model, dir, session, worktree, timeout)
+- `ask-agent claude|cursor|copilot|codex|a2a` — one command, one set of options (mode, model, dir, session, worktree, timeout)
   mapped onto each CLI's own flags; the answer comes back as text plus a `[bridge]` line (session id, tokens, log path).
 - `bridge-panel` — a leader plus role peers (root-cause, contract-checker, design-critic, …) answer in parallel,
   cross-examine each other's citations, and the leader writes one report.
@@ -175,6 +175,26 @@ API duration, reported premium usage and tool failures; missing historical value
 the CLI's reported value, not a dollar estimate or a quality score. Use `bridge-plan mark <run-log> --kept N --rejected M`
 after verifying analysis findings, and the work report's verify/review results for implementation quality.
 
+### Across machines (A2A)
+
+The bridge can be one [A2A](https://a2a-protocol.org) agent and can call one. Nothing runs by itself: an inbound task
+becomes a request on the board, addressed to a family you allowed, and waits until you run `bridge-board dispatch`.
+
+```bash
+# on the machine that answers
+bridge-a2a client add laptop          # prints a bearer token once — give it to the other side
+bridge-a2a serve --peers claude,cursor -d ~/src/myrepo        # loopback only; reach it through an SSH tunnel
+bridge-board dispatch --agents claude,cursor                  # runs what arrived, like any queued turn
+
+# on the machine that asks
+export AGENT_BRIDGE_A2A_URL=http://127.0.0.1:8411 AGENT_BRIDGE_A2A_TOKEN=…   # the tunnel's local end
+ask-agent a2a -d ~/src/myrepo "Review src/payment/ for retry bugs. Answer as file:line findings."
+```
+
+A client sees only its own topic, never chooses the directory, and gets `write` only if the server was started with
+`--allow-write`. The protocol mapping is in [docs/PROTOCOL.md](docs/PROTOCOL.md) §10.4, the network surface in
+[SECURITY.md](SECURITY.md).
+
 ## Commands
 
 | Command | Purpose |
@@ -189,6 +209,7 @@ after verifying analysis findings, and the work report's verify/review results f
 | `bridge-live` | persistent Claude peers that talk over the board |
 | `bridge-watch` | live view of every bridged run |
 | `bridge-sync` | mirror rules, skills, subagents and the board MCP into every peer |
+| `bridge-a2a` | across machines: `serve` the bridge as an A2A agent (off by default, loopback + bearer tokens); `send` a task to any A2A agent, which is what `ask-agent a2a` runs |
 
 Every command takes `--help`.
 

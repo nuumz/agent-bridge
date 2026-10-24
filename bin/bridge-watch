@@ -124,6 +124,16 @@ def render(peer: str, d: dict) -> tuple[str, str] | None:
         if t in ("turn.failed", "error"):
             return "error", one_line((d.get("error") or {}).get("message") or d.get("message", ""), 160)
         return None
+    if peer == "a2a":                                     # `bridge-a2a send`: card · task per state · result
+        if t == "card":
+            return "init", f"agent={d.get('agent', '?')} url={d.get('url', '')}"
+        if t == "task":
+            return "tool", f"{d.get('state', '?')} {d.get('id', '')}"
+        if t == "result":
+            return ("done" if d.get("state") == "completed" else "error"), one_line(f"{d.get('state')} {d.get('text', '')}", 160)
+        if t == "error":
+            return "error", one_line(d.get("message", ""), 160)
+        return None
     return None
 
 

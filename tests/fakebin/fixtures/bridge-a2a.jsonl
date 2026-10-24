@@ -1,0 +1,5 @@
+{"type":"card","agent":"agent-bridge@workstation","url":"http://127.0.0.1:8411","protocolVersion":"0.3.0"}
+{"type":"task","id":"a2a:alice/3","context_id":"a2a:alice","state":"submitted"}
+{"type":"task","id":"a2a:alice/3","context_id":"a2a:alice","state":"working"}
+{"type":"task","id":"a2a:alice/3","context_id":"a2a:alice","state":"completed"}
+{"type":"result","state":"completed","text":"The retry loop in src/retry.py:12 never backs off, and src/retry.py:30 swallows the timeout.","task_id":"a2a:alice/3","context_id":"a2a:alice","agent":"agent-bridge@workstation","url":"http://127.0.0.1:8411"}

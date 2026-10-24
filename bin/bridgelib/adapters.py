@@ -671,4 +671,62 @@ class Codex(Adapter):
                       u.get("output_tokens", "?"), is_error, extra, metrics)
 
 
-ADAPTERS: dict[str, Adapter] = {a.name: a for a in (Claude(), Cursor(), Copilot(), Codex())}
+class A2A(Adapter):
+    """A remote agent that speaks A2A (Agent2Agent over JSON-RPC/HTTP), reached through `bridge-a2a send`: one
+    message/send, then tasks/get until a terminal state, as JSON Lines. The bridge sends text, a mode and a shape —
+    never a credential, a path grant or a command — so the remote's own rails are the rails (SECURITY.md). URL from
+    AGENT_BRIDGE_A2A_URL, token from AGENT_BRIDGE_A2A_TOKEN (environment only, never argv); docs/PROTOCOL.md §10.4."""
+    name, binary = "a2a", "bridge-a2a"
+    rules_mirror = "none — the remote agent keeps its own rules"
+    URL_VAR, TOKEN_VAR = "AGENT_BRIDGE_A2A_URL", "AGENT_BRIDGE_A2A_TOKEN"
+
+    def resolve(self):
+        own = ROOT / "bin" / self.binary
+        return find_bin(self.binary) or (str(own) if own.is_file() else None)
+
+    def auth_hint(self):
+        url = os.environ.get(self.URL_VAR)
+        return f"url={url or f'NONE (set {self.URL_VAR})'} token={'set' if os.environ.get(self.TOKEN_VAR) else 'NONE'}"
+
+    def _base(self, o):
+        a = ["send", "--url", os.environ.get(self.URL_VAR, ""), "--mode", o.mode,
+             "--timeout", str(max(int(getattr(o, "timeout", 900)) - 5, 5))]   # the client gives up before the kill
+        if o.model:
+            a += ["--model", o.model]
+        for d in o.add_dir:
+            a += ["--add-dir", d]
+        return a
+
+    def argv(self, o, prompt):
+        a = self._base(o)
+        if o.session:
+            a += ["--context", o.session]
+        elif o.cont:
+            a += ["--context", "last"]
+        return a + ["--", prompt]
+
+    def resume_argv(self, o, session, prompt):
+        return self._base(o) + ["--context", session, "--", prompt]
+
+    def parse(self, raw):
+        events = []
+        for line in raw.splitlines():
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(d, dict) and d.get("type"):
+                events.append(d)
+        res = next((e for e in reversed(events) if e.get("type") == "result"), None)
+        if res is None:
+            err = next((e.get("message", "") for e in reversed(events) if e.get("type") == "error"), "")
+            return Parsed(err or "A2A stream incomplete: no result event.", is_error=True)
+        state, text = res.get("state", "?"), res.get("text") or ""
+        extra = f"task={res.get('task_id', '?')} state={state} agent={res.get('agent', '?')}"
+        if state != "completed":
+            text = f"A2A task {state}" + (f": {text}" if text else "")
+        return Parsed(text or "(the remote agent returned no text)", res.get("context_id"), "?", "?",
+                      state != "completed" or not res.get("text"), extra)
+
+
+ADAPTERS: dict[str, Adapter] = {a.name: a for a in (Claude(), Cursor(), Copilot(), Codex(), A2A())}

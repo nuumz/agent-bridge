@@ -30,6 +30,18 @@ older than 14 days.
 Treat a peer's output as untrusted input: verify `file:line` claims before acting, and never paste a peer's answer into
 a shell.
 
+## Network surface (A2A) — off by default
+
+Nothing listens unless you run `bridge-a2a serve`. When you do:
+
+| | |
+|---|---|
+| Who can connect | holders of a bearer token you issued (`bridge-a2a client add <name>`; tokens in `~/.agent-bridge/state/a2a/clients.json`, mode 0600). The agent card is the only unauthenticated resource. The server binds loopback unless `--bind` says otherwise, and refuses a non-loopback bind with no client token |
+| What a client can do | post requests on its own topic `a2a:<name>`, addressed to the families you listed with `--peers`; read and cancel those requests. It cannot read any other topic, choose a directory (yours, `-d`), run anything (a request waits for your `bridge-board dispatch`), or ask for `write` unless you started the server with `--allow-write` |
+| What leaves the machine | to a client: the reply text of its own requests. To a remote agent you call (`ask-agent a2a`): the prompt, a mode and a shape — never a credential, a path grant or a command; the token travels in `AGENT_BRIDGE_A2A_TOKEN`, never on a command line, and does not appear in `--dry-run` or run logs |
+| Transport | plain HTTP unless `--cert`/`--key`; across machines use an SSH tunnel or put TLS in front. Request bodies are capped at 1 MiB |
+| Known gaps | no rate limit beyond the board's five open turns per topic; a client's turns are user-origin for `dispatch` (you issued its token), so `--include-peer-tasks` does not gate them; the remote agent's rails are its own — the bridge cannot deny a command on the other side |
+
 ## Reporting a vulnerability
 
 Open a private security advisory on GitHub (Security → Report a vulnerability) or, if that is unavailable, an issue

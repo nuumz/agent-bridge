@@ -25,7 +25,7 @@ guess.
 
 | Term | Meaning |
 |---|---|
-| **family** | one vendor CLI as the bridge drives it: `claude`, `cursor`, `copilot`, `codex` (the `ADAPTERS` registry; `boardlib.FAMILIES` for turns). A family name is lowercase ASCII letters |
+| **family** | one vendor CLI as the bridge drives it: `claude`, `cursor`, `copilot`, `codex`, and `a2a` for the remote agent of §10.4 (the `ADAPTERS` registry; `boardlib.FAMILIES` for turns). A family name is lowercase ASCII letters and digits |
 | **peer** | an agent of a family started by the bridge for one job (an `ask-agent` run, a dispatched turn, a live peer). A peer is always *inside* the bridge: hop guard on, no spawning |
 | **primary** | the interactive session of a family the user is typing into (`<family>@primary`). It may spend peer runs; a peer may not |
 | **user** | the human at the machine, `user:<name>`. The only author of a `decision`; the one every *card* is addressed to |
@@ -48,6 +48,7 @@ An identity is resolved by the transport, never taken from what the author claim
 | `<family>:task<N>` | the run `bridge-board dispatch` started for task N (a turn) | as a run; the only identity a family-addressed request reaches |
 | `<family>@live:<peer>` | a persistent `bridge-live` peer | as a run |
 | `<family>@hop` | a bridged run that *claimed* a user or primary identity through its environment: the claim is downgraded to this | as a run |
+| `a2a:<client>` | a remote agent the operator gave a bearer token to (`bridge-a2a client add <client>`), speaking A2A (§10.4) | leads its own topic `a2a:<client>` and nothing else: posts requests there (turns to the families the operator allowed), reads and withdraws them |
 | `board` | the transport itself (`kind=task` log rows) | writes only `task` rows |
 | `<slug>` (lowercase, digits, dashes) | a script on the user's side speaking for itself (`bridge-board post --as bridge-fix`) | posts as itself; never `decision`, never inside a bridged run |
 
@@ -218,6 +219,7 @@ Any non-empty string. Reserved prefixes and who opens them:
 | `panel:<name>`, `conv:panel-<name>-<role>` | `bridge-panel` | a panel's plan and report; one thread per role |
 | `live:<room>` | `bridge-live` | a room of persistent peers; the caller leads |
 | `fix:<name>` | `bridge-fix` | the decision card of a fix flow |
+| `a2a:<client>` | `bridge-a2a serve`, for an authenticated remote client, which leads it | the client's thread: every A2A task it sends is one request there (§10.4) |
 | `dm:<a>+<b>` | either side (sorted by the transport; `+` because identities carry `:`) | a 1:1 thread with exactly those two as members. A peer may open one only with the user or with an agent it already shares a topic with |
 | `room:<name>` | the user or a primary, who becomes its leader | a group thread |
 | anything else | the user or a primary | a plain topic; a peer may not open topics |
@@ -305,8 +307,41 @@ reply as `<family>#<pid>` `answer`), so a direct exchange is readable on the boa
 
 ### 10.3 Not in v1
 
-Cross-machine transport, message signatures, capability discovery (an agent card saying which shapes and modes a
-family answers), and budget headers. A transport that adds them is a new `v`, or new optional fields with vectors.
+Message signatures, per-family capability discovery (which shapes and modes a family answers) and budget headers. A
+transport that adds them is a new `v`, or new optional fields with vectors. Reach across machines exists as the A2A
+transport below, which carries the envelope unchanged.
+
+### 10.4 A2A transport (`bridge-a2a`)
+
+The bridge is reachable as one [A2A](https://a2a-protocol.org) agent (Agent2Agent, JSON-RPC 2.0 over HTTP), and can
+send a task to any A2A agent. Nothing in the envelope changes: an A2A task *is* one board request, and the A2A
+client is an identity of §2. The server is started by the operator (`bridge-a2a serve`, like `bridge-live start`),
+listens on loopback unless told otherwise, and is needed for nothing local.
+
+| A2A | Board |
+|---|---|
+| a client with a bearer token (`bridge-a2a client add <name>`) | identity `a2a:<name>`, leader of its own topic `a2a:<name>` (created on first use) |
+| `message/send` — text parts, `metadata.to` (a family the operator allowed with `--peers`), `metadata.mode` (`ask` default, `plan`, `write` only under `--allow-write`), `metadata.shape` | one `request` on that topic, `to` = the family (a turn: a task queued for it), header lines `shape:`, `mode:`, `dir:` (the operator's `--dir`, never the client's), `message-id:` |
+| Task `id` / `contextId` | `<topic>/<seq>` / the topic |
+| `submitted` · `working` | the queued task · the task claimed by a dispatch |
+| `completed` (artifact = the reply text) · `failed` (status message = the `blocked` body or the task's failure) | the closing `answer`/`done` · `blocked` from a run of that family (§6.2), or a board task that ended without a reply |
+| `canceled` | the requester's own closing reply (`tasks/cancel` posts it), which cancels the queued task |
+| `tasks/get` | the request, its board task and its replies, read as the client only (another client's task is `TaskNotFound`) |
+| `configuration.blocking` | the server polls the board up to `--max-block` seconds before answering |
+| not offered: `message/stream`, push notifications (`capabilities` says so; `UnsupportedOperation` / `PushNotificationNotSupported`) | the board has no push channel either; polling is the model |
+
+What the server enforces, on every request: the token (the card is the only unauthenticated resource); one topic
+per client, so a client never reads or closes another's requests; the operator's family list as the egress gate;
+the operator's directory; the peer task cap of §6.5 (a client's turns are peer-origin for the cap, user-origin for
+dispatch, since the operator issued the token); and the rule that **nothing on the board spawns anything** — a
+remote task waits in `submitted` until a human runs `bridge-board dispatch`.
+
+Outbound, `bridge-a2a send` (what `ask-agent a2a` runs through the `a2a` adapter) fetches the remote card, sends one
+`message/send` and polls `tasks/get` until a terminal state, printing JSON Lines — `card`, `task` per state change,
+`result` — so the adapter's `parse()` and a human read one stream. The remote URL comes from `AGENT_BRIDGE_A2A_URL`
+and the token from `AGENT_BRIDGE_A2A_TOKEN`, environment only, never a command line. The bridge sends text, a mode
+and a shape; no credential, no path grant, no command — the remote agent's own rails are the rails, and a request
+`to=a2a` on the board is a turn to that remote like any other family.
 
 ## 11. Conformance
 
