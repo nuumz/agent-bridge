@@ -1,4 +1,5 @@
-"""tests/fakebin — stand-ins for the peer CLIs (`claude`, `cursor-agent`, `copilot`) that tests put first on PATH.
+"""tests/fakebin — stand-ins for the peer CLIs (`claude`, `cursor-agent`, `copilot`, `codex`) that tests put first on
+PATH.
 
 Each stub is the CLI's name beside this file and does two things: it records how it was called, and it replays its
 CLI's machine-readable output from `fixtures/<binary>.jsonl` (the event shapes the adapters' `parse()` were verified
@@ -28,7 +29,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ANSWER = "The retry loop in src/retry.py:12 never backs off, and src/retry.py:30 swallows the timeout."
-VERSIONS = {"claude": "2.1.275 (Claude Code)", "cursor-agent": "2025.10.17-a1b2c3d", "copilot": "1.0.88"}
+VERSIONS = {"claude": "2.1.275 (Claude Code)", "cursor-agent": "2025.10.17-a1b2c3d", "copilot": "1.0.88",
+            "codex": "codex-cli 0.63.0"}
 ENV_PREFIXES = ("AGENT_BRIDGE_", "CLAUDE_CODE_", "CLAUDECODE", "CLAUDE_SESSION_")
 
 

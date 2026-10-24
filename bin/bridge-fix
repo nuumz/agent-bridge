@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """bridge-fix — analyze → decision → fix, as one resumable flow with the decision left to a human.
 
-    bridge-fix run <name> -d <repo> -p claude[,cursor,copilot] [-r roles] [--files <globs>] [--verify "<cmd>"]
+    bridge-fix run <name> -d <repo> -p claude[,cursor,copilot,codex] [-r roles] [--files <globs>] [--verify "<cmd>"]
                   [--rounds 2] [-t 420] "<problem: symptom · expected vs actual · files involved>"
     bridge-fix decide <name> (--answer "1=B" ... | --go) [--files <globs>] [--verify "<cmd>"] [--note "..."] [--no-fix]
     bridge-fix status <name> | show <name> | list
@@ -197,6 +197,41 @@ Panel `{fl['panel']}` ({fl['peers']}; report: {fl['report']}). {patch_verdict}
     return f
 
 
+RULING_LINE = re.compile(r"^- (\d+)\. (.*?) → \*\*(.*)\*\*( \(options: .*)$")   # the template write_agreement emits
+
+
+def ruling_start(lines: list[str]) -> int:
+    """Index of the `## Ruling` heading; only lines after it are the human's — Root cause / Next actions above it
+    may carry the same `- N. … → **x**` shape and must never be rewritten."""
+    return next((i for i, ln in enumerate(lines) if ln.startswith("## Ruling")), len(lines))
+
+
+def gate_error(files: str, verify: str, proposed: str) -> str | None:
+    if not files or not verify or "TODO" in files or "TODO" in verify:
+        return (f"the fix needs a file set and a verify command — pass --files and --verify "
+                f"(proposed files: {proposed or 'none'})")
+    return None
+
+
+def with_gates(lines: list[str], files: str, verify: str) -> list[str]:
+    """The Ruling section's two gate lines set to `files` / `verify` (in memory; the caller writes)."""
+    for idx in range(ruling_start(lines), len(lines)):
+        if lines[idx].startswith("- files the fix may touch:"):
+            lines[idx] = f"- files the fix may touch: {files}"
+        elif lines[idx].startswith("- verify command"):
+            lines[idx] = f"- verify command (must fail now, pass after): {verify}"
+    return lines
+
+
+def set_gates(fl: dict, files: str, verify: str) -> None:
+    """The file set and verify command the fix runs with: on the flow, and on the agreement's Ruling lines when it
+    exists — `decide` and a resumed `run --files/--verify` both end here, so the two never disagree."""
+    fl["files"], fl["verify"] = files, verify
+    f = Path(fl["agreement"]) if fl.get("agreement") else None
+    if f and f.is_file():
+        f.write_text("\n".join(with_gates(f.read_text().splitlines(), files, verify)) + "\n")
+
+
 def decide_card(fl: dict) -> None:
     f = fl["agreement"]
     print(f"\n[fix] DECISION NEEDED — the flow stops here until a human rules.\n"
@@ -246,6 +281,7 @@ def close_card(fl: dict, ruling: str) -> None:
     board("post", t, f"ruled by {fl.get('decided_by', 'user')}: {ruling}", "-k", "done", "--to", "*",
           "--reply-to", str(fl["card_seq"]))
     board("close", t)
+    fl["card_closed"] = True                     # the caller saves the flow
 
 
 def decide(o) -> int:
@@ -267,33 +303,34 @@ def decide(o) -> int:
         if not m:
             print(f"bridge-fix decide: --answer must look like '1=B', got {a!r}", file=sys.stderr)
             return 2
-        answers[int(m.group(1))] = m.group(2).strip()
+        answers[int(m.group(1))] = m.group(2).strip().replace("**", "")   # bold would nest inside the ruling marker
     n_q = len(fl.get("questions", []))
     for i in range(1, n_q + 1):
         if i not in answers and not o.go:
             print(f"bridge-fix decide: question {i} has no --answer (use --go to take the recommendations)", file=sys.stderr)
             return 2
+    if any(i > n_q for i in answers):
+        print(f"bridge-fix decide: the Ruling section has {n_q} question(s) — --answer {max(answers)} names none",
+              file=sys.stderr)
+        return 2
     lines = text.splitlines()
-    for idx, ln in enumerate(lines):
-        m = re.match(r"^- (\d+)\. (.*) → \*\*TODO\*\*(.*)$", ln)
+    for idx in range(ruling_start(lines), len(lines)):
+        # `**TODO**` on the first ruling; an earlier ruling when the human rules again after a failed fix — the
+        # agreement is what the implementer reads, so the new ruling must land here, not only in flow.json
+        m = RULING_LINE.match(lines[idx])
         if m:
             i = int(m.group(1))
             ruling = answers.get(i) or "GO — the panel's recommendation as written"
-            lines[idx] = f"- {i}. {m.group(2)} → **{ruling}**{m.group(3)}"
-    files = o.files or fl.get("proposed_files") or ""
-    verify = o.verify or fl.get("verify") or ""
-    if not files or not verify or "TODO" in files or "TODO" in verify:
-        print(f"bridge-fix decide: the fix needs a file set and a verify command — pass --files and --verify "
-              f"(proposed files: {fl.get('proposed_files') or 'none'})", file=sys.stderr)
-        return 2
-    for idx, ln in enumerate(lines):
-        if ln.startswith("- files the fix may touch:"):
-            lines[idx] = f"- files the fix may touch: {files}"
-        elif ln.startswith("- verify command"):
-            lines[idx] = f"- verify command (must fail now, pass after): {verify}"
-        elif ln.startswith("- note:") and o.note:
+            lines[idx] = f"- {i}. {m.group(2)} → **{ruling}**{m.group(4)}"
+        elif lines[idx].startswith("- note:") and o.note:
             lines[idx] = f"- note: {o.note}"
-    text = "\n".join(lines) + "\n"
+    files = o.files or fl.get("files") or fl.get("proposed_files") or ""
+    verify = o.verify or fl.get("verify") or ""
+    if err := gate_error(files, verify, fl.get("proposed_files") or ""):
+        print(f"bridge-fix decide: {err}", file=sys.stderr)
+        return 2
+    text = "\n".join(with_gates(lines, files, verify)) + "\n"
+    # every check runs on the text in memory: a refusal leaves agreement and flow.json as they were, in step
     ruling = text.split("## Ruling", 1)[-1] if "## Ruling" in text else text
     todos = grill_plan.open_field_todos(ruling)
     err, warn = grill_plan.gate_before_run(text)
@@ -302,22 +339,30 @@ def decide(o) -> int:
     if err:
         print(f"bridge-fix decide: {err} — edit the Grill plan on the agreement, then re-run decide",
               file=sys.stderr)
-        f.write_text(text)
         return 2
     if todos:
         print("bridge-fix decide: a TODO survived in the Ruling section — edit the agreement, then re-run decide",
               file=sys.stderr)
         for t in todos:
             print("  " + t[:120], file=sys.stderr)
-        f.write_text(text)
         return 2
     f.write_text(text)
-    fl.update({"stage": "fix", "files": files, "verify": verify, "ruling": answers or "GO", "decided_at": time.strftime("%Y-%m-%d %H:%M"),
-               "decided_by": os.environ.get("USER", "user")})
+    again = fl["stage"] == "fix"                 # ruling anew after a failed fix
+    if again:
+        fl.pop("work_rc", None)                  # the failed attempt's outcome belongs to the earlier ruling
+        fl.pop("work_report", None)
+    fl.update({"stage": "fix", "files": files, "verify": verify, "ruling": answers or "GO",
+               "decided_at": time.strftime("%Y-%m-%d %H:%M"), "decided_by": os.environ.get("USER", "user")})
     save(fl)
-    print(f"[fix] ruling recorded in {f}", file=sys.stderr)
-    close_card(fl, "GO — every recommendation as written" if not answers else
-               "; ".join(f"{i}={a}" for i, a in sorted(answers.items())))
+    print(f"[fix] ruling {'replaced' if again else 'recorded'} in {f}", file=sys.stderr)
+    ruling = "GO — every recommendation as written" if not answers else \
+        "; ".join(f"{i}={a}" for i, a in sorted(answers.items()))
+    if again and fl.get("card_closed"):
+        print(f"[fix] the board card was closed at the first ruling; the new one ({ruling}) is in the agreement",
+              file=sys.stderr)
+    else:
+        close_card(fl, ruling)
+        save(fl)
     if o.no_fix:
         return 0
     return fix(fl, o)
@@ -331,15 +376,19 @@ def fix(fl: dict, o) -> int:
     sketch = ""
     if patch and "accepts this diff" in patch.splitlines()[0]:
         sketch = "\n\nPatch sketch from the analysis (accepted by `git apply --check` at analysis time — use it as guidance, re-read the files first):\n" + patch[:12000]
+    earlier = ("\n\nAn earlier attempt under a previous ruling is still in this worktree (same branch). It is not the "
+               "ruling: re-read the files, keep what the Ruling section still asks for, discard what contradicts it."
+               if fl.get("attempts") else "")
     task = (f"Fix the defect below exactly as ruled in the agreement (Ruling section = what the human chose; the panel's "
-            f"recommendation is NOT the ruling where they differ).\n\nProblem:\n{fl['problem']}\n\n{agreement}{sketch}")
+            f"recommendation is NOT the ruling where they differ).\n\nProblem:\n{fl['problem']}\n\n{agreement}{sketch}"
+            f"{earlier}")
     argv = [str(BIN / "bridge-work"), "run", f"fix-{fl['name']}", "-d", fl["repo"], "-p", fl["peers"], "--files", fl["files"],
             "--verify", fl["verify"], "--rounds", str(getattr(o, "rounds", 2) or 2), "-t", str(max(getattr(o, "timeout", 420) or 420, 600)), task]
     share_add_dirs(fl.get("add_dirs", []))
     print(f"[fix] fix: bridge-work run fix-{fl['name']} (files {fl['files']}; verify `{fl['verify']}`)", file=sys.stderr)
     rc = stream_filtered(argv, ("[work]",))
     report = WORK / f"fix-{fl['name']}" / "report.md"
-    fl.update({"stage": "done" if rc == 0 else "fix", "work_rc": rc,
+    fl.update({"stage": "done" if rc == 0 else "fix", "work_rc": rc, "attempts": fl.get("attempts", 0) + 1,
                "work_report": str(report) if report.is_file() else None})
     save(fl)
     try:
@@ -373,6 +422,13 @@ def run(o) -> int:
         save(fl)
     else:
         print(f"[fix] resuming {o.name} at stage {fl['stage']}", file=sys.stderr)
+        if (o.files or o.verify) and fl["stage"] != "done":
+            files, verify = o.files or fl.get("files") or "", o.verify or fl.get("verify") or ""
+            if fl["stage"] == "fix" and (err := gate_error(files, verify, fl.get("proposed_files") or "")):
+                print(f"bridge-fix run: {err}", file=sys.stderr)
+                return 2
+            set_gates(fl, files, verify)
+            save(fl)
         if o.add_dir:
             fl["add_dirs"] = [*fl.get("add_dirs", []), *(d for d in add_dirs_from_env() if d not in fl.get("add_dirs", []))]
             save(fl)

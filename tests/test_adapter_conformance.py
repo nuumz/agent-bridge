@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -44,9 +45,10 @@ def present(argv: list[str], item) -> bool:
 
 # What each family's CLI must be told, in that CLI's own syntax. `modes`: per bridge mode what must be present and
 # what must not (board off); `board_ask`: the same for -m ask with the board on; `git_deny(cmd)`: how the CLI is
-# told to deny a git command (None: the family has no deny flag and holds the deny in its own config — `hold` says
-# which entries each mode must hold, as the stub observes them during the run); `quota`: a line the CLI prints when
-# the plan is exhausted (must match core.QUOTA_RE); `prompt_flag`: the argument right before the prompt.
+# told to deny a git command (None: the family has no deny flag — then `hold` says which entries of its own config
+# each mode must hold, as the stub observes them during the run, or `no_commit` names the mechanism, e.g. a sandbox);
+# `quota`: a line the CLI prints when the plan is exhausted (must match core.QUOTA_RE); `prompt_flag`: the argument
+# right before the prompt.
 EXPECT = {
     "claude": dict(
         output=("--output-format", "stream-json"), prompt_flag="--",
@@ -82,6 +84,21 @@ EXPECT = {
         add_dir=lambda d: f"--add-dir={d}", model=lambda m: f"--model={m}",
         resume=lambda s: f"--resume={s}", cont="--continue",
         quota="You have exceeded your monthly quota of premium requests.",
+    ),
+    "codex": dict(
+        output=("exec", "--json"), prompt_flag="--",
+        modes={"ask": dict(has=[("--sandbox", "read-only"), "--skip-git-repo-check"],
+                           not_=[("--sandbox", "workspace-write"), "--dangerously-bypass-approvals-and-sandbox"]),
+               "plan": dict(has=[("--sandbox", "read-only")], not_=[("--sandbox", "workspace-write")]),
+               "write": dict(has=[("--sandbox", "workspace-write")],
+                             not_=[("--sandbox", "read-only"), "--dangerously-bypass-approvals-and-sandbox"])},
+        board_ask=dict(has=[("--sandbox", "read-only"), ("-c", 'mcp_servers.bridge_board.args=["serve"]')],
+                       not_=[("--sandbox", "workspace-write")]),
+        git_deny=None, hold=None,
+        no_commit="no deny flag: the workspace-write sandbox keeps .git/ read-only, so a commit cannot land",
+        add_dir=lambda d: ("--add-dir", d), model=lambda m: ("--model", m),
+        resume=lambda s: ("resume", s), cont=("resume", "--last"),
+        quota="You've hit your usage limit. Try again in 3 hours.",
     ),
 }
 
@@ -177,8 +194,10 @@ class Conformance(unittest.TestCase):
                 for cmd in core.GIT_DISCARD:            # the caller's checkout: their uncommitted work stays
                     self.assertTrue(present(argv, x["git_deny"](cmd)), (cmd, argv))
             if not agent.supports_deny:
-                self.assertIsNone(x["git_deny"], "a family without a deny flag declares a hold instead")
-                self.assertTrue(x["hold"], "…and the hold must be declared")
+                self.assertIsNone(x["git_deny"], "a family without a deny flag declares a hold or a sandbox instead")
+                self.assertTrue(x["hold"] or x.get("no_commit"),
+                                "…and the row says how a commit is prevented: `hold` (config entries the stub "
+                                "observes) or `no_commit` (the mechanism, e.g. a sandbox)")
 
     @per_family
     def test_board_on_ask_keeps_the_run_read_only_and_reaches_the_board(self, name, agent, x):
@@ -290,7 +309,8 @@ class Conformance(unittest.TestCase):
     def test_list_probes_the_binary_and_its_version(self, name, agent, x):
         row = self.list_row(name)
         self.assertIn(str(self.bindir / agent.binary), row)
-        self.assertIn(_fakebin.VERSIONS[agent.binary].split()[0], row)
+        version = re.search(r"\d+\.\d+[\w.\-]*", _fakebin.VERSIONS[agent.binary]).group(0)   # what the probe extracts
+        self.assertIn(version, row)
         self.assertIn("unknown version", self.list_row(name, FAKEBIN_VERSION="none"))
 
 

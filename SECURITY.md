@@ -2,7 +2,7 @@
 
 ## What leaves the machine
 
-agent-bridge runs the coding-agent CLIs you already have (`claude`, `cursor-agent`, `copilot`). Every bridged call sends
+agent-bridge runs the coding-agent CLIs you already have (`claude`, `cursor-agent`, `copilot`, `codex`). Every bridged call sends
 the prompt, the preamble the bridge adds, and **every file the peer decides to read** to that peer's vendor, under your
 own login and plan. The bridge adds no telemetry, no network calls of its own, and no API keys.
 
@@ -21,9 +21,9 @@ older than 14 days.
 
 | Rail | Enforced by | Known gap |
 |---|---|---|
-| Read-only by default | each CLI's own permission / deny mechanism (`--permission-mode`, deny lists) | Cursor honours only its global deny list, which the bridge holds temporarily; an unrestricted shell can still write through an interpreter |
-| No `git commit` / `push` / `tag` | Claude and Copilot: their deny lists. Cursor: a write run holds `Shell(git commit)`/`push`/`tag` in the global deny for its duration | the Cursor hold is the global `~/.cursor/cli-config.json`, so it is only as reliable as the restore on exit; `bridge-work` reports the branch against its base SHA, so a stray commit is visible. A `-m write` Claude run may `git add` |
-| Your uncommitted work survives a write run in your checkout | `git restore` / `checkout` / `switch` / `stash` / `reset` / `clean` (and the `git -C` / `-c` / `--git-dir` / `--work-tree` option forms) denied on every peer outside a bridge-owned worktree (`-w`, branch `bridge/<name>`) | denies match a command prefix only: a pre-approved runner (`make`, `npm run`, `npx`, `pytest` on Claude) or an unrestricted shell (Cursor) can still reach the verbs through a script it writes; the peer can overwrite a file it is allowed to edit; the Cursor hold is machine-global for the run |
+| Read-only by default | each CLI's own permission / deny mechanism (`--permission-mode`, deny lists); Codex: `--sandbox read-only` (no file writes, no network) | Cursor honours only its global deny list, which the bridge holds temporarily; an unrestricted shell can still write through an interpreter. The Codex sandbox is the CLI's own (Seatbelt / Landlock) and has not been exercised through the bridge yet |
+| No `git commit` / `push` / `tag` | Claude and Copilot: their deny lists. Cursor: a write run holds `Shell(git commit)`/`push`/`tag` in the global deny for its duration. Codex: no deny list — its `workspace-write` sandbox keeps `<root>/.git` read-only and has no network, so a commit or push cannot land | the Cursor hold is the global `~/.cursor/cli-config.json`, so it is only as reliable as the restore on exit; `bridge-work` reports the branch against its base SHA, so a stray commit is visible. A `-m write` Claude run may `git add`. For Codex the rail is the sandbox's `.git` protection alone, plus the prompt |
+| Your uncommitted work survives a write run in your checkout | `git restore` / `checkout` / `switch` / `stash` / `reset` / `clean` (and the `git -C` / `-c` / `--git-dir` / `--work-tree` option forms) denied on every peer outside a bridge-owned worktree (`-w`, branch `bridge/<name>`) | denies match a command prefix only: a pre-approved runner (`make`, `npm run`, `npx`, `pytest` on Claude) or an unrestricted shell (Cursor) can still reach the verbs through a script it writes; the peer can overwrite a file it is allowed to edit; the Cursor hold is machine-global for the run. **Codex has no deny flag at all**: these verbs are prompt-only there (they write to the working tree, which `workspace-write` allows), so prefer `-w`-style isolation (`git worktree add` + `-d`) for a Codex write run in a dirty checkout |
 | One hop | `AGENT_BRIDGE_HOP` in the peer's environment; every command that spawns a peer refuses under it | a peer could `unset` it in a shell it is allowed to run |
 | Isolated writes | `bridge-work` / `bridge-fix` write in a git worktree on branch `bridge/<name>` | the worktree shares the repository's hooks and untracked ignores |
 

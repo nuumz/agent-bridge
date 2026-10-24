@@ -30,7 +30,7 @@
       "enum": ["note", "question", "answer", "decision", "task", "system", "request", "handoff", "done", "blocked"]
     },
     "to": {
-      "description": "Whom it is for: null or * = everyone in the topic; @<role> = the members holding that role; an identity; a bare family name (claude, cursor, copilot) on a request = a turn for a peer that is not running.",
+      "description": "Whom it is for: null or * = everyone in the topic; @<role> = the members holding that role; an identity; a bare family name (claude, cursor, copilot, codex) on a request = a turn for a peer that is not running.",
       "anyOf": [
         {"type": "null"},
         {"const": "*"},

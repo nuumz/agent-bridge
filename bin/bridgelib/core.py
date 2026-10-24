@@ -225,7 +225,7 @@ GIT_DENY = ("git commit", "git push", "git tag")
 GIT_DISCARD = ("git restore", "git checkout", "git switch", "git stash", "git reset", "git clean",
                # every deny below is a command prefix, and these option forms put the verb after the prefix
                "git -C", "git -c", "git --git-dir", "git --work-tree")
-BRIDGE_CMDS = ("ask-agent", "ask-claude", "ask-cursor", "ask-copilot")
+BRIDGE_CMDS = ("ask-agent", "ask-claude", "ask-cursor", "ask-copilot", "ask-codex")
 # peers switched off on this machine (reason shown by --list and on any attempt); delete the entry to re-enable
 DISABLED: dict[str, str] = {}
 # A peer that reports an exhausted plan/quota is marked here for QUOTA_TTL seconds; every later run of that peer fails
@@ -233,7 +233,7 @@ DISABLED: dict[str, str] = {}
 QUOTA_DIR = STATE / "quota"
 QUOTA_TTL = 30 * 60
 QUOTA_RE = re.compile(r"out of usage|exceeded your (?:monthly )?quota|Increase limits for faster responses|"
-                      r"usage limit reached|rate.?limit(?:ed| exceeded)|insufficient[_ ]quota", re.I)
+                      r"usage limit reached|hit your usage limit|rate.?limit(?:ed| exceeded)|insufficient[_ ]quota", re.I)
 # Read-only bridged Claude: headless `-p` cannot ask for permission, so anything outside the settings allow-list is denied
 # and the peer burns turns looking for another way in (measured 2026-09-26: 449 denials in 194 runs, median 33 turns vs 1).
 # These are auto-approved for -m ask/plan; edits stay denied by --disallowed-tools.

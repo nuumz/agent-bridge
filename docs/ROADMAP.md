@@ -26,8 +26,13 @@ Also landed 2026-10-24, outside the borrowed list: **the message protocol as a s
 (identities, envelope, header lines, kinds, request lifecycle, topics, markers, what a transport must enforce),
 `protocol/envelope.schema.json`, `protocol/vectors.json`, `bridge-board read --json`, and `tests/test_protocol.py`
 holding spec, schema and board to each other. It is the first of four steps toward a protocol a fourth vendor can
-implement without reading SHARED-RULES.md; the adapter conformance kit (#11) is the second, landed the same day. Next a
-fourth family through the kit, then an A2A transport (#16) when a cross-machine peer exists.
+implement without reading SHARED-RULES.md; the adapter conformance kit (#11) is the second, landed the same day; the
+third — a fourth family through the kit — landed the same day too: **Codex CLI** (`ask-codex`, `codex exec --json`
+with the read-only / workspace-write sandboxes as the rails, the board MCP as `-c` overrides on the run, `codex` in
+`boardlib.FAMILIES` for turns), written from the codex-rs sources and passing the kit; the first run against a real
+`codex` binary is still owed (SHARED-RULES §2 says what it must confirm). Left: an A2A transport (#16) when a
+cross-machine peer exists, and `bridge-sync` targets for Codex (`~/.codex/AGENTS.md` mirror, `codex mcp add` for the
+board) once the adapter is verified.
 
 ## Next (M) — cheaper, safer runs
 
