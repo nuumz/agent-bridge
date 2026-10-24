@@ -125,11 +125,29 @@ class Claude(Adapter):
         if obj is None:
             return Parsed(raw)
         u = obj.get("usage") or {}
-        # turns × the context each turn re-sends, and what the run newly pulled into context (cache_write), drive cost
+        # turns × the context each turn re-sends, and what the run newly pulled into context (cache_write), drive cost;
+        # tool calls (the `tool_use` blocks of the assistant events) say how much the run actually did
         return Parsed(str(obj.get("result", raw)), obj.get("session_id"), u.get("input_tokens", "?"),
                       u.get("output_tokens", "?"), bool(obj.get("is_error")),
                       f"cost={obj.get('total_cost_usd', '?')} turns={obj.get('num_turns', '?')} "
-                      f"cache_write={u.get('cache_creation_input_tokens', '?')}")
+                      f"cache_write={u.get('cache_creation_input_tokens', '?')} tools={tool_calls(raw)}")
+
+
+def tool_calls(raw: str) -> int:
+    """Number of tool_use blocks in a stream-json transcript (0 for a plain JSON result)."""
+    n = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{") or '"tool_use"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "assistant":
+            content = (ev.get("message") or {}).get("content") or []
+            n += sum(1 for b in content if isinstance(b, dict) and b.get("type") == "tool_use")
+    return n
 
 
 class Cursor(Adapter):

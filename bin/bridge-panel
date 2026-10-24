@@ -40,6 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger  # noqa: E402
+from bridgelib.evidence import cite_score, citation_table, low_evidence, verify_citations  # noqa: E402
 from bridgelib.core import (BOARD_PROTOCOL, PEER_TALK_RULE, ROOT, STATE, detach, guarded_rc, hop_active,  # noqa: E402
                             lang_rule)
 
@@ -52,7 +53,6 @@ DEFAULT_ROLES = ["root-cause", "contract-checker", "design-critic", "spec-reader
 MAX_SHARE = 6000     # chars of one finding shown to another worker / the leader
 MAX_CASE = 14000     # chars of the shared case file
 MAX_FILE_LINES = 260  # lines quoted per file in the case file
-CITE_RE = re.compile(r"`?([\w./-]+\.[A-Za-z0-9]+):(\d+)(?:-(\d+))?`?")
 
 
 def load_roles() -> dict[str, dict]:
@@ -179,74 +179,6 @@ def case_file(workspace: str, problem: str) -> tuple[str, list[str]]:
             "numbers so another role can check you.\n\n" + "\n\n".join(parts)), names
 
 
-def resolve_cited(root: Path, rel: str) -> tuple[Path | None, str]:
-    """A role may cite `cutoff.py:10` for `app/cutoff.py`; resolve by basename before calling a citation broken."""
-    direct = root / rel
-    if direct.is_file():
-        return direct, rel
-    hits = [f for f in root.rglob(Path(rel).name) if f.is_file() and ".git" not in f.parts][:5]
-    if len(hits) == 1:
-        return hits[0], str(hits[0].relative_to(root))
-    if len(hits) > 1:
-        return None, f"AMBIGUOUS ({len(hits)} files named {Path(rel).name})"
-    return None, "NO SUCH FILE"
-
-
-def verify_citations(workspace: str, texts: dict[str, str]) -> list[dict]:
-    """Check every `path:line` a role wrote against the workspace — the shared, model-free fact base."""
-    root = Path(workspace)
-    out: dict[tuple[str, int], dict] = {}
-    seen: dict[str, tuple[Path | None, str]] = {}
-    for role, text in texts.items():
-        for m in CITE_RE.finditer(text or ""):
-            rel, start = m.group(1).lstrip("./"), int(m.group(2))
-            if rel not in seen:
-                seen[rel] = resolve_cited(root, rel)
-            f, resolved = seen[rel]
-            # key on the RESOLVED path: `cutoff.py:4` and `app/cutoff.py:4` are one line, so the shared record
-            # must show one row (two rows read as two pieces of evidence for the same claim)
-            key = (resolved if f else rel, start)
-            rec = out.setdefault(key, {"cite": f"{resolved if f else rel}:{start}", "roles": [], "as_written": set(),
-                                       "status": "", "text": ""})
-            rec["as_written"].add(rel)
-            if role not in rec["roles"]:
-                rec["roles"].append(role)
-            if rec["status"]:
-                continue
-            if f is None:
-                rec["status"] = resolved
-                continue
-            try:
-                lines = f.read_text(errors="replace").splitlines()
-            except OSError:
-                rec["status"] = "UNREADABLE"
-                continue
-            if not 1 <= start <= len(lines):
-                rec["status"] = f"OUT OF RANGE (file has {len(lines)} lines)"
-                continue
-            rec["text"] = lines[start - 1].strip()[:160]
-            rec["status"] = "ok" if rec["text"] else "BLANK LINE (wrong anchor?)"
-    rows = []
-    for rec in out.values():
-        short = sorted(w for w in rec.pop("as_written") if not rec["cite"].startswith(w))
-        if short:
-            rec["cite"] += f"  (written as {', '.join(short)})"
-        rows.append(rec)
-    return sorted(rows, key=lambda r: (r["status"] == "ok", r["cite"]))
-
-
-def citation_table(rows: list[dict]) -> str:
-    if not rows:
-        return ""
-    bad = [r for r in rows if r["status"] != "ok"]
-    head = ("## Verified citations — checked against the files, not by a model\n\n"
-            f"{len(rows)} distinct citations, {len(bad)} that do not resolve.\n\n"
-            "| citation | cited by | line on disk / problem |\n|---|---|---|\n")
-    body = "".join(f"| `{r['cite']}` | {', '.join(r['roles'])} | "
-                   f"{'`' + r['text'] + '`' if r['status'] == 'ok' else '**' + r['status'] + '**'} |\n" for r in rows)
-    return head + body
-
-
 def tree_state(d: str) -> str:
     """`git status --porcelain` of the workspace ('' when not a git repo) — workers are read-only by contract."""
     r = subprocess.run(["git", "-C", d, "status", "--porcelain", "--untracked-files=all"], capture_output=True, text=True)
@@ -309,7 +241,16 @@ def cross_prompt(name: str, role: dict, others: dict[str, str], directed: list[s
             + PEER_TALK_RULE + " " + BOARD_PROTOCOL)
 
 
-def synth_prompt(name: str, problem: str, findings: dict[str, str], cross: dict[str, str], cites: str = "") -> str:
+def low_evidence_line(low: dict[str, tuple[int, int]] | None) -> str:
+    """One line naming the roles whose citations mostly failed to resolve — the leader weighs them down, not out."""
+    if not low:
+        return ""
+    return ("Low-evidence roles (most of their citations did not resolve — weigh their claims as UNVERIFIED unless "
+            "another role's citation holds): " + ", ".join(f"{r} ({ok}/{t} ok)" for r, (ok, t) in low.items()) + ".")
+
+
+def synth_prompt(name: str, problem: str, findings: dict[str, str], cross: dict[str, str], cites: str = "",
+                 low: dict[str, tuple[int, int]] | None = None) -> str:
     body = "\n\n".join(f"### {r} — finding\n{findings[r][:MAX_SHARE]}\n\n### {r} — cross-examination\n"
                        f"{cross.get(r, '(none)')[:MAX_SHARE]}" for r in findings)
     agreed = [r for r in findings if "[[AGREE]]" in (cross.get(r) or "")]
@@ -317,7 +258,7 @@ def synth_prompt(name: str, problem: str, findings: dict[str, str], cross: dict[
               f"{', '.join(r for r in findings if r not in agreed) or 'none'}.\n") if cross else ""
     return (f"Panel `{name}` — synthesis. Problem:\n\n{problem}\n\nAnswers:\n\n{body}\n{ledger}\n{cites}\n"
             "The citation table above was produced by checking the files, not by a model: a claim resting on a citation "
-            "that does not resolve is UNVERIFIED no matter how many roles repeated it.\n\n"
+            "that does not resolve is UNVERIFIED no matter how many roles repeated it. " + low_evidence_line(low) + "\n\n"
             + lang_rule(problem) + " "
             "Write the report in the reply body with exactly these headings: "
             "## Root cause (ranked; each with the citing role and file:line, and whether the panel agreed) · "
@@ -503,13 +444,17 @@ def run(o) -> int:
         cites = verify_citations(o.dir, {**findings, **{f"{r} (cross)": t for r, t in cross.items()}})
         (out / "citations.json").write_text(json.dumps(cites, ensure_ascii=False, indent=2))
         cite_md = citation_table(cites)
+    low = low_evidence(cites, list(findings))
+    if low:
+        print(f"[panel] low-evidence roles: {low_evidence_line(low)}", file=sys.stderr)
     print(f"[panel] synthesis with {leader_peer} …", file=sys.stderr)
-    rc, report = ask(leader_peer, f"panel-{o.name}-leader", synth_prompt(o.name, o.problem, findings, cross, cite_md), o)
+    rc, report = ask(leader_peer, f"panel-{o.name}-leader",
+                     synth_prompt(o.name, o.problem, findings, cross, cite_md, low), o)
     if rc not in (0, 5):
         print(f"[panel] ABORT — synthesis failed ({report[:200]}); findings/cross are saved — "
               f"`bridge-panel synth {o.name} -p {leader_peer} -d {o.dir}` re-runs just this step", file=sys.stderr)
         (out / "report.md").unlink(missing_ok=True)
-        ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start)
+        ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start, cites)
         return 4
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     roles_line = ", ".join(f"{r} ({used[r]})" if used.get(r) and used[r] != roles[r]["peer"] else r for r in findings)
@@ -528,6 +473,8 @@ def run(o) -> int:
     if needs_input:
         head += "> Roles that asked back (exit 5) — answer in their thread and re-run:\n" + "".join(
             f"> - {r}: `ask-agent {roles[r]['peer']} --conv panel-{o.name}-{r} \"<answer>\"`\n" for r in needs_input) + "\n"
+    if low:
+        head += f"> {low_evidence_line(low)}\n\n"
     (out / "report.md").write_text(head + report + ("\n\n" + cite_md if cite_md else "") + "\n")
     if o.fix and "implementer" in roles and roles["implementer"].get("peer") in peers:
         imp = roles["implementer"]
@@ -539,18 +486,21 @@ def run(o) -> int:
         print(f"[panel] {verdict.strip()}", file=sys.stderr)
         print(f"[panel] patch={out / 'patch.md'}", file=sys.stderr)
     post(topic, f"Report written: {out / 'report.md'}\n\n" + report[:3000])
-    ledger_row(o, kind, findings, used, fallbacks, failed, 0, t_start)
+    ledger_row(o, kind, findings, used, fallbacks, failed, 0, t_start, cites)
     close_panel_topics(o.name, chosen)
     print(head + report)
     print(f"\n[panel] report={out / 'report.md'} board={topic} threads=panel-{o.name}-*", file=sys.stderr)
     return 0
 
 
-def ledger_row(o, kind: str, findings: dict, used: dict, fallbacks: dict, failed: dict, rc: int, t_start: float) -> None:
+def ledger_row(o, kind: str, findings: dict, used: dict, fallbacks: dict, failed: dict, rc: int, t_start: float,
+               cites: list[dict] | None = None) -> None:
     try:
         ledger.record({"type": "panel", "name": o.name, "kind": kind, "peers": o.peers, "roles": list(findings),
                        "answered": used, "fallbacks": list(fallbacks), "failed": list(failed), "rc": rc,
                        "fix": bool(o.fix), "cross": not o.no_cross, "agreement": bool(o.agreement),
+                       "citations": {r: list(cite_score(cites or [], r)) for r in findings},
+                       "low_evidence": sorted(low_evidence(cites or [], list(findings))),
                        "duration_s": round(time.time() - t_start)})
     except Exception:  # noqa: BLE001 — the ledger must never break a panel
         pass
@@ -669,10 +619,12 @@ def synth(o) -> int:
     cites = verify_citations(o.dir, {**findings, **{f"{r} (cross)": t for r, t in cross.items()}})
     (out / "citations.json").write_text(json.dumps(cites, ensure_ascii=False, indent=2))
     cite_md = citation_table(cites)
+    low = low_evidence(cites, list(findings))
     print(f"[panel] re-synthesising `{o.name}` from {len(findings)} saved findings …", file=sys.stderr)
-    rc, report = ask(o.leader, f"panel-{o.name}-leader", synth_prompt(o.name, problem, findings, cross, cite_md), o)
+    rc, report = ask(o.leader, f"panel-{o.name}-leader", synth_prompt(o.name, problem, findings, cross, cite_md, low), o)
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    head = f"# Panel `{o.name}` — re-synthesised {stamp}\n\nLeader: {o.leader} · roles: {', '.join(findings)}\n\n"
+    head = (f"# Panel `{o.name}` — re-synthesised {stamp}\n\nLeader: {o.leader} · roles: {', '.join(findings)}\n\n"
+            + (f"> {low_evidence_line(low)}\n\n" if low else ""))
     (out / "report.md").write_text(head + report + ("\n\n" + cite_md if cite_md else "") + "\n")
     print(head + report)
     if rc in (0, 5):                      # the run's abort left its threads open for exactly this re-synthesis

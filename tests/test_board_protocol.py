@@ -123,7 +123,7 @@ class Cards(Board):
         r = boardlib.post(self.conn, tid, CURSOR, "shape: list\n\ncallers?", "request", to="*")
         boardlib.post(self.conn, tid, USER, "keep it short", "decision", reply_to=r)    # steering is not an answer
         self.assertEqual(boardlib.open_requests_to(self.conn, tid, COPILOT), 1)
-        boardlib.post(self.conn, tid, COPILOT, "a, b", "answer", reply_to=r)
+        boardlib.post(self.conn, tid, COPILOT, "- a\n- b", "answer", reply_to=r)
         self.assertEqual(boardlib.open_requests_to(self.conn, tid, COPILOT), 0)
 
     def test_blocked_needs_what_is_missing(self):
@@ -242,6 +242,10 @@ class Live(Board):
         self.assertEqual(live.send_targets(self.conn, tid, "@design-critic", live_ids), {a})
         self.assertEqual(live.send_targets(self.conn, tid, b, live_ids), {b})
         self.assertEqual(live.send_targets(self.conn, tid, "claude@live:zz", live_ids), set())
+        item = live.retry_item({"seq": 3, "to": b, "last": 5}, a, "incomplete: the request asks for `table`")
+        self.assertEqual((item["author"], item["kind"], item["to"], item["seq"]), ("board", "system", a, 5))
+        self.assertEqual(item["retry_of"], {"seq": 3, "to": b, "last": 5})
+        self.assertIn("asks for `table`", live.label(item))
         lab = live.label({"kind": "request", "author": USER, "seq": 7, "body": "shape: x", "to": "@design-critic"})
         self.assertEqual(lab.splitlines()[0], "[user:tester · request · seq 7 → @design-critic]")
         self.assertIn(core.BOARD_PROTOCOL, live.intro("a", "r", ""))

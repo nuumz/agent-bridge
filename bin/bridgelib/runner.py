@@ -16,6 +16,7 @@ from typing import Any
 
 import boardlib
 
+from . import evidence
 from .adapters import Adapter, Parsed
 from .core import (BOARD_PROTOCOL, STATE, HOP_VAR, IDENTITY_VAR, QUOTA_TTL, RUNS, TASK_VAR, err_summary, peer_env,
                    quota_block, quota_clear, quota_hit, quota_mark)
@@ -230,19 +231,28 @@ def execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | N
             cost = re.search(r"cost=([\d.]+)", extra)
             turns = re.search(r"turns=(\d+)", extra)
             cache_write = re.search(r"cache_write=(\d+)", extra)
+            tools = re.search(r"tools=(\d+)", extra)
             session = parsed.session if parsed else None
             cost_session = float(cost.group(1)) if cost else None   # cumulative when the run resumed a session
+            # the evidence the answer carries: how many of its file:line citations resolve in the workspace
+            cites = (evidence.verify_citations(o.dir, {"run": parsed.result})
+                     if parsed and parsed.result and getattr(o, "dir", None) and Path(o.dir).is_dir() else [])
             ledger.record({"type": "run", "peer": agent.name, "mode": o.mode,
                            "kind": getattr(o, "kind", "") or (ranked[0][0] if ranked else "other"),
                            "panel": panel.group(1) if panel else None, "conv": getattr(o, "conv", "") or None,
                            "rc": rc, "duration_s": round(time.time() - t0),
                            "session": session, "cost_session": cost_session,
                            "cost": ledger.run_cost(session, cost_session, t0),
+                           "tokens_in": parsed.tok_in if parsed and isinstance(parsed.tok_in, int) else None,
                            "tokens_out": parsed.tok_out if parsed and isinstance(parsed.tok_out, int) else None,
                            "turns": int(turns.group(1)) if turns else None,
                            "cache_write": int(cache_write.group(1)) if cache_write else None,
                            "log": str(log) if log else None,
-                           **(parsed.metrics if parsed else {})})
+                           **(parsed.metrics if parsed else {}),      # Copilot: tool_calls, failures, denials, premium
+                           "tool_calls": (int(tools.group(1)) if tools else      # Claude: counted from the transcript
+                                          (parsed.metrics.get("tool_calls") if parsed else None)),
+                           "citations_ok": sum(1 for c in cites if c["status"] == "ok"), "citations_total": len(cites),
+                           "asked_back": bool(parsed and ASK_RE.search(parsed.result or ""))})
         except Exception:  # noqa: BLE001 — the ledger must never break a run
             pass
 
