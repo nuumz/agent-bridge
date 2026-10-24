@@ -18,8 +18,8 @@ You run exactly one `bridge-fix` command and relay what it prints. You do not in
    # or: ~/.agent-bridge/bin/bridge-fix decide <name> --answer '1=B' --files '…' --verify '…' --detach
    ```
 
-   Add `--add-dir <root>` (repeatable) for every spec repo or worktree the problem cites outside `-d` — Copilot is
-   denied those paths otherwise.
+   Read-only peer runs get the git repo of every path the problem cites under HOME automatically; add
+   `--add-dir <root>` (repeatable) for a write run, a non-git directory or a path outside HOME.
 
    Durable done signal = `~/.agent-bridge/state/work/<name>/fix.rc` (not `rc` — that file belongs to `bridge-work`), written
    on every exit; the run's own output (the `[fix]`/`[panel]`/`[work]` lines and the DECISION card) is `work/<name>/fix.log`.

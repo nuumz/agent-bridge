@@ -317,3 +317,63 @@ class SharedExtraRoots(unittest.TestCase):
         from bridgelib import core
         with mock.patch.dict(os.environ, {}, clear=False), self.assertRaises(SystemExit):
             core.share_add_dirs(["/nonexistent/agent-bridge-root"])
+
+
+class CitedRoots(unittest.TestCase):
+    """A read-only run may read the git repo of any path its prompt cites under HOME — without the caller remembering --add-dir."""
+
+    def setUp(self):
+        import subprocess
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name).resolve()
+        for repo in ("code", "spec"):
+            subprocess.run(["git", "init", "-q", str(self.home / repo)], check=True)
+        (self.home / "spec" / "docs").mkdir()
+        (self.home / "spec" / "docs" / "design.md").write_text("x")
+        (self.home / "loose").mkdir()
+        (self.home / "loose" / "notes.md").write_text("x")
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_only_git_roots_outside_the_workspace_and_under_home_are_granted(self):
+        from bridgelib import core
+        text = (f"see {self.home}/spec/docs/design.md:12, also `{self.home}/spec/docs/missing.md` and "
+                f"{self.home}/code/src/A.java:3 plus {self.home}/loose/notes.md and /etc/hosts.")
+        with mock.patch.object(core, "HOME", self.home):
+            self.assertEqual(core.cited_roots(text, str(self.home / "code"), []), [str(self.home / "spec")])
+            self.assertEqual(core.cited_roots(text, str(self.home / "code"), [str(self.home / "spec")]), [])
+
+    def test_quoted_path_with_spaces_is_one_path(self):
+        import subprocess
+        from bridgelib import core
+        subprocess.run(["git", "init", "-q", str(self.home / "My Specs")], check=True)
+        (self.home / "My Specs" / "a.md").write_text("x")
+        with mock.patch.object(core, "HOME", self.home):
+            for quote in ('"', "'", "`"):
+                self.assertEqual(core.cited_roots(f"read {quote}{self.home}/My Specs/a.md{quote}:3", str(self.home / "code"), []),
+                                 [str(self.home / "My Specs")])
+
+    def test_bridge_state_grants_one_run_folder_not_the_ledger(self):
+        from bridgelib import core
+        state = self.home / ".agent-bridge" / "state"
+        (state / "panel" / "p1").mkdir(parents=True)
+        (state / "panel" / "p1" / "agreement.md").write_text("x")
+        (state / "ledger.jsonl").write_text("{}")
+        text = f"{state}/panel/p1/agreement.md and {state}/ledger.jsonl and {self.home}/.agent-bridge/SHARED-RULES.md"
+        with mock.patch.object(core, "HOME", self.home), mock.patch.object(core, "STATE", state):
+            self.assertEqual(core.cited_roots(text, str(self.home / "code"), []), [str(state / "panel" / "p1")])
+
+    def test_ask_agent_grants_cited_roots_in_read_modes_only(self):
+        import os
+        import subprocess
+        from bridgelib import core
+        env = {k: v for k, v in os.environ.items() if k not in (core.HOP_VAR, core.ADD_DIRS_VAR)}
+        env["HOME"] = str(self.home)
+        prompt = f"check {self.home}/spec/docs/design.md:4 against the code"
+        argv = {}
+        for mode in ("ask", "write"):
+            out = subprocess.run([str(Path(__file__).resolve().parents[1] / "bin" / "ask-agent"), "copilot", "-m", mode,
+                                  "--dry-run", "-d", str(self.home / "code"), prompt],
+                                 capture_output=True, text=True, env=env)
+            argv[mode] = json.loads(out.stdout)["argv"]
+        self.assertIn(f"--add-dir={self.home / 'spec'}", argv["ask"])
+        self.assertNotIn(f"--add-dir={self.home / 'spec'}", argv["write"])

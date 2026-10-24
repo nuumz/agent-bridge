@@ -19,8 +19,8 @@ You run exactly one `bridge-work run` and relay its report. You do not investiga
        "$(cat "$SCRATCH/task.txt")"
    ```
 
-   Add `--add-dir <root>` (repeatable) for every spec repo or worktree the problem cites outside `-d` — Copilot is
-   denied those paths otherwise.
+   Read-only peer runs get the git repo of every path the problem cites under HOME automatically; add
+   `--add-dir <root>` (repeatable) for a write run, a non-git directory or a path outside HOME.
 
    Durable done signal = `~/.agent-bridge/state/work/<name>/rc`; the run's own output is `work/<name>/run.log` (bridge-work writes it on every exit and clears a prior `report.md` when a new
    implement run actually starts). Do not treat an old `report.md` alone as done.

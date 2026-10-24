@@ -21,8 +21,8 @@ You run exactly one panel and relay its output. You do not investigate, add find
        "$(cat <scratch>/panel-problem.txt)"
    ```
 
-   Add `--add-dir <root>` (repeatable) for every spec repo or worktree the problem cites outside `-d` — Copilot is
-   denied those paths otherwise.
+   Read-only peer runs get the git repo of every path the problem cites under HOME automatically; add
+   `--add-dir <root>` (repeatable) for a write run, a non-git directory or a path outside HOME.
 
    Durable done signal = `~/.agent-bridge/state/panel/<name>/rc` (written on every exit, `rc=143` on SIGTERM); the run's
    own output is `panel/<name>/run.log`.

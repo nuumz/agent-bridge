@@ -34,8 +34,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boardlib  # noqa: E402
 from bridgelib.adapters import ADAPTERS, Adapter  # noqa: E402
-from bridgelib.core import (PEER_TALK_RULE, DISABLED, HOP_VAR, QUOTA_TTL, add_dirs_from_env, hop_active,  # noqa: E402
-                            quota_block, version_of)
+from bridgelib.core import (PEER_TALK_RULE, DISABLED, HOP_VAR, QUOTA_TTL, add_dirs_from_env, cited_roots,  # noqa: E402
+                            hop_active, quota_block, version_of)
 from bridgelib.runner import (AGREE_RE, CONV_DIR, USER_AUTHOR, BoardRun, Conv, execute, print_parsed,  # noqa: E402
                               protocol)
 
@@ -188,6 +188,10 @@ def main() -> int:
         print(f"ask-agent: no such dir: {o.dir}", file=sys.stderr)
         return 2
     o.dir = str(Path(o.dir).resolve())
+    if o.mode != "write":                  # a write grant stays explicit; reading what the prompt cites does not
+        for root in cited_roots(prompt, o.dir, o.add_dir):
+            o.add_dir.append(root)
+            print(f"[bridge] add-dir (cited in prompt): {root}", file=sys.stderr)
 
     if o.agent == "dialog":
         if o.mode == "write" or o.worktree is not None:

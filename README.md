@@ -95,10 +95,11 @@ in its saved prompt: the actual working directory, nearest repo root, existing r
 explicit access roots and the mode's tool limits. Copilot still discovers personal instructions and skills itself;
 the inventory does not prove instructions loaded. Check discovery locally with `copilot -C <repo> instruction list`
 on CLI versions supporting that command. No generated context directory, automatic folder trust or global path
-permission is added. If evidence lives in another repo, grant only that root with `--add-dir`; a source path inside
-the prompt alone does not grant access. Copilot also loads that root's `.github/skills` and `.github/agents`, so grant
-only repos whose config you trust. `bridge-panel`, `bridge-work` and `bridge-fix` take the same `--add-dir` and pass
-it to every peer run they start — use it whenever the case cites a spec repo or another worktree.
+permission is added. In read-only runs (`ask`/`plan`) the git repo of each absolute path the prompt cites under HOME
+is granted automatically and printed as `[bridge] add-dir (cited in prompt)`. For write runs, non-git directories and
+paths outside HOME, grant the root yourself with `--add-dir`. Copilot also loads a granted root's `.github/skills` and
+`.github/agents`, so cite or grant only repos whose config you trust. `bridge-panel`, `bridge-work` and `bridge-fix`
+take the same `--add-dir` and pass it to every peer run they start.
 
 Give analysis tasks a bounded question, source paths/logs, expected versus actual behavior and the output needed
 (evidence, root cause, smallest safe fix, remaining uncertainty). In `ask`/`plan`, shell and writes stay denied:
