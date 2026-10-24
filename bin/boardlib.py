@@ -29,6 +29,7 @@ KINDS = ("note", "question", "answer", "decision", "task", "system", "request", 
 CLOSING_KINDS = ("answer", "done", "blocked")   # a request stays open until one of these replies to it (OPEN_REQUEST)
 ROLES = ("leader", "member", "observer")
 TASK_MODES = ("ask", "plan", "write")
+FAMILIES = ("claude", "cursor", "copilot")   # a request addressed to a family is a turn: a task, run by dispatch
 
 # `addressee` is the column behind the `to` argument (TO is an SQLite keyword): NULL = broadcast, like every message
 # posted before the column existed; otherwise `*`, an agent identity, or `@<role>` of the topic's members.
@@ -46,7 +47,8 @@ CREATE TABLE IF NOT EXISTS tasks   (id INTEGER PRIMARY KEY, topic_id INTEGER NOT
                                     dir TEXT, mode TEXT NOT NULL DEFAULT 'ask', origin TEXT NOT NULL,
                                     requested_by TEXT, assignee TEXT NOT NULL DEFAULT 'any', priority INTEGER DEFAULT 0,
                                     status TEXT NOT NULL DEFAULT 'queued', claimed_by TEXT, claimed_at INTEGER,
-                                    lease_until INTEGER, result TEXT, created_at INTEGER, updated_at INTEGER);
+                                    lease_until INTEGER, result TEXT, created_at INTEGER, updated_at INTEGER,
+                                    request_seq INTEGER);
 CREATE TABLE IF NOT EXISTS workers (pid INTEGER PRIMARY KEY, driver_pid INTEGER, identity TEXT, family TEXT,
                                     task_id INTEGER, peer INTEGER DEFAULT 1, started_at INTEGER, log TEXT,
                                     deadline INTEGER);
@@ -70,6 +72,8 @@ def connect() -> sqlite3.Connection:
         conn.execute("ALTER TABLE workers ADD COLUMN deadline INTEGER")
     if "addressee" not in {r[1] for r in conn.execute("PRAGMA table_info(messages)")}:  # boards before 2026-10-24
         conn.execute("ALTER TABLE messages ADD COLUMN addressee TEXT")
+    if "request_seq" not in {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}:   # boards before 2026-10-25
+        conn.execute("ALTER TABLE tasks ADD COLUMN request_seq INTEGER")
     return conn
 
 
@@ -137,10 +141,18 @@ def resolve_identity(conn: sqlite3.Connection, env: dict[str, str]) -> tuple[str
     if found:
         return found[0], True, found[1]
     if env.get("AGENT_BRIDGE_IDENTITY"):
-        return env["AGENT_BRIDGE_IDENTITY"], hop_active(env), None
+        return hop_identity(env["AGENT_BRIDGE_IDENTITY"], env), hop_active(env), None
     if env.get("AGENT_BRIDGE_AGENT"):
         return f"{env['AGENT_BRIDGE_AGENT']}@primary", hop_active(env), None
     raise BoardError("no identity: set AGENT_BRIDGE_AGENT in the MCP server env (bridge-sync does this)")
+
+
+def hop_identity(claimed: str, env: dict[str, str]) -> str:
+    """An identity taken from the environment of a bridged run: never the user's and never the primary's — those
+    carry rights (decisions, turns, --as) that an env variable must not grant. Such a claim becomes `<family>@hop`."""
+    if hop_active(env) and (claimed.startswith("user:") or claimed.endswith("@primary")):
+        return f"{family(claimed) or env.get('AGENT_BRIDGE_AGENT', 'peer')}@hop"
+    return claimed
 
 
 def heartbeat(conn: sqlite3.Connection, name: str, kind: str, note: str = "") -> None:
@@ -249,6 +261,19 @@ def post(conn: sqlite3.Connection, tid: int, author: str, body: str, kind: str =
     if kind == "blocked" and header(body).get("missing", "").strip().lower() in NO_VALUE:
         raise BoardError("kind=blocked needs a `missing: <what you lack>` header line — if what you lack is a "
                          "decision or a fact only the user has, send a card (board_ask_user) instead")
+    turn = kind == "request" and to in FAMILIES       # a turn for a peer that is not running: queued, run by dispatch
+    if turn:
+        if not may_call_turn(conn, tid, author):
+            raise BoardError(f"only the user, the primary or the topic's leader may call a {to} turn (each one is a "
+                             f"full run) — ask the leader to post the request")
+        head = header(body)
+        turn_mode, turn_dir = head.get("mode", "ask"), head.get("dir") or None
+        if turn_mode == "write" and not turn_dir:
+            raise BoardError("mode: write needs a `dir:` line — dispatch runs write turns only inside --allow-write dirs")
+        if turn_dir:
+            turn_dir = str(Path(turn_dir).expanduser().resolve())
+        # a peer leader still pays into the peer task cap; checked here so the request never lands without its task
+        _task_checks(conn, tid, not may_spend(author), turn_mode, turn_dir)
     target = None
     if reply_to is not None:
         target = conn.execute("SELECT seq, author, kind, body, addressee FROM messages WHERE topic_id=? AND seq=?",
@@ -259,7 +284,9 @@ def post(conn: sqlite3.Connection, tid: int, author: str, body: str, kind: str =
     # ephemeral `<family>#<pid>` thread included), a human answering, and replies to a card (its shape names the kind
     # of answer, the human writes it freely) are not
     if (target is not None and target["kind"] == "request" and kind in ("answer", "done", "blocked")
-            and not same_run(author, target["author"]) and not author.startswith("user:")
+            and not (author == target["author"] or (target["addressee"] not in FAMILIES
+                                                     and same_run(author, target["author"])))
+            and not author.startswith("user:")
             and not (target["addressee"] or "").startswith("user:")
             and conn.execute(f"SELECT 1 FROM messages m WHERE m.topic_id=? AND m.seq=? AND {OPEN_REQUEST}",
                              (tid, target["seq"])).fetchone() is not None):
@@ -270,7 +297,59 @@ def post(conn: sqlite3.Connection, tid: int, author: str, body: str, kind: str =
                      (tid, author, kind, body, reply_to, now(), to, tid))
         seq = conn.execute("SELECT MAX(seq) FROM messages WHERE topic_id=?", (tid,)).fetchone()[0]
         conn.execute("UPDATE tasks SET lease_until=? WHERE status='claimed' AND claimed_by=?", (now() + LEASE_S, author))
+        if target is not None and target["kind"] == "request" and target["addressee"] in FAMILIES:
+            _settle_turn(conn, tid, target, author, kind, body)
+        if turn:
+            # a turn from a leader is user-sanctioned (the leader was appointed by the user or the primary), so the
+            # task is origin=user and dispatch starts it without --include-peer-tasks
+            _task_insert(conn, tid, body_title(body), body, author, False, to, turn_mode, turn_dir, 0, seq)
     return seq
+
+
+def may_spend(me: str) -> bool:
+    """The identities that are not a bridged peer: the human and the primary session."""
+    return me.startswith("user:") or me.endswith("@primary")
+
+
+def may_call_turn(conn: sqlite3.Connection, tid: int, me: str) -> bool:
+    """Who may spend a peer run from the board: the user, the primary session, or the topic's leader."""
+    return may_spend(me) or is_leader(conn, tid, me)
+
+
+def is_turn_run(me: str) -> bool:
+    """`<family>:task<N>` — the run dispatch started for a turn; the one identity a family-addressed request reaches."""
+    return re.fullmatch(r"[a-z]+:task\d+", me) is not None
+
+
+def body_title(body: str) -> str:
+    """The first line of a body after its `key: value` header block, for a task title."""
+    lines = body.splitlines()
+    n = len(header(body))
+    rest = [ln.strip() for ln in lines[n:] if ln.strip()]
+    return (rest[0] if rest else (lines[0].strip() if lines else "request"))[:120]
+
+
+def _settle_turn(conn: sqlite3.Connection, tid: int, request: sqlite3.Row, author: str, kind: str, body: str) -> None:
+    """A reply to a family turn: from that family's dispatched (or hand-started `<fam>#pid`) run it finishes the task
+    (failed when it is `blocked`); from anyone else that closes the request (the requester withdrawing, the user) it
+    cancels the task so dispatch never spends a run on a settled turn."""
+    fam = request["addressee"]
+    by_family = family(author) == fam and ("#" in author or is_turn_run(author)) and author != request["author"]
+    if by_family and kind in CLOSING_KINDS:
+        status = "failed" if kind == "blocked" else "done"
+        row = conn.execute("UPDATE tasks SET status=?, result=?, updated_at=?, lease_until=NULL WHERE topic_id=? AND "
+                           "request_seq=? AND status IN ('queued','claimed') RETURNING id",
+                           (status, body[:400], now(), tid, request["seq"])).fetchone()
+        if row:
+            _log(conn, tid, f"task #{row['id']} {status} by {author}: answered request seq {request['seq']}")
+        return
+    still_open = conn.execute(f"SELECT 1 FROM messages m WHERE m.topic_id=? AND m.seq=? AND {OPEN_REQUEST}",
+                              (tid, request["seq"])).fetchone() is not None
+    if not still_open:
+        row = conn.execute("UPDATE tasks SET status='cancelled', updated_at=? WHERE topic_id=? AND request_seq=? AND "
+                           "status IN ('queued','claimed') RETURNING id", (now(), tid, request["seq"])).fetchone()
+        if row:
+            _log(conn, tid, f"task #{row['id']} cancelled: request seq {request['seq']} was closed by {author}")
 
 
 def _score_reply(conn: sqlite3.Connection, tid: int, author: str, kind: str, body: str, request: sqlite3.Row) -> None:
@@ -321,10 +400,11 @@ def _for_me(me: str, roles: list[str]) -> tuple[str, tuple]:
     """SQL over alias `m`: a message that reaches `me` — broadcast (NULL or *), addressed to me or to one of my
     @roles, or a reply to a message of mine in the same topic. The board's task-log rows are bookkeeping, not mail."""
     marks = ",".join("?" * len(roles))
-    sql = ("(m.kind<>'task' AND (m.addressee IS NULL OR m.addressee='*' OR m.addressee=? "
+    sql = ("(m.kind<>'task' AND (m.addressee IS NULL OR m.addressee='*' OR m.addressee=? OR m.addressee=? "
            + (f"OR m.addressee IN ({marks}) " if roles else "")
            + "OR m.reply_to IN (SELECT seq FROM messages WHERE topic_id=m.topic_id AND author=?)))")
-    return sql, (me, *roles, me)
+    fam = family(me) if is_turn_run(me) else None   # a family turn reaches the run dispatched for it, nobody else
+    return sql, (me, fam, *roles, me)
 
 
 # a request is closed only by an answer/done/blocked from its addressee (the agent, a member holding the @role, any
@@ -335,6 +415,8 @@ OPEN_REQUEST = ("m.kind='request' AND NOT EXISTS (SELECT 1 FROM messages r WHERE
                 "m.addressee LIKE 'user:%')) AND (m.addressee='*' OR r.author=m.addressee OR r.author=m.author "
                 "OR (instr(m.author,'#')>0 AND instr(r.author,'#')>0 AND substr(m.author,1,instr(m.author,'#'))="
                 "substr(r.author,1,instr(r.author,'#'))) "     # a later run of the requester's own `<family>#<pid>` thread
+                "OR (m.addressee IN ('claude','cursor','copilot') AND (r.author LIKE m.addressee||'#%' OR "
+                "r.author LIKE m.addressee||':task%')) "      # a dispatched or hand-started run of that family
                 "OR (m.addressee LIKE 'user:%' AND r.author LIKE 'user:%') OR (m.addressee LIKE '@%' AND r.author IN "
                 "(SELECT agent FROM members b WHERE b.topic_id=m.topic_id AND b.role=substr(m.addressee, 2) "
                 "AND b.left_at IS NULL))))")
@@ -536,7 +618,14 @@ def _log(conn: sqlite3.Connection, tid: int, text: str) -> None:
 
 
 def task_add(conn: sqlite3.Connection, tid: int, title: str, body: str, requester: str, peer: bool,
-             assignee: str = "any", mode: str = "ask", workdir: str | None = None, priority: int = 0) -> int:
+             assignee: str = "any", mode: str = "ask", workdir: str | None = None, priority: int = 0,
+             request_seq: int | None = None) -> int:
+    _task_checks(conn, tid, peer, mode, workdir)
+    with tx(conn):
+        return _task_insert(conn, tid, title, body, requester, peer, assignee, mode, workdir, priority, request_seq)
+
+
+def _task_checks(conn: sqlite3.Connection, tid: int, peer: bool, mode: str, workdir: str | None) -> None:
     if mode not in TASK_MODES:
         raise BoardError(f"mode must be one of {TASK_MODES}")
     if workdir and not Path(workdir).is_dir():
@@ -546,12 +635,17 @@ def task_add(conn: sqlite3.Connection, tid: int, title: str, body: str, requeste
                          (tid,)).fetchone()[0]
         if n >= PEER_OPEN_TASKS:
             raise BoardError(f"peer task limit reached for this topic ({PEER_OPEN_TASKS} open)")
-    with tx(conn):
-        cur = conn.execute("INSERT INTO tasks(topic_id, title, body, dir, mode, origin, requested_by, assignee, priority, "
-                           "status, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?)",
-                           (tid, title, body, workdir, mode, "peer" if peer else "user", requester, assignee, priority,
-                            now(), now()))
-        _log(conn, tid, f"task #{cur.lastrowid} queued by {requester} for {assignee} ({mode}): {title}")
+
+
+def _task_insert(conn: sqlite3.Connection, tid: int, title: str, body: str, requester: str, peer: bool, assignee: str,
+                 mode: str, workdir: str | None, priority: int, request_seq: int | None) -> int:
+    """The insert alone — inside the caller's transaction (post() queues a turn with its request in one commit)."""
+    cur = conn.execute("INSERT INTO tasks(topic_id, title, body, dir, mode, origin, requested_by, assignee, priority, "
+                       "status, created_at, updated_at, request_seq) VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?,?)",
+                       (tid, title, body, workdir, mode, "peer" if peer else "user", requester, assignee, priority,
+                        now(), now(), request_seq))
+    _log(conn, tid, f"task #{cur.lastrowid} queued by {requester} for {assignee} ({mode}): {title}"
+                    + (f" — request seq {request_seq}" if request_seq else ""))
     return cur.lastrowid
 
 
@@ -610,13 +704,13 @@ def status(conn: sqlite3.Connection, me: str) -> dict:
     topics = []
     for r in conn.execute("SELECT id, name, created_by FROM topics WHERE closed_at IS NULL ORDER BY id"):
         mem = members(conn, r["id"])
-        if mem and me not in {m["agent"] for m in mem} and not me.startswith("user:"):
-            continue                                        # members only — the user, who runs the board, sees all
+        owed = open_requests_to(conn, r["id"], me)
+        if mem and me not in {m["agent"] for m in mem} and not me.startswith("user:") and not owed:
+            continue            # members only — the user, who runs the board, sees all; so does a run a turn is owed by
         cur = conn.execute("SELECT seq FROM cursors WHERE agent=? AND topic_id=?", (me, r["id"])).fetchone()
         last = conn.execute("SELECT COALESCE(MAX(seq),0) FROM messages WHERE topic_id=?", (r["id"],)).fetchone()[0]
         topics.append({"name": r["name"], "created_by": r["created_by"], "members": mem, "last_seq": last,
-                       "unread_for_me": last - (cur["seq"] if cur else 0),
-                       "open_requests_to_me": open_requests_to(conn, r["id"], me)})
+                       "unread_for_me": last - (cur["seq"] if cur else 0), "open_requests_to_me": owed})
     tasks = [dict(r) for r in conn.execute(
         "SELECT t.id, p.name AS topic, t.title, t.assignee, t.mode, t.origin, t.status, t.claimed_by "
         "FROM tasks t JOIN topics p ON p.id=t.topic_id WHERE t.status IN ('queued','claimed') ORDER BY t.priority DESC, t.id")]
@@ -631,8 +725,10 @@ def open_requests_to(conn: sqlite3.Connection, tid: int, me: str) -> int:
     roles = my_roles(conn, tid, me)
     marks = ",".join("?" * len(roles))
     by_role = f"OR m.addressee IN ({marks})" if roles else ""
+    fam = family(me) if is_turn_run(me) else None
     return conn.execute(f"SELECT COUNT(*) FROM messages m WHERE m.topic_id=? AND m.author<>? AND {OPEN_REQUEST} "
-                        f"AND (m.addressee='*' OR m.addressee=? {by_role})", (tid, me, me, *roles)).fetchone()[0]
+                        f"AND (m.addressee='*' OR m.addressee=? OR m.addressee=? {by_role})",
+                        (tid, me, me, fam, *roles)).fetchone()[0]
 
 
 def close_topic_as(conn: sqlite3.Connection, name: str, me: str) -> None:
