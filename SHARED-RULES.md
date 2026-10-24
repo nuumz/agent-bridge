@@ -14,7 +14,7 @@ Owner-facing docs are in English; user-facing replies follow each agent's own la
 |---|---|---|---|
 | Claude Code | `claude` | `ask-claude` | Long-context reasoning, spec/doc authoring, multi-file refactors, CodeGraph + MCP tooling |
 | Cursor Agent | `cursor-agent` | `ask-cursor` | Second opinion from another model family (the bridge starts it on `auto`; `-M` picks a model), isolated worktree runs |
-| Copilot CLI | `copilot` (`@github/copilot`) | `ask-copilot` | GitHub-native tasks (issues/PRs), another model family |
+| Copilot CLI | `copilot` (`@github/copilot`) | `ask-copilot` | Bounded analysis/review, targeted implementation and improvements via `bridge-work`, GitHub-native tasks |
 
 `ask-agent --list` shows which peers are installed and logged in. All three `ask-*` commands are thin wrappers
 around `ask-agent <peer>`; every peer reads the same machine-wide rules (§5) and the same per-repo rules
@@ -66,6 +66,27 @@ How the common options map onto each CLI:
 | `-w [name]` | `--worktree [name]` → `<repo>/.claude/worktrees/<name>` (locked) | `--worktree [name]` → `~/.cursor/worktrees/<repo>/<name>` | not supported (use `git worktree add` + `-d`) |
 | `--add-dir` | `--add-dir` | `--add-dir` | `--add-dir=` |
 | output parsed from | `--output-format stream-json --verbose` (last line = `result`: `result`, `session_id`, `usage`; earlier lines feed `bridge-watch`) | `--output-format stream-json` (`assistant` chunks, `result`) | `--output-format json` JSONL (`assistant.message` content, `result.sessionId` + `usage.premiumRequests`/`totalApiDurationMs`; `EDITED=` in the bridge line when `codeChanges.filesModified` is non-empty) |
+
+**Copilot workspace bootstrap.** Each prompt names its resolved cwd, nearest git root (including a worktree's
+`.git` file), existing `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` / `.github/copilot-instructions.md` files from root
+to cwd, access roots and mode limits. It points to native instruction/skill discovery rather than copying rules or
+creating a context tree. This is an inventory, not proof of loaded instructions. It does not enable `--trust-folder`,
+`--allow-all-paths`, extra roots or shell access. Supply external evidence explicitly or grant a specific root with
+`--add-dir`; the peer must not retry a denied tool or bypass a denied path. Essential missing access uses `[[ASK]]`.
+Instruction files above cwd and outside every `--add-dir` root are listed as outside file access. Note that Copilot's
+`--add-dir` also loads that root's `.github/skills` and `.github/agents` as trusted configuration — grant only roots
+whose repo config you trust.
+
+Copilot JSONL must end with a `result` event to count as a completed stream (legacy plain-text output is still
+accepted). Tool failures can be recovered during a run, so they produce a warning and operational metrics, not an
+automatic task failure. Live and backfilled ledger rows preserve `premium_requests`, `api_duration_ms`,
+`files_modified` when reported, plus `tool_calls`, `tool_failures`, `permission_denials` for JSONL. `bridge-plan learn`
+groups Copilot operations by job kind and mode, including panel workers; backfilled modes and absent usage remain
+unknown. Reported premium usage is not dollars or a quality score and is not assumed to be a per-run billing delta.
+Backfill keeps the exit status a live row recorded for the same log (`rc_source: live`) instead of re-deriving it.
+A playbook may list `alt_peers` (e.g. `implement`: `cursor,copilot`); `bridge-plan plan` prints them when `-p` is not
+given — a suggestion only, `-p` stays the egress gate.
+Use verified findings (`bridge-plan mark`) and work verify/review results for quality.
 
 Cursor read-only detail: `-m ask` holds `Write(**)` plus denials for write-capable Shell commands (`printf`/`tee`/`cp`/`mv`/`rm`/…)
 in the global deny for the run (the model routed around a denied Write with `printf > file` under
@@ -458,9 +479,11 @@ bridge-work show <name>       # ~/.agent-bridge/state/work/<name>/report.md
 4. **Review** — the reviewer (the other peer in `-p`, else the implementer in a fresh session) reads `git diff <base>`
    + verify output and returns `file:line | finding | severity | must-fix | why` or NONE. The allowed file set bounds
    the task: a finding that needs a file outside it is `out-of-agreement`, never must-fix (the script drops such rows
-   too). **No review = NOT DONE** — a green verify alone never yields READY.
-   A role whose peer is unavailable (out of quota · binary missing · disabled) **falls back to claude once** (local,
-   no egress); the report header shows `cursor→claude` and the ledger row keeps `used`.
+   too). **No review = NOT DONE** — a green verify alone never yields READY. A review counts only when it exits 0 and
+   returns a markdown table or `NONE`; `[[ASK]]` (exit 5) or free text is no review. When the reviewer is the
+   implementer (single peer in `-p`), the report labels it `self-review` and the ledger row sets `self_review: true`.
+   A role whose peer is unavailable (out of quota · binary missing · disabled) **falls back to claude once**, only
+   when `claude` is in `-p` (the egress gate); the report header shows `cursor→claude` and the ledger row keeps `used`.
 5. **Loop** — a red verify, a file outside the set, or a must-fix=yes row goes back to the implementer with exactly
    those points, at most `--rounds` times (default 2).
 6. **Report** — `work/<name>/report.md` + `work/<name>/rc` (cleared at start; written on every exit): READY FOR REVIEW / NOT DONE, diff stat, verify tail, the review table, the

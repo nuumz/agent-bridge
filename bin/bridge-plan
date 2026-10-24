@@ -194,6 +194,8 @@ def plan(o) -> int:
         "negotiate": "fill the session card first; the run refuses while a TODO remains"}[level])
     print(f"who        {form}: {book.get('panel_roles') if form == 'panel' or adjud else book.get('peers')} on {peers}"
           f"{'  (data leaves the machine — cursor)' if 'cursor' in peers else ''}")
+    if book.get("alt_peers") and not o.peers:
+        print(f"alt peers  {book['alt_peers']}  (opt in with -p; each named peer receives the repo content)")
     print(f"inputs     {book.get('inputs', '')}")
     if gaps:
         print(f"  missing  {' · '.join(gaps)}")
@@ -362,6 +364,25 @@ def learn(o) -> int:
             suggestions.append(f"{kind}: {len(ps)} panels, none cited as `peer review: panel …` — check whether a direct run would do")
         if len(rs) >= 5 and ok / len(rs) < 0.8:
             suggestions.append(f"{kind}: only {ok}/{len(rs)} direct runs ended rc=0 — look at the .err lines before running more")
+    copilot: dict[tuple[str, str], list[dict]] = {}
+    for r in rows:
+        if r.get("type") == "run" and r.get("peer") == "copilot":
+            copilot.setdefault((r.get("kind") or "other", r.get("mode") or "unknown"), []).append(r)
+    if copilot:
+        print("\nCopilot operations (includes panel workers; rc0 is process completion, not quality):")
+        print("  usage is reported by the CLI, not dollars; unknown historical modes/usage remain unknown.")
+        print(f"  {'kind':18} {'mode':7} {'runs':>4} {'rc0':>4} {'med API s':>9} "
+              f"{'premium':>7} {'tool fail':>9} {'denied':>6}  samples(api/premium/tools)")
+        for (kind, mode), rs in sorted(copilot.items()):
+            api = [r["api_duration_ms"] / 1000 for r in rs if r.get("api_duration_ms") is not None]
+            premium = [r["premium_requests"] for r in rs if r.get("premium_requests") is not None]
+            tools = [r for r in rs if r.get("tool_failures") is not None]
+            med_api = f"{statistics.median(api):.1f}" if api else "-"
+            reported_premium = f"{sum(premium):g}" if premium else "-"
+            failures = str(sum(r["tool_failures"] for r in tools)) if tools else "-"
+            denied = str(sum(r.get("permission_denials", 0) for r in tools)) if tools else "-"
+            print(f"  {kind:18} {mode:7} {len(rs):4} {sum(r.get('rc') == 0 for r in rs):4} {med_api:>9} "
+                  f"{reported_premium:>7} {failures:>9} {denied:>6}  {len(api)}/{len(premium)}/{len(tools)}")
     ws = [r for r in rows if r.get("type") == "work"]
     if ws:
         ready = sum(1 for r in ws if r.get("ok"))

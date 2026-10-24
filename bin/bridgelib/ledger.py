@@ -114,6 +114,10 @@ def backfill() -> tuple[int, int]:
     """Rebuild the ledger from ~/.agent-bridge/state/runs and panel/ — used once to seed learning from history."""
     books = load_playbooks()
     out: list[dict] = []
+    # The process exit status is not on disk; a live row (or a backfilled row that inherited it) is its only source.
+    live_rc = {r["log"]: r["rc"] for r in rows()
+               if r.get("type") == "run" and r.get("log") and "rc" in r
+               and (not r.get("backfilled") or r.get("rc_source") == "live")}
     panel_kind: dict[str, str] = {}
     for d in sorted((STATE / "panel").iterdir()) if (STATE / "panel").is_dir() else []:
         for p in sorted(RUNS.glob("*-claude.prompt.txt")):
@@ -127,24 +131,36 @@ def backfill() -> tuple[int, int]:
         if not m or m.group(4):
             continue
         prompt = p.read_text(errors="replace")
+        if m.group(3) == "copilot":
+            # Capability/instruction metadata is not the task and must not match playbook triggers.
+            prompt = re.sub(r"^\(Bridge workspace bootstrap\n.*?\)\n\n", "", prompt, count=1, flags=re.S)
         panel = re.search(r"Panel `([^`]+)`", prompt)
         log = p.with_name(p.name.replace(".prompt.txt", ".json"))
         d = _last_json(log) if log.is_file() else {}
+        parsed = None
+        if m.group(3) == "copilot" and log.is_file():
+            from .adapters import ADAPTERS
+            parsed = ADAPTERS["copilot"].parse(log.read_text(errors="replace"))
         usage = d.get("usage") or {}
         err = log.with_suffix(".err")
         err_txt = err.read_text(errors="replace") if err.is_file() else ""
         ts = int(time.mktime(time.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")))
         ranked = classify(prompt, books)
+        rc = (7 if re.search(r"out of usage|monthly quota", err_txt) else
+              (int(parsed.is_error) if parsed else (1 if d.get("is_error") else (0 if d else None))))
+        if str(log) in live_rc:
+            rc = live_rc[str(log)]
         out.append({"ts": ts, "type": "run", "peer": m.group(3),
                     "kind": panel_kind.get(panel.group(1), "other") if panel else (ranked[0][0] if ranked else "other"),
                     "panel": panel.group(1) if panel else None,
                     "role": (re.search(r"you are `([^`]+)`", prompt) or [None, None])[1],
-                    "rc": 7 if re.search(r"out of usage|monthly quota", err_txt) else (1 if d.get("is_error") else (0 if d else None)),
+                    "rc": rc, **({"rc_source": "live"} if str(log) in live_rc else {}),
                     "duration_s": round((d.get("duration_ms") or usage.get("sessionDurationMs") or 0) / 1000),
-                    "session": d.get("session_id"), "cost_session": d.get("total_cost_usd"),
+                    "session": parsed.session if parsed else d.get("session_id"),
+                    "cost_session": d.get("total_cost_usd"),
                     "tokens_out": usage.get("output_tokens") or usage.get("outputTokens"),
                     "turns": d.get("num_turns"), "cache_write": usage.get("cache_creation_input_tokens"),
-                    "log": str(log), "backfilled": True})
+                    "log": str(log), "backfilled": True, **(parsed.metrics if parsed else {})})
     done: list[dict] = []
     for r in sorted(out, key=lambda r: r["ts"]):             # backfilled ts = start, so this is start order
         r["cost"] = run_cost(r["session"], r["cost_session"], r["ts"], done)
