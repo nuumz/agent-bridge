@@ -3,9 +3,11 @@
 
     bridge-board serve                         MCP server over stdio (each CLI spawns its own; state is one SQLite file)
     bridge-board status                        who is online, open topics, queue, running workers
-    bridge-board post   <topic> "<text>" [-k kind]        post as user:$USER (opens the topic if needed)
-    bridge-board read   <topic> [--after N] [-n 50]       print messages
+    bridge-board post   <topic> "<text>" [-k kind] [--to X]   post as user:$USER (opens the topic if needed)
+    bridge-board read   <topic> [--after N] [-n 50] [--mine] [--open-requests]   print messages
     bridge-board tail   <topic>                           follow a topic (Ctrl-C to stop)
+    bridge-board open   dm:<a>+<b> | room:<name>          a 1:1 thread (both sides members) or a room (opener leads)
+    bridge-board join   <topic> <agent> [-r leader|member|observer] | leave <topic> [agent]
     bridge-board task add "<title>" [-b body] [-t topic] [-a cursor|claude|any] [-m ask|plan|write] [-d dir] [-p prio]
     bridge-board task list | cancel <id>
     bridge-board dispatch [--max-agents 2] [--agents cursor,claude] [--allow-write DIR,...]
@@ -14,7 +16,8 @@
 
 The board never spawns anything by itself: agents post / read / wait / claim through MCP tools, and a human
 (or the primary session) runs `dispatch` with an explicit concurrency cap. A bridged peer (AGENT_BRIDGE_HOP=1)
-may not run dispatch, may not open topics, and may hold at most PEER_OPEN_TASKS queued tasks per topic.
+may not run dispatch, may not open topics (a dm: it is one side of excepted), may not close a topic it does not
+lead, and may hold at most PEER_OPEN_TASKS queued tasks per topic.
 """
 from __future__ import annotations
 
@@ -38,32 +41,65 @@ WAIT_DEFAULT, WAIT_MAX = 60, 120
 
 def fmt_msgs(msgs: list[dict]) -> str:
     return "\n".join(f"[seq={m['seq']} author={m['author']} kind={m['kind']}"
+                     f"{' to=' + m['to'] if m.get('to') else ''}"
                      f"{' reply_to=' + str(m['reply_to']) if m.get('reply_to') else ''}]\n"
                      + "\n".join("    " + ln for ln in m["body"].splitlines()) for m in msgs) or "(no messages)"
 
 
 # ----------------------------------------------------------------------------- MCP server
 TOOLS = [
-    {"name": "board_status", "description": "Who is online, open topics with your unread count, queued/claimed tasks, "
-     "running workers. Call this first.", "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "board_status", "description": "Who is online, the open topics you can see (your unread count, members, "
+     "open requests addressed to you), queued/claimed tasks, running workers. Call this first.",
+     "inputSchema": {"type": "object", "properties": {}}},
     {"name": "board_post", "description": "Post a message to a topic (created on demand unless you are a bridged peer). "
-     "Post BEFORE you wait for a reply. kind: note|question|answer (decision is reserved for the user).",
+     "Post BEFORE you wait for a reply. kind: note|question|answer|request|handoff|done|blocked (decision is reserved "
+     "for the user). `to` addresses it: an agent identity, @leader|@member|@observer of the topic, or * (everyone); "
+     "omitted = everyone. A request needs `to` and a `shape: <what the answer must look like>` header line, and stays "
+     "open until its owner (or the requester) replies answer|done|blocked to its seq.",
      "inputSchema": {"type": "object", "required": ["topic", "body"], "properties": {
          "topic": {"type": "string"}, "body": {"type": "string"},
-         "kind": {"type": "string", "enum": ["note", "question", "answer"], "default": "note"},
+         "kind": {"type": "string", "enum": ["note", "question", "answer", "request", "handoff", "done", "blocked"],
+                  "default": "note"},
+         "to": {"type": "string", "description": "agent identity | @role | *"},
          "reply_to": {"type": "integer", "description": "seq of the message you answer"}}}},
     {"name": "board_read", "description": "Read messages of a topic after a seq (default: after what you already read). "
-     "Returns next_after_seq for the follow-up call. " + UNTRUSTED.strip(),
+     "Returns next_after_seq for the follow-up call. mine=true: only what reaches you (addressed to you, your role, "
+     "everyone, or replying to you) — what it skips was not for you, so it moves your unread cursor like a plain "
+     "read; "
+     "open_requests=true: requests their owner has not closed yet (from the start of the topic; a view, cursor "
+     "untouched). " + UNTRUSTED.strip(),
      "inputSchema": {"type": "object", "required": ["topic"], "properties": {
          "topic": {"type": "string"}, "after_seq": {"type": "integer", "minimum": 0},
-         "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200}}}},
+         "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+         "mine": {"type": "boolean", "default": False}, "open_requests": {"type": "boolean", "default": False}}}},
     {"name": "board_wait", "description": f"Block up to timeout_s (default {WAIT_DEFAULT}, max {WAIT_MAX}) until another "
-     "agent posts after after_seq, then return everything after it. On timeout returns timed_out=true and "
-     "resume_after_seq — call again, or stop and post your final answer. Budget: "
-     f"{B.WAIT_BUDGET} waits per session. " + UNTRUSTED.strip(),
+     "agent posts after after_seq, then return everything after it. mention (default true for a bridged peer, false "
+     "for the primary): wake only on a post that reaches you — addressed to you, your role or everyone, or replying "
+     "to you. On timeout returns timed_out=true and resume_after_seq — call again, or stop and post your final "
+     "answer. "
+     f"Budget: {B.WAIT_BUDGET} waits per session (a refused call does not count). " + UNTRUSTED.strip(),
      "inputSchema": {"type": "object", "required": ["topic"], "properties": {
          "topic": {"type": "string"}, "after_seq": {"type": "integer", "minimum": 0},
-         "timeout_s": {"type": "integer", "minimum": 1, "maximum": WAIT_MAX, "default": WAIT_DEFAULT}}}},
+         "timeout_s": {"type": "integer", "minimum": 1, "maximum": WAIT_MAX, "default": WAIT_DEFAULT},
+         "mention": {"type": "boolean"}}}},
+    {"name": "board_open", "description": "Open a topic you may talk in. dm:<a>+<b> (either order; you are one side) "
+     "is a 1:1 thread with both as members — a bridged peer may open one with the user or with an agent it already "
+     "shares a "
+     "topic with. room:<name> is a group topic; only the user or the primary opens one and becomes its leader. "
+     "Returns the canonical name.",
+     "inputSchema": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}},
+    {"name": "board_join", "description": "Add an agent to a topic with a role (leader|member|observer), or change its "
+     "role. Leader or user only.",
+     "inputSchema": {"type": "object", "required": ["topic", "agent"], "properties": {
+         "topic": {"type": "string"}, "agent": {"type": "string"},
+         "role": {"type": "string", "enum": ["leader", "member", "observer"], "default": "member"}}}},
+    {"name": "board_leave", "description": "Leave a topic yourself, or (leader/user) remove another member.",
+     "inputSchema": {"type": "object", "required": ["topic"], "properties": {
+         "topic": {"type": "string"}, "agent": {"type": "string", "description": "default: you"}}}},
+    {"name": "board_close", "description": "Close a topic: the user, its leader, or either side of a dm. A topic with "
+     "members needs a summary first — kind=done to=*, not a reply, posted after the last request: what was done, the "
+     "evidence, what is still open.",
+     "inputSchema": {"type": "object", "required": ["topic"], "properties": {"topic": {"type": "string"}}}},
     {"name": "board_task_add", "description": "Queue a task for a peer agent. Nothing runs until a human runs "
      "`bridge-board dispatch` (capped concurrency). mode write needs the dispatcher's --allow-write.",
      "inputSchema": {"type": "object", "required": ["title", "body"], "properties": {
@@ -103,19 +139,22 @@ class Server:
     def board_status(self) -> dict:
         return B.status(self.conn, self.me)
 
-    def board_post(self, topic: str, body: str, kind: str = "note", reply_to: int | None = None) -> dict:
+    def board_post(self, topic: str, body: str, kind: str = "note", reply_to: int | None = None,
+                   to: str | None = None) -> dict:
         tid = B.topic_id(self.conn, topic, self.creator())
-        return {"topic": topic, "seq": B.post(self.conn, tid, self.me, body, kind, reply_to)}
+        return {"topic": topic, "seq": B.post(self.conn, tid, self.me, body, kind, reply_to, to)}
 
-    def board_read(self, topic: str, after_seq: int | None = None, limit: int = 50) -> str:
+    def board_read(self, topic: str, after_seq: int | None = None, limit: int = 50, mine: bool = False,
+                   open_requests: bool = False) -> str:
         tid = B.topic_id(self.conn, topic, None)
-        msgs, nxt = B.read(self.conn, tid, self.me, after_seq, limit)
+        roles = B.my_roles(self.conn, tid, self.me)
+        msgs, nxt = B.read(self.conn, tid, self.me, after_seq, limit, mine, open_requests, roles)
         return f"{UNTRUSTED}next_after_seq={nxt}\n{fmt_msgs(msgs)}"
 
-    def board_wait(self, topic: str, after_seq: int | None = None, timeout_s: int = WAIT_DEFAULT) -> str:
+    def board_wait(self, topic: str, after_seq: int | None = None, timeout_s: int = WAIT_DEFAULT,
+                   mention: bool | None = None) -> str:
         if self.waits >= B.WAIT_BUDGET:
             raise B.BoardError(f"wait budget exhausted ({B.WAIT_BUDGET}) — post your final answer and stop")
-        self.waits += 1
         tid = B.topic_id(self.conn, topic, None)
         if after_seq is None:
             row = self.conn.execute("SELECT seq FROM cursors WHERE agent=? AND topic_id=?", (self.me, tid)).fetchone()
@@ -126,13 +165,34 @@ class Server:
             if left <= 0:
                 raise B.BoardError("run timeout imminent — end your reply with `[[ASK]] <question>` and stop")
             limit = min(limit, left)
+        self.waits += 1                                     # only a wait that actually starts spends the budget
+        mention = self.peer if mention is None else bool(mention)
+        roles = B.my_roles(self.conn, tid, self.me)
         deadline = time.time() + limit
         while time.time() < deadline:                       # short autocommit SELECTs only: no txn spans the sleep
-            if B.others_after(self.conn, tid, self.me, after_seq):
-                msgs, nxt = B.read(self.conn, tid, self.me, after_seq, 200)
+            if B.others_after(self.conn, tid, self.me, after_seq, mention, roles):
+                msgs, nxt = B.read(self.conn, tid, self.me, after_seq, 200, mention, False, roles)
                 return f"{UNTRUSTED}next_after_seq={nxt} waits_left={B.WAIT_BUDGET - self.waits}\n{fmt_msgs(msgs)}"
             time.sleep(0.5)
         return json.dumps({"timed_out": True, "resume_after_seq": after_seq, "waits_left": B.WAIT_BUDGET - self.waits})
+
+    def board_open(self, name: str) -> dict:
+        tid, canonical = B.open_topic(self.conn, name, self.me, self.peer)
+        return {"topic": canonical, "members": B.members(self.conn, tid)}
+
+    def board_join(self, topic: str, agent: str, role: str = "member") -> dict:
+        tid = B.topic_id(self.conn, topic, None)
+        B.join(self.conn, tid, self.me, agent, role)
+        return {"topic": topic, "members": B.members(self.conn, tid)}
+
+    def board_leave(self, topic: str, agent: str | None = None) -> dict:
+        tid = B.topic_id(self.conn, topic, None)
+        B.leave(self.conn, tid, self.me, agent)
+        return {"topic": topic, "members": B.members(self.conn, tid)}
+
+    def board_close(self, topic: str) -> dict:
+        B.close_topic_as(self.conn, topic, self.me)
+        return {"topic": topic, "closed": True}
 
     def board_task_add(self, title: str, body: str, topic: str = "tasks", assignee: str = "any", mode: str = "ask",
                        dir: str | None = None, priority: int = 0) -> dict:  # noqa: A002 — MCP argument name
@@ -218,8 +278,8 @@ CONTEXT_BYTES = 4000
 
 def recent_context(conn, topic_id: int) -> list[dict]:
     """Newest topic messages up to CONTEXT_BYTES, skipping task-log lines and questions that already have an answer."""
-    rows = [dict(r) for r in conn.execute("SELECT seq, author, kind, body, reply_to FROM messages WHERE topic_id=? "
-                                          "AND kind<>'task' ORDER BY seq DESC LIMIT 50", (topic_id,))]
+    rows = [dict(r) for r in conn.execute(f"SELECT {B.MSG_COLS} FROM messages m WHERE m.topic_id=? "
+                                          "AND m.kind<>'task' ORDER BY m.seq DESC LIMIT 50", (topic_id,))]
     answered = {r["reply_to"] for r in rows if r["kind"] == "answer" and r["reply_to"]}
     out, size = [], 0
     for r in rows:
@@ -302,8 +362,15 @@ def main() -> int:
     sub.add_parser("serve")
     sub.add_parser("status")
     p = sub.add_parser("post"); p.add_argument("topic"); p.add_argument("text"); p.add_argument("-k", "--kind", default="note", choices=B.KINDS)
+    p.add_argument("--to", help="agent identity | @leader|@member|@observer | * (default: everyone)")
     p = sub.add_parser("read"); p.add_argument("topic"); p.add_argument("--after", type=int); p.add_argument("-n", type=int, default=50)
+    p.add_argument("--mine", action="store_true", help="only what reaches you")
+    p.add_argument("--open-requests", action="store_true", help="requests their owner has not closed")
     p = sub.add_parser("tail"); p.add_argument("topic")
+    p = sub.add_parser("open"); p.add_argument("name", help="dm:<a>+<b> or room:<name>")
+    p = sub.add_parser("join"); p.add_argument("topic"); p.add_argument("agent")
+    p.add_argument("-r", "--role", default="member", choices=B.ROLES)
+    p = sub.add_parser("leave"); p.add_argument("topic"); p.add_argument("agent", nargs="?")
     p = sub.add_parser("close"); p.add_argument("topic")
     p = sub.add_parser("gc"); p.add_argument("--days", type=int, default=14); p.add_argument("--quiet", action="store_true")
     t = sub.add_parser("task").add_subparsers(dest="tcmd", required=True)
@@ -340,10 +407,18 @@ def main() -> int:
         if o.cmd == "status":
             print(json.dumps(B.status(conn, me), ensure_ascii=False, indent=1))
         elif o.cmd == "post":
-            print("seq", B.post(conn, B.topic_id(conn, o.topic, None if peer else me), me, o.text, o.kind))
+            print("seq", B.post(conn, B.topic_id(conn, o.topic, None if peer else me), me, o.text, o.kind, to=o.to))
         elif o.cmd == "read":
-            msgs, nxt = B.read(conn, B.topic_id(conn, o.topic, None), me, o.after, o.n)
+            tid = B.topic_id(conn, o.topic, None)
+            msgs, nxt = B.read(conn, tid, me, o.after, o.n, o.mine, o.open_requests, B.my_roles(conn, tid, me))
             print(fmt_msgs(msgs)); print(f"-- next_after_seq={nxt}")
+        elif o.cmd == "open":
+            _, name = B.open_topic(conn, o.name, me, peer)
+            print(name)
+        elif o.cmd == "join":
+            B.join(conn, B.topic_id(conn, o.topic, None), me, o.agent, o.role)
+        elif o.cmd == "leave":
+            B.leave(conn, B.topic_id(conn, o.topic, None), me, o.agent)
         elif o.cmd == "tail":
             tid, after = B.topic_id(conn, o.topic, None), 0
             while True:
@@ -352,9 +427,7 @@ def main() -> int:
                     print(fmt_msgs(msgs), flush=True)
                 time.sleep(1)
         elif o.cmd == "close":
-            if peer:
-                raise B.BoardError("a bridged peer may not close topics")
-            B.close_topic(conn, o.topic)
+            B.close_topic_as(conn, o.topic, me)
         elif o.cmd == "gc":
             n = B.gc(conn, o.days)
             if not o.quiet:

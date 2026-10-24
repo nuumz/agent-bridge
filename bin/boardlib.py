@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -22,17 +23,23 @@ ONLINE_S = 120            # agent counts as online when its last heartbeat is yo
 LEASE_S = 1500            # claim lease: ask-agent default timeout (900 s) + recovery run + margin
 WAIT_BUDGET = 8           # board_wait calls one server process may make before it must stop waiting
 PEER_OPEN_TASKS = 5       # queued+claimed tasks a peer-origin identity may hold per topic
-KINDS = ("note", "question", "answer", "decision", "task", "system")
+KINDS = ("note", "question", "answer", "decision", "task", "system", "request", "handoff", "done", "blocked")
+CLOSING_KINDS = ("answer", "done", "blocked")   # a request stays open until one of these replies to it
+ROLES = ("leader", "member", "observer")
 TASK_MODES = ("ask", "plan", "write")
 
+# `addressee` is the column behind the `to` argument (TO is an SQLite keyword): NULL = broadcast, like every message
+# posted before the column existed; otherwise `*`, an agent identity, or `@<role>` of the topic's members.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents  (name TEXT PRIMARY KEY, kind TEXT, pid INTEGER, last_seen INTEGER, note TEXT);
 CREATE TABLE IF NOT EXISTS topics  (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, created_by TEXT,
                                     created_at INTEGER, closed_at INTEGER);
 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, topic_id INTEGER NOT NULL, seq INTEGER NOT NULL,
                                     author TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, reply_to INTEGER,
-                                    created_at INTEGER, UNIQUE(topic_id, seq));
+                                    created_at INTEGER, addressee TEXT, UNIQUE(topic_id, seq));
 CREATE TABLE IF NOT EXISTS cursors (agent TEXT, topic_id INTEGER, seq INTEGER, PRIMARY KEY(agent, topic_id));
+CREATE TABLE IF NOT EXISTS members (topic_id INTEGER NOT NULL, agent TEXT NOT NULL, role TEXT NOT NULL,
+                                    joined_at INTEGER, left_at INTEGER, PRIMARY KEY(topic_id, agent));
 CREATE TABLE IF NOT EXISTS tasks   (id INTEGER PRIMARY KEY, topic_id INTEGER NOT NULL, title TEXT NOT NULL, body TEXT,
                                     dir TEXT, mode TEXT NOT NULL DEFAULT 'ask', origin TEXT NOT NULL,
                                     requested_by TEXT, assignee TEXT NOT NULL DEFAULT 'any', priority INTEGER DEFAULT 0,
@@ -59,6 +66,8 @@ def connect() -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     if "deadline" not in {r[1] for r in conn.execute("PRAGMA table_info(workers)")}:   # boards created before 2026-09-12
         conn.execute("ALTER TABLE workers ADD COLUMN deadline INTEGER")
+    if "addressee" not in {r[1] for r in conn.execute("PRAGMA table_info(messages)")}:  # boards before 2026-10-24
+        conn.execute("ALTER TABLE messages ADD COLUMN addressee TEXT")
     return conn
 
 
@@ -178,38 +187,223 @@ def topic_id(conn: sqlite3.Connection, name: str, creator: str | None) -> int:
     return conn.execute("SELECT id FROM topics WHERE name=?", (name,)).fetchone()["id"]
 
 
+def header(body: str) -> dict[str, str]:
+    """`key: value` lines at the top of a body, up to the first blank or non-header line — how a request carries
+    owner / due / shape."""
+    out: dict[str, str] = {}
+    for ln in body.splitlines():
+        key, sep, value = ln.partition(":")
+        if not sep or not key.strip() or " " in key.strip():
+            break
+        out[key.strip().lower()] = value.strip()
+    return out
+
+
+IDENTITY = re.compile(r"[^\s+@*][^\s+]*")    # claude@primary, cursor#41, claude:task3, user:x — no blanks, no `+`
+
+
+def identity(name: str, what: str = "agent") -> str:
+    if not IDENTITY.fullmatch(name) or name == "user:":
+        raise BoardError(f"{what} must be an agent identity like claude@primary or cursor#41 (got {name!r})")
+    return name
+
+
+def addressee(to: str | None) -> str | None:
+    """Normalise a `to` argument: None/'' = broadcast; else `*`, `@<role>` or an agent identity."""
+    if not to:
+        return None
+    if to == "*":
+        return to
+    if to.startswith("@"):
+        if to[1:] not in ROLES:
+            raise BoardError(f"to=@<role> must name one of {ROLES}")
+        return to
+    return identity(to, "to")
+
+
 def post(conn: sqlite3.Connection, tid: int, author: str, body: str, kind: str = "note",
-         reply_to: int | None = None) -> int:
+         reply_to: int | None = None, to: str | None = None) -> int:
     if kind not in KINDS:
         raise BoardError(f"kind must be one of {KINDS}")
     if kind == "decision" and not author.startswith("user:"):
         raise BoardError("kind=decision is reserved for the user (author user:*); post it as note/answer")
+    to = addressee(to)
+    if kind == "request":
+        if to is None:
+            raise BoardError("kind=request needs to=<agent|@role|*>: a request without an owner is a note")
+        if not header(body).get("shape"):
+            raise BoardError("kind=request needs a `shape: <what the answer must look like>` header line")
+    if reply_to is not None and conn.execute("SELECT 1 FROM messages WHERE topic_id=? AND seq=?",
+                                             (tid, reply_to)).fetchone() is None:
+        raise BoardError(f"reply_to={reply_to} is not a message of this topic")
     with tx(conn):
-        conn.execute("INSERT INTO messages(topic_id, seq, author, kind, body, reply_to, created_at) "
-                     "SELECT ?, COALESCE(MAX(seq),0)+1, ?, ?, ?, ?, ? FROM messages WHERE topic_id=?",
-                     (tid, author, kind, body, reply_to, now(), tid))
+        conn.execute("INSERT INTO messages(topic_id, seq, author, kind, body, reply_to, created_at, addressee) "
+                     "SELECT ?, COALESCE(MAX(seq),0)+1, ?, ?, ?, ?, ?, ? FROM messages WHERE topic_id=?",
+                     (tid, author, kind, body, reply_to, now(), to, tid))
         seq = conn.execute("SELECT MAX(seq) FROM messages WHERE topic_id=?", (tid,)).fetchone()[0]
         conn.execute("UPDATE tasks SET lease_until=? WHERE status='claimed' AND claimed_by=?", (now() + LEASE_S, author))
     return seq
 
 
-def read(conn: sqlite3.Connection, tid: int, reader: str, after_seq: int | None, limit: int = 50) -> tuple[list, int]:
-    """Messages after `after_seq` (explicit wins; None = after the reader's unread cursor). Advances the cursor."""
+def _for_me(me: str, roles: list[str]) -> tuple[str, tuple]:
+    """SQL over alias `m`: a message that reaches `me` — broadcast (NULL or *), addressed to me or to one of my
+    @roles, or a reply to a message of mine in the same topic. The board's task-log rows are bookkeeping, not mail."""
+    marks = ",".join("?" * len(roles))
+    sql = ("(m.kind<>'task' AND (m.addressee IS NULL OR m.addressee='*' OR m.addressee=? "
+           + (f"OR m.addressee IN ({marks}) " if roles else "")
+           + "OR m.reply_to IN (SELECT seq FROM messages WHERE topic_id=m.topic_id AND author=?)))")
+    return sql, (me, *roles, me)
+
+
+# a request is closed only by an answer/done/blocked from its addressee (the agent, a member holding the @role, or
+# anyone when it was for everyone) or from the requester — a third party's reply does not take it off the owner's list
+OPEN_REQUEST = ("m.kind='request' AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.topic_id=m.topic_id "
+                "AND r.reply_to=m.seq AND r.kind IN ('answer','done','blocked') AND (m.addressee='*' "
+                "OR r.author=m.addressee OR r.author=m.author OR (m.addressee LIKE '@%' AND r.author IN "
+                "(SELECT agent FROM members b WHERE b.topic_id=m.topic_id AND b.role=substr(m.addressee, 2) "
+                "AND b.left_at IS NULL))))")
+MSG_COLS = 'm.seq, m.author, m.kind, m.body, m.reply_to, m.created_at, m.addressee AS "to"'
+
+
+def read(conn: sqlite3.Connection, tid: int, reader: str, after_seq: int | None, limit: int = 50,
+         mine: bool = False, open_requests: bool = False, roles: list[str] | None = None) -> tuple[list, int]:
+    """Messages after `after_seq` (explicit wins; None = after the reader's unread cursor, or from the start for
+    open_requests). A plain or `mine` read advances the cursor (what `mine` skips was never for the reader);
+    `open_requests` is a view and leaves it alone."""
+    filtered = open_requests
     if after_seq is None:
         row = conn.execute("SELECT seq FROM cursors WHERE agent=? AND topic_id=?", (reader, tid)).fetchone()
-        after_seq = row["seq"] if row else 0
-    rows = conn.execute("SELECT seq, author, kind, body, reply_to, created_at FROM messages "
-                        "WHERE topic_id=? AND seq>? ORDER BY seq LIMIT ?", (tid, after_seq, limit)).fetchall()
+        after_seq = 0 if open_requests else (row["seq"] if row else 0)
+    where, args = ["m.topic_id=?", "m.seq>?"], [tid, after_seq]
+    if mine:
+        sql, a = _for_me(reader, roles or [])
+        where.append(sql)
+        args.extend(a)
+    if open_requests:
+        where.append(OPEN_REQUEST)
+    rows = conn.execute(f"SELECT {MSG_COLS} FROM messages m WHERE {' AND '.join(where)} ORDER BY m.seq LIMIT ?",
+                        (*args, limit)).fetchall()
     last = rows[-1]["seq"] if rows else after_seq
-    with tx(conn):
-        conn.execute("INSERT INTO cursors(agent, topic_id, seq) VALUES(?,?,?) ON CONFLICT(agent, topic_id) "
-                     "DO UPDATE SET seq=MAX(cursors.seq, excluded.seq)", (reader, tid, last))
+    if not filtered:
+        with tx(conn):
+            conn.execute("INSERT INTO cursors(agent, topic_id, seq) VALUES(?,?,?) ON CONFLICT(agent, topic_id) "
+                         "DO UPDATE SET seq=MAX(cursors.seq, excluded.seq)", (reader, tid, last))
     return [dict(r) for r in rows], last
 
 
-def others_after(conn: sqlite3.Connection, tid: int, me: str, after_seq: int) -> bool:
-    return conn.execute("SELECT 1 FROM messages WHERE topic_id=? AND seq>? AND author<>? LIMIT 1",
-                        (tid, after_seq, me)).fetchone() is not None
+def others_after(conn: sqlite3.Connection, tid: int, me: str, after_seq: int, mention: bool = False,
+                 roles: list[str] | None = None) -> bool:
+    """Someone else posted after `after_seq`; with `mention`, only a post that reaches me (see _for_me) counts."""
+    sql, args = _for_me(me, roles or []) if mention else ("1", ())
+    return conn.execute(f"SELECT 1 FROM messages m WHERE m.topic_id=? AND m.seq>? AND m.author<>? AND {sql} LIMIT 1",
+                        (tid, after_seq, me, *args)).fetchone() is not None
+
+
+# ----------------------------------------------------------------------------- members / dm / room
+def member_add(conn: sqlite3.Connection, tid: int, agent: str, role: str = "member") -> None:
+    if role not in ROLES:
+        raise BoardError(f"role must be one of {ROLES}")
+    with tx(conn):
+        conn.execute("INSERT INTO members(topic_id, agent, role, joined_at, left_at) VALUES(?,?,?,?,NULL) "
+                     "ON CONFLICT(topic_id, agent) DO UPDATE SET role=excluded.role, joined_at=excluded.joined_at, "
+                     "left_at=NULL", (tid, agent, role, now()))
+
+
+def member_remove(conn: sqlite3.Connection, tid: int, agent: str) -> bool:
+    with tx(conn):
+        n = conn.execute("UPDATE members SET left_at=? WHERE topic_id=? AND agent=? AND left_at IS NULL",
+                         (now(), tid, agent)).rowcount
+    return bool(n)
+
+
+def members(conn: sqlite3.Connection, tid: int) -> list[dict]:
+    return [dict(r) for r in conn.execute("SELECT agent, role FROM members WHERE topic_id=? AND left_at IS NULL "
+                                          "ORDER BY role, agent", (tid,))]
+
+
+def my_roles(conn: sqlite3.Connection, tid: int, me: str) -> list[str]:
+    """The `@<role>` mentions that reach `me` in this topic (empty when I am not a member)."""
+    return [f"@{m['role']}" for m in members(conn, tid) if m["agent"] == me]
+
+
+def is_leader(conn: sqlite3.Connection, tid: int, me: str) -> bool:
+    return "@leader" in my_roles(conn, tid, me)
+
+
+def shares_topic(conn: sqlite3.Connection, a: str, b: str) -> bool:
+    return conn.execute("SELECT 1 FROM members x JOIN members y ON y.topic_id=x.topic_id WHERE x.agent=? AND y.agent=? "
+                        "AND x.left_at IS NULL AND y.left_at IS NULL LIMIT 1", (a, b)).fetchone() is not None
+
+
+def dm_name(a: str, b: str) -> str:
+    """`dm:<a>+<b>` in sorted order — `+` because identities themselves carry `:` (user:x, claude:task3)."""
+    return "dm:" + "+".join(sorted((a, b)))
+
+
+def _reopen_as(conn: sqlite3.Connection, name: str, me: str, peer: bool) -> None:
+    """A closed dm/room comes back only for the user or the primary, and the reopening is on the record so the
+    close gate asks for a fresh summary."""
+    if conn.execute("SELECT 1 FROM topics WHERE name=? AND closed_at IS NOT NULL", (name,)).fetchone() is None:
+        return
+    if peer:
+        raise BoardError(f"topic '{name}' is closed — only the user or the primary may reopen it")
+    reopen_topic(conn, name)
+    post(conn, topic_id(conn, name, me), me, f"reopened by {me}", "system")
+
+
+def open_topic(conn: sqlite3.Connection, name: str, me: str, peer: bool) -> tuple[int, str]:
+    """Open (or reopen) a topic as `me`. `dm:<a>+<b>`: I must be one side; a bridged peer's other side must be the
+    user or an agent it already shares a topic with. `room:<name>`: the user or the primary only; the opener leads.
+    Any other name keeps the old rule (a bridged peer may not open topics). Returns (topic id, canonical name)."""
+    if name.startswith("dm:"):
+        pair = name[3:].split("+")
+        if len(pair) != 2 or pair[0] == pair[1]:
+            raise BoardError("a dm topic is dm:<agent>+<agent> (two different identities)")
+        for side in pair:
+            identity(side, "each side of a dm")
+        if me not in pair:
+            raise BoardError("a dm must have you on one side")
+        other = pair[1] if pair[0] == me else pair[0]
+        if peer and not (other.startswith("user:") or shares_topic(conn, me, other)):
+            raise BoardError(f"a bridged peer may open a dm only with the user or with an agent it shares a topic with "
+                             f"({other} is neither)")
+        name = dm_name(*pair)
+        _reopen_as(conn, name, me, peer)
+        tid = topic_id(conn, name, me)
+        ever = {r[0] for r in conn.execute("SELECT agent FROM members WHERE topic_id=?", (tid,))}
+        for agent in pair:
+            if agent not in ever:                       # a side that left stays out until it joins again itself
+                member_add(conn, tid, agent, "member")
+        return tid, name
+    if name.startswith("room:"):
+        if peer:
+            raise BoardError("a bridged peer may not open rooms — ask the leader or the user to open one")
+        _reopen_as(conn, name, me, peer)
+        tid = topic_id(conn, name, me)
+        if not members(conn, tid):                      # a reopened room keeps its leader
+            member_add(conn, tid, me, "leader")
+        return tid, name
+    return topic_id(conn, name, None if peer else me), name
+
+
+def _may_manage(conn: sqlite3.Connection, tid: int, me: str) -> bool:
+    return me.startswith("user:") or is_leader(conn, tid, me)
+
+
+def join(conn: sqlite3.Connection, tid: int, me: str, agent: str, role: str = "member") -> None:
+    if not _may_manage(conn, tid, me):
+        raise BoardError("only the topic's leader or the user may add members or set roles")
+    member_add(conn, tid, identity(agent), role)
+
+
+def leave(conn: sqlite3.Connection, tid: int, me: str, agent: str | None = None) -> None:
+    agent = agent or me
+    if agent != me and not _may_manage(conn, tid, me):
+        raise BoardError("only the topic's leader or the user may remove another member")
+    if agent != me and agent.startswith("user:") and not me.startswith("user:"):
+        raise BoardError("the user leaves a topic by their own choice, never removed by an agent")
+    if not member_remove(conn, tid, agent):
+        raise BoardError(f"{agent} is not a member of this topic")
 
 
 # ----------------------------------------------------------------------------- tasks
@@ -305,17 +499,54 @@ def status(conn: sqlite3.Connection, me: str) -> dict:
     online = [dict(r) for r in conn.execute("SELECT name, kind, last_seen FROM agents WHERE last_seen>? ORDER BY name",
                                             (t - ONLINE_S,))]
     topics = []
-    for r in conn.execute("SELECT id, name, created_by, closed_at FROM topics ORDER BY id"):
+    for r in conn.execute("SELECT id, name, created_by FROM topics WHERE closed_at IS NULL ORDER BY id"):
+        mem = members(conn, r["id"])
+        if mem and me not in {m["agent"] for m in mem} and not me.startswith("user:"):
+            continue                                        # members only — the user, who runs the board, sees all
         cur = conn.execute("SELECT seq FROM cursors WHERE agent=? AND topic_id=?", (me, r["id"])).fetchone()
         last = conn.execute("SELECT COALESCE(MAX(seq),0) FROM messages WHERE topic_id=?", (r["id"],)).fetchone()[0]
-        topics.append({"name": r["name"], "created_by": r["created_by"], "closed": bool(r["closed_at"]),
-                       "last_seq": last, "unread_for_me": last - (cur["seq"] if cur else 0)})
+        topics.append({"name": r["name"], "created_by": r["created_by"], "members": mem, "last_seq": last,
+                       "unread_for_me": last - (cur["seq"] if cur else 0),
+                       "open_requests_to_me": open_requests_to(conn, r["id"], me)})
     tasks = [dict(r) for r in conn.execute(
         "SELECT t.id, p.name AS topic, t.title, t.assignee, t.mode, t.origin, t.status, t.claimed_by "
         "FROM tasks t JOIN topics p ON p.id=t.topic_id WHERE t.status IN ('queued','claimed') ORDER BY t.priority DESC, t.id")]
     workers = [{"identity": r["identity"], "family": r["family"], "task_id": r["task_id"],
                 "running_s": t - r["started_at"]} for r in live_workers(conn)]
-    return {"me": me, "online": online, "topics": topics, "open_tasks": tasks, "running_workers": workers}
+    return {"me": me, "online": online, "topics": topics, "open_tasks": tasks, "running_workers": workers,
+            "open_requests_to_me": sum(x["open_requests_to_me"] for x in topics)}
+
+
+def open_requests_to(conn: sqlite3.Connection, tid: int, me: str) -> int:
+    """Requests by others in this topic, addressed to me / one of my roles / everyone, with no closing reply yet."""
+    roles = my_roles(conn, tid, me)
+    marks = ",".join("?" * len(roles))
+    by_role = f"OR m.addressee IN ({marks})" if roles else ""
+    return conn.execute(f"SELECT COUNT(*) FROM messages m WHERE m.topic_id=? AND m.author<>? AND {OPEN_REQUEST} "
+                        f"AND (m.addressee='*' OR m.addressee=? {by_role})", (tid, me, me, *roles)).fetchone()[0]
+
+
+def close_topic_as(conn: sqlite3.Connection, name: str, me: str) -> None:
+    """Close as `me`: the user, the topic's leader, either side of a dm, or the creator of a topic that has no members
+    (the pre-members shape). A topic with members closes only after a summary — a `done` to everyone that answers
+    nothing in particular (reply_to NULL) and comes after the last request and the last reopening — so the board
+    itself records what the team finished."""
+    row = conn.execute("SELECT id, name, created_by FROM topics WHERE name=? AND closed_at IS NULL", (name,)).fetchone()
+    if row is None:
+        raise BoardError(f"topic '{name}' is not open")
+    tid, mem = row["id"], members(conn, row["id"])
+    mine = me in {m["agent"] for m in mem}
+    if not (_may_manage(conn, tid, me) or (name.startswith("dm:") and mine) or (not mem and row["created_by"] == me)):
+        raise BoardError("only the topic's leader or the user may close it (either side closes a dm)")
+    if mem:
+        floor = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM messages WHERE topic_id=? AND (kind='request' "
+                             "OR (kind='system' AND body LIKE 'reopened by %'))", (tid,)).fetchone()[0]
+        summary = conn.execute("SELECT 1 FROM messages WHERE topic_id=? AND kind='done' AND addressee='*' "
+                               "AND reply_to IS NULL AND seq>?", (tid, floor)).fetchone()
+        if summary is None:
+            raise BoardError("post a summary first (kind=done to=*, not a reply, after the last request: what was "
+                             "done, the evidence, what is still open)")
+    close_topic(conn, name)
 
 
 def close_topic(conn: sqlite3.Connection, name: str, missing_ok: bool = False) -> bool:
@@ -340,7 +571,7 @@ def gc(conn: sqlite3.Connection, days: int) -> int:
     with tx(conn):
         ids = [r["id"] for r in conn.execute("SELECT id FROM topics WHERE closed_at IS NOT NULL AND closed_at<?", (cutoff,))]
         for tid in ids:
-            for table in ("messages", "cursors", "tasks"):
+            for table in ("messages", "cursors", "tasks", "members"):
                 conn.execute(f"DELETE FROM {table} WHERE topic_id=?", (tid,))
             conn.execute("DELETE FROM topics WHERE id=?", (tid,))
         conn.execute("DELETE FROM agents WHERE last_seen<?", (cutoff,))

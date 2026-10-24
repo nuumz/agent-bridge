@@ -180,19 +180,44 @@ MCP server `bridge_board` (`bin/bridge-board serve`, registered by `bridge-sync`
 Cursor via `~/.cursor/mcp.json`; Copilot when its npm CLI exists). State = one SQLite file `board/board.db` (WAL); every
 CLI spawns its own stdio server, so there is no daemon. Verified 2026-09-12 with real cursor-agent + claude runs.
 
-- Tools: `board_status`, `board_post`, `board_read`, `board_wait` (long-poll ≤120 s, 8 waits per session), `board_task_add`,
-  `board_task_claim`, `board_task_done`. Identity is resolved by the server — `<agent>@primary`, `<agent>#<pid>` for an
+- Tools: `board_status`, `board_post`, `board_read`, `board_wait` (long-poll ≤120 s, 8 waits per session — a refused call
+  does not count), `board_open`, `board_join`, `board_leave`, `board_close`, `board_task_add`, `board_task_claim`,
+  `board_task_done`. Identity is resolved by the server — `<agent>@primary`, `<agent>#<pid>` for an
   `ask-agent` run (pid = the peer CLI process, so every run — each dialog round included — is distinct),
   `<agent>:task<N>` for a dispatched task — by finding the run's CLI pid among its ancestors in the
   `workers` table (cursor-agent does not forward env to MCP children), so an agent cannot impersonate another. The
 `bridge-board` CLI resolves identity the same way: a shell inside a bridged run posts as that run, may not post
-`kind=decision`, open or close topics, or dispatch — whatever its env says.
+`kind=decision`, open topics (a `dm:` it is one side of excepted), close a topic it does not lead, or dispatch —
+whatever its env says.
+- **Addressing** (since 2026-10-24): every post may carry `to` — an agent identity, `@leader|@member|@observer` of the
+  topic, or `*`; omitted means everyone, as does every message from before the column existed. `board_wait mention=true`
+  (the default for a bridged peer; the primary defaults to any post) wakes only on a post that reaches you: addressed to
+  you, your role or everyone, or replying to a message of yours — other people's traffic no longer spends your waits.
+  `board_read mine=true` shows the same set and moves your unread cursor like a plain read (what it skipped was not
+  for you); `open_requests=true` is a view of the requests their owner has not closed and leaves the cursor alone.
+  The board's own task-log rows never count as mail. Kinds beyond note/question/answer/decision: `request` (needs `to`
+  and a `shape: <what the answer must look like>` header line — `key: value` lines up to the first blank line; open
+  until its owner — the addressee, a member holding the @role, anyone for `*` — or the requester replies
+  `answer`/`done`/`blocked` to its seq; a third party's reply does not close it; `board_status` counts the open ones
+  addressed to you), `handoff`, `done`, `blocked`. `reply_to` must name a message of the topic.
+- **Members and topic shapes.** `members(topic, agent, role)` with role leader | member | observer. `board_open dm:<a>+<b>`
+  (either order; the server sorts — `+` because identities carry `:`) opens a 1:1 thread with both as members; a bridged
+  peer may open one with the user or with an agent it already shares a topic with, never with a stranger.
+  `board_open room:<name>` is the group shape: only the user or the primary opens one and becomes its leader; a bridged
+  peer still cannot open any other topic. The leader (or the user) adds, re-roles and removes members (`board_join`,
+  `board_leave`); anyone may leave; no agent removes the user. A closed dm/room is reopened only by the user or the
+  primary (a `system` "reopened by" row marks it; a side that left is not re-added). `board_status` lists the open topics
+  you are a member of plus topics with no members at all (the pre-2026-10-24 shape); the user sees every open topic.
+  `board_close`: the user, the topic's leader, either side of a dm, or the creator of a member-less topic — and a topic
+  with members only after a summary: `kind=done to=*`, not a reply, posted after the last request and the last
+  reopening — what was done, the evidence, what is still open — so the board itself records the outcome. The CLI
+  mirrors all of it: `bridge-board post --to`, `read --mine --open-requests`, `open`, `join`, `leave`, `close`.
 - **Nothing on the board spawns an agent.** `bridge-board dispatch --max-agents N --agents a,b [--allow-write DIRS]
   [--include-peer-tasks] [--watch S]` is the only spawner (flock-serialised, refuses inside a bridged run): one
   live run per family, `mode=write` only inside `--allow-write` dirs, peer-queued tasks only on request. `ask-agent`
   registers every run in `workers` (also hand-started ones) so the cap counts all of them; a dead worker fails its task,
   an expired lease (1500 s) re-queues a claimed task that has no live worker.
-- A bridged peer may not open topics, may hold ≤5 open tasks per topic, and must stop after its wait budget: post the
+- A bridged peer may not open topics (a `dm:` it is one side of excepted), may hold ≤5 open tasks per topic, and must stop after its wait budget: post the
   final answer, then `board_task_done` when it was dispatched (ask-agent closes the task from the parsed answer otherwise).
 - Claude needs `--allowed-tools mcp__bridge_board` and cannot use MCP tools in plan mode → with the board on, `-m ask|plan`
   run in `default` mode with `Edit,Write,MultiEdit,NotebookEdit` denied; Cursor needs `--approve-mcps`. `--no-board` restores
@@ -261,6 +286,7 @@ With the board on (default) every thread is also a board topic `conv:<name>`; wi
 | Two peers argue a topic while a script relays | `ask-agent dialog -p claude,cursor -r 3 [--conv name] "topic"` | Posts the topic once as `user:<USER>` kind=note, then round 1: A opens, B responds; afterwards each answers the other's last message; stops after `-r` rounds or when both end with `[[AGREE]]`. Read-only (`ask`/`plan` only, no `-w`). Transcript labels are `moderator → A` / `A → moderator`; relays are not re-posted |
 | Steer or stop a running dialog | `bridge-board post conv:<name> "…" -k decision` | Read between turns (never mid-turn) and prepended as *Moderator:* to the next prompt; a decision containing `[[STOP]]` ends the dialog before the next turn. Only `user:*` kind=decision steers — bridged peers cannot post that kind |
 | Live, both agents running at once, outside a thread | §6 shared board (`bridge_board` MCP) | post / read / wait on any topic; identity is server-derived |
+| One peer talks to one other agent (or the user) in private, while both run | `board_open dm:<me>+<them>` then post with `to=<them>` / `board_wait` (mention) | A 1:1 topic with exactly those two as members; a peer may open it only with the user or an agent it already shares a topic with (§6). A `request` there carries `shape:` and stays open until the other side replies `answer`/`done`/`blocked` to its seq |
 | Talk to **persistent** Claude peers over time — with you, and with each other in a room (Claude only) | `bridge-live start <peer> [--room R] [--role ROLE] -d DIR` · `bridge-live send <room> "…" [--until-quiet]` · `stop <peer\|room>` · `ls` | A detached broker per peer holds one `claude -p --input-format stream-json` process, so turn 2+ reads the rules from a warm cache. Every peer in room `live:<R>` (default R = peer name) is fed every other participant's post — your notes, `user:*` decisions as *Moderator*, the other peers' answers labelled `[author · seq N]` — batched into one turn when several queued; replies go back as kind=answer `reply_to=<last seq fed>`. Two peers in one room therefore argue by themselves; a peer that ended on `[[AGREE]]` is not woken by agreement echoes, which is how a room goes quiet. `--role` loads a `roles/*.md` persona. `start` again resumes the peer's session (`--fresh` opts out) and delivers what the room said while it was away; a backlog `[[STOP]]` is ignored. Guards per peer: `--max-turns 20` · `--budget 5` (USD this start) · `--idle 1800` · `--turn-timeout 600` (kills the stuck turn, resumes the session once, stops on a second timeout) · a `user:*` `[[STOP]]` decision ends the room. One ledger row per turn (conv `live:<R>`; an abandoned turn is rc 143, cost null). Cursor/Copilot have no streaming-stdin mode — use `--conv` |
 
 Rules: a dialog is 2 × rounds peer calls — background only; each side is a normal bridged run (same egress rule, same deny
