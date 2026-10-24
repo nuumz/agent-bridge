@@ -28,7 +28,7 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
         k, v = line.split(":", 1)
         v = v.strip()
         if len(v) >= 2 and v[0] == v[-1] == '"':
-            v = v[1:-1]
+            v = v[1:-1].replace("\\\\", "\\")           # quoted = JSON-style: `\\b` is the regex `\b`
         meta[k.strip()] = v
     return meta, body
 
