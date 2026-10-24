@@ -163,7 +163,11 @@ wrapper never echoed hung 2 h 45 min, a batch issued without `timeout: 600000` w
 orphan loop firing "interim" notifications at the caller, and a bare `sleep` is blocked outright (all three
 2026-09-27). Clear the rc file before launch so a stale sentinel cannot finish the wait.
 `bridge-panel` / `bridge-work` / `bridge-fix` install a SIGTERM handler that still writes the rc file (`rc=143`) so a
-killed run does not leave waiters polling forever — launch with `--detach` (see `peer-*` agents).
+killed run does not leave waiters polling forever — launch with `--detach` (see `peer-*` agents). The same handler
+covers SIGHUP (`rc=129`) and SIGINT (`rc=130`), and the kill reaches the peers: every `ask-agent` (and `--verify`
+command) the run has alive — a panel's parallel workers included — sits in its own process group and gets SIGTERM
+at once, so `ask-agent` forwards it to the peer; whatever is still there 10 s later is SIGKILLed. The rc file is
+written once they have exited (normally within a few seconds), so `rc=143` means nothing is still editing.
 
 **Lost answers.** Cursor `-m plan` can spend its whole turn on tools and return one narration line.
 `ask-agent cursor` detects that (short result + large output tokens) and resumes the session once to fetch

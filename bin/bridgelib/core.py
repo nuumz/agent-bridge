@@ -8,6 +8,7 @@ import re
 import signal
 import sys
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -98,12 +99,21 @@ def cited_roots(text: str, cwd: str, granted: list[str]) -> list[str]:
     return roots
 
 def guarded_rc(name: str, write_rc: Callable[[str, int], int], body: Callable[[], int]) -> int:
-    """Run `body` with SIGTERM → exit 143; always write_rc(name, rc), including on SIGTERM.
+    """Run `body` with SIGTERM → exit 143 (SIGHUP 129, SIGINT 130); always write_rc(name, rc), on a signal too.
 
     Agent/Bash kills of a foreground bridge call send SIGTERM; without this the waiter never sees a
     done signal. SystemExit from the handler is intercepted so `rc` is 143 before write_rc runs.
+    The handler first signals every child run_tool() has alive — in any thread, so a panel's parallel
+    workers are covered — then SIGKILLs whatever is still there 10 s later; the body unwinds as they exit.
     """
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    def on_signal(signum: int, _frame: Any) -> None:
+        _signal_children(signal.SIGTERM)
+        t = threading.Timer(10, _signal_children, (signal.SIGKILL,))
+        t.daemon = True
+        t.start()
+        sys.exit(128 + signum)
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):     # the set runner.run forwards for ask-agent
+        signal.signal(s, on_signal)
     rc = 1
     try:
         rc = body()
@@ -114,6 +124,72 @@ def guarded_rc(name: str, write_rc: Callable[[str, int], int], body: Callable[[]
     finally:
         write_rc(name, rc)
     return rc
+
+def kill_tree(proc: subprocess.Popen, sig: int = signal.SIGTERM, grace: int = 10) -> None:
+    """Signal the child's whole process group (the CLI and every tool/MCP child it spawned); SIGKILL after `grace` s."""
+    for s, wait in ((sig, grace), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(proc.pid, s)
+        except OSError:                 # ESRCH: gone; EPERM: macOS, when what is left of the group is a zombie
+            return
+        try:
+            proc.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+_CHILDREN: set[subprocess.Popen] = set()        # run_tool children alive now, in any thread (guarded_rc signals them)
+_CHILDREN_LOCK = threading.Lock()
+
+
+def _signal_children(sig: int) -> None:
+    with _CHILDREN_LOCK:
+        procs = list(_CHILDREN)
+    for p in procs:
+        try:
+            os.killpg(p.pid, sig)
+        except OSError:                 # ESRCH: gone; EPERM: macOS, when what is left of the group is a zombie
+            pass
+
+
+def _end_group(proc: subprocess.Popen, grace: int) -> None:
+    """SIGTERM the group, SIGKILL the direct child after `grace` s, then SIGKILL what the child left behind in the
+    group (a verify command's children that ignore SIGTERM and still hold the pipes)."""
+    kill_tree(proc, grace=grace)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:                     # ESRCH: gone; EPERM: macOS, when what is left of the group is a zombie
+        pass
+
+
+def run_tool(argv, *, input: str | None = None, cwd: str | Path | None = None, timeout: float | None = None,
+             shell: bool = False) -> subprocess.CompletedProcess:
+    """subprocess.run(capture_output=True, text=True) for a child that has children of its own (ask-agent and its
+    peer, a verify command and its build). The child gets its own process group; a timeout, or a signal that unwinds
+    this call (guarded_rc turns SIGTERM into SystemExit), takes the whole group down with SIGTERM first, so ask-agent
+    forwards it to the peer. subprocess.run would SIGKILL the direct child alone: an ask-agent killed that way never
+    forwards anything, and its peer — in write mode, still editing — outlives the run whose rc file says 143."""
+    proc = subprocess.Popen(argv, cwd=cwd, shell=shell, text=True, process_group=0,
+                            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    with _CHILDREN_LOCK:
+        _CHILDREN.add(proc)
+    try:
+        out, err = proc.communicate(input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _end_group(proc, grace=10)
+        out, err = proc.communicate()
+        raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err)
+    except BaseException:
+        # grace 5: ask-agent's own forward SIGKILLs its peer at 3 s, so it has exited (or is past that) by then
+        _end_group(proc, grace=5)
+        raise
+    finally:
+        with _CHILDREN_LOCK:
+            _CHILDREN.discard(proc)
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
 
 def detach(log: Path) -> None:
     """`--detach`: fork; the parent prints `detached pid=N log=PATH` and exits 0 at once, the child keeps running in

@@ -35,7 +35,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger, workskills  # noqa: E402
-from bridgelib.core import ROOT, STATE, detach, guarded_rc, hop_active, lang_rule, share_add_dirs  # noqa: E402
+from bridgelib.core import (ROOT, STATE, detach, guarded_rc, hop_active, lang_rule, run_tool,  # noqa: E402
+                            share_add_dirs)
 
 ASK = ROOT / "bin" / "ask-agent"
 BOARD = ROOT / "bin" / "bridge-board"
@@ -49,7 +50,7 @@ def git(repo: str | Path, *a: str) -> subprocess.CompletedProcess:
 def ask(peer: str, mode: str, cwd: str, prompt: str, timeout: int, conv: str, kind: str) -> tuple[int, str, str]:
     """One bridged run; returns (rc, answer, bridge/error lines)."""
     argv = [str(ASK), peer, "-m", mode, "-d", cwd, "-t", str(timeout), "--conv", conv, "--kind", kind]
-    r = subprocess.run(argv, input=prompt, capture_output=True, text=True)
+    r = run_tool(argv, input=prompt)                # a kill of this run reaches the peer through ask-agent
     answer = "\n".join(ln for ln in r.stdout.splitlines() if not ln.startswith("[bridge]")).strip()
     notes = "\n".join(ln for ln in r.stderr.splitlines() if ln.startswith("[bridge]"))
     if r.returncode not in (0, 5) and not answer:
@@ -117,7 +118,7 @@ def outside(files: list[str], allowed: list[str]) -> list[str]:
 
 def verify(wt: Path, cmd: str, timeout: int = 600) -> tuple[int, str]:
     try:
-        r = subprocess.run(cmd, shell=True, cwd=wt, capture_output=True, text=True, timeout=timeout)
+        r = run_tool(cmd, shell=True, cwd=wt, timeout=timeout)     # the timeout ends the build, not just the shell
     except subprocess.TimeoutExpired:
         return 124, f"verify timed out after {timeout}s"
     out = (r.stdout + "\n" + r.stderr).strip()
