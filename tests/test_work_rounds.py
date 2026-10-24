@@ -139,3 +139,88 @@ class Loop(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EarlierAttempt(unittest.TestCase):
+    """A second `bridge-work run <name>` finds the worktree of the first: what it carries is named to the implementer
+    (files and diff, with the base to discard against), or discarded up front with --fresh."""
+
+    ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+           "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def git(self, cwd: Path, *a: str) -> str:
+        return subprocess.run(["git", *a], cwd=cwd, env=self.ENV, check=True, capture_output=True, text=True).stdout
+
+    def start(self, d: Path, fresh: bool, between=None):
+        w = _load()
+        repo = d / "repo"
+        (repo / "src").mkdir(parents=True)
+        (repo / "src" / "x.py").write_text("x = 1\n")
+        (repo / ".gitignore").write_text(".claude/worktrees/\n")
+        self.git(repo, "init", "-q")
+        self.git(repo, "add", ".")
+        self.git(repo, "commit", "-q", "-m", "base")
+        base = self.git(repo, "rev-parse", "HEAD").strip()
+        wt = repo / ".claude" / "worktrees" / "bridge-w"
+        self.git(repo, "worktree", "add", "-q", "-b", "bridge/w", str(wt), base)
+        (wt / "src" / "x.py").write_text("x = 2  # first attempt\n")                  # the earlier attempt
+        (wt / "src" / "new.py").write_text("print('untracked from attempt one')\n")
+        if between:                                                                     # what happened since run one
+            between(repo, wt)
+        prompts: list[str] = []
+
+        def ask(peer, mode, cwd, prompt, timeout, conv, kind, peers=None):
+            if mode == "write":
+                prompts.append(prompt)
+                return 0, "attempt", "", peer
+            return 0, "NONE", "", peer
+        o = argparse.Namespace(name="w", task="t", dir=str(repo), peers="claude,cursor", implementer=None,
+                               reviewer=None, base=None, files="src/x.py,src/new.py", verify="true", agreement=None,
+                               rounds=1, timeout=5, skill="none", detach=False, fresh=fresh)
+        with mock.patch.object(w, "WORK", d / "work"), mock.patch.object(w, "ask_with_fallback", ask), \
+                mock.patch.object(w, "verify", lambda wt, cmd, timeout=600: (0, "ok")), \
+                mock.patch.object(w, "close_threads", lambda n: None), \
+                mock.patch.object(ledger, "LEDGER", d / "ledger.jsonl"), \
+                mock.patch("sys.stderr"), mock.patch("sys.stdout"):
+            rc = w.run(o)
+        report = d / "work" / "w" / "report.md"
+        return prompts[0] if prompts else "", report.read_text() if report.is_file() else "", wt, rc
+
+    def test_the_implementer_is_told_what_the_worktree_carries(self):
+        with tempfile.TemporaryDirectory() as d:
+            prompt, report, wt, _ = self.start(Path(d), fresh=False)
+            self.assertIn("earlier run left changes in this worktree", prompt)
+            self.assertIn("src/x.py", prompt)
+            self.assertIn("src/new.py", prompt)
+            self.assertIn("git checkout", prompt)                                      # how to discard, with the base
+            self.assertIn("earlier attempt: 2 file(s) carried", report)
+            self.assertEqual((wt / "src" / "x.py").read_text(), "x = 2  # first attempt\n")   # nothing discarded
+
+    def test_fresh_resets_the_worktree_to_base_first(self):
+        with tempfile.TemporaryDirectory() as d:
+            prompt, report, wt, _ = self.start(Path(d), fresh=True)
+            self.assertNotIn("earlier run left changes", prompt)
+            self.assertEqual((wt / "src" / "x.py").read_text(), "x = 1\n")
+            self.assertFalse((wt / "src" / "new.py").exists())
+            self.assertIn("earlier attempt: 2 file(s) discarded (--fresh)", report)
+
+    def test_the_base_is_the_branch_point_even_after_main_moved_on(self):
+        def main_moves(repo, wt):
+            (repo / "src" / "y.py").write_text("y = 1\n")
+            self.git(repo, "add", "src/y.py")
+            self.git(repo, "commit", "-q", "-m", "main moved")
+        with tempfile.TemporaryDirectory() as d:
+            prompt, report, wt, _ = self.start(Path(d), fresh=False, between=main_moves)
+            self.assertIn("2 file(s): src/new.py, src/x.py", prompt)                       # not main's y.py
+            self.assertNotIn("y.py", prompt)
+
+    def test_fresh_refuses_to_drop_commits_the_user_made_on_the_branch(self):
+        def user_commits(repo, wt):
+            self.git(wt, "add", "src/x.py")
+            self.git(wt, "commit", "-q", "-m", "kept part of attempt one")
+        with tempfile.TemporaryDirectory() as d:
+            prompt, report, wt, rc = self.start(Path(d), fresh=True, between=user_commits)
+            self.assertEqual(rc, 2)
+            self.assertEqual(prompt, "")                                                     # no peer was spent
+            self.assertEqual((wt / "src" / "x.py").read_text(), "x = 2  # first attempt\n")  # the commit stands
+            self.assertTrue((wt / "src" / "new.py").exists())
