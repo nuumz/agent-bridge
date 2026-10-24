@@ -18,6 +18,7 @@ BIN = Path(__file__).resolve().parents[1] / "bin"
 sys.path.insert(0, str(BIN))
 
 import boardlib  # noqa: E402
+from bridgelib import ledger  # noqa: E402
 
 USER, PRIMARY, CURSOR_RUN, LIVE = "user:tester", "claude@primary", "cursor:task1", "claude@live:p"
 REQUEST = "shape: table file:line · claim · evidence\n\nList every caller of post()."
@@ -39,6 +40,7 @@ class Turns(unittest.TestCase):
         board_dir = home / ".agent-bridge" / "state" / "board"
         self.patches = [mock.patch.object(boardlib, "BOARD_DIR", board_dir),
                         mock.patch.object(boardlib, "DB_PATH", board_dir / "board.db"),
+                        mock.patch.object(ledger, "LEDGER", board_dir / "ledger.jsonl"),   # _score_reply logs here
                         mock.patch.dict(os.environ, {"HOME": str(home), "USER": "tester"})]
         for p in self.patches:
             p.start()
