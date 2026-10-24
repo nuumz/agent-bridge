@@ -10,7 +10,7 @@ from pathlib import Path
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 sys.path.insert(0, str(BIN))
-from bridgelib import ledger  # noqa: E402
+from bridgelib import ledger
 
 
 def _load():
@@ -119,9 +119,19 @@ class Loop(unittest.TestCase):
         self.assertIn("switched implementer: round 3: claude→cursor", report)
         self.assertIn("rounds: 3/3", report)
 
+    def test_revise_verdict_without_a_row_sends_the_implementer_back_from_the_loop(self):
+        # the loop must consume review_fixes (verdict-aware), not must_fix: a bare REVISE earns a second round
+        got, calls, report = self.run_loop(2, [0, 0], ["NONE\nBRIDGE_VERDICT=REVISE", "NONE\nBRIDGE_VERDICT=APPROVE"])
+        self.assertEqual(calls, ["write:claude", "ask:cursor", "write:claude", "ask:cursor"])
+        self.assertEqual([r["verdict"] for r in got["rounds"]], ["REVISE", "APPROVE"])
+        self.assertIn("BRIDGE_VERDICT=REVISE", got["rounds"][0]["must_fix"][0])
+        self.assertEqual(got["rounds"][1]["must_fix"], [])
+        self.assertIn("review verdict: APPROVE", report)
+        self.assertIn("READY FOR REVIEW", report)
+
     def test_no_switch_without_a_repeat_or_when_green(self):
         one = "| file:line | finding | severity | must-fix | why |\n|---|---|---|---|---|\n| src/x.py:1 | a | high | yes | x |"
-        got, calls, report = self.run_loop(2, [1, 0], [one, "NONE"])
+        _got, calls, report = self.run_loop(2, [1, 0], [one, "NONE"])
         self.assertEqual(calls, ["write:claude", "ask:cursor", "write:claude", "ask:cursor"])
         self.assertIn("READY FOR REVIEW", report)
         self.assertNotIn("switched", report)
