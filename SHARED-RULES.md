@@ -225,8 +225,12 @@ write delegation review `git status` / `git diff` before building on the result.
   `<repo>/.cursor/rules/` before each run and lists them in `.git/info/exclude` (local only, never committed); a `-w` run gets a
   prompt preamble pointing at `~/.agent-bridge/state/mirror/` instead, because a fresh worktree has no untracked files. User-level skills
   in `~/.cursor/skills-cursor/` DO reach the CLI (canary YES).
-- Machine-wide engineering rules live in `~/.claude/CLAUDE.md` (source of truth). `bridge-sync` strips the
-  Claude-only parts (the `@RTK.md` import, `## Efficient Agent Usage`, the commit-token recipe, any
+- Machine-wide engineering rules live in `~/.claude/CLAUDE.md` (source of truth). `bridge-sync` says what its filters
+  dropped and names a configured section it did not find; an inline commit-marker mention loses only its own sentence;
+  if the stripped text would still carry the marker, `.commit-authorized`, `commit-autonomy on` or an unterminated
+  `<!-- bridge:skip -->`, no rules mirror is written (an existing peer file stays as it is, a peer without one gets
+  the bridge note alone) and `bridge-sync` exits 1. It strips the Claude-only parts (the `@RTK.md` import, any
+  section named in `SKIP_HEADINGS`, the commit-token recipe, any
   `<!-- bridge:skip --> … <!-- /bridge:skip -->` region) into `~/.agent-bridge/state/mirror/user-rules.md` and
   writes it to each peer — **edit the Claude file, never a mirror** (mirrors carry a GENERATED marker and are
   overwritten; a peer file without the marker is the user's and is left alone).
