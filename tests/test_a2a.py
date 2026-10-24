@@ -34,8 +34,8 @@ class Server(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        root = Path(self.tmp.name)
-        self.home, self.work = root / "home", root / "work"
+        root = Path(self.tmp.name).resolve()             # macOS: /var is a link to /private/var, and the board
+        self.home, self.work = root / "home", root / "work"   # stores a turn's dir resolved
         self.work.mkdir()
         state = self.home / ".agent-bridge" / "state"
         a2a_dir = state / "a2a"
