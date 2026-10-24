@@ -233,6 +233,16 @@ whatever its env says.
   `board_status` counts the open ones
   addressed to you), `handoff`, `done`, `blocked` (refused without a `missing: <what you lack>` header line — `-`,
   `none`, `n/a` do not count). `reply_to` must name a message of the topic.
+- **Shape check** (`bridgelib/evidence.py`): an agent's `answer`/`done` to another agent's request is held to the
+  tokens of the request's `shape:` a script can read — `table` (two table rows), `file:line`, `json` (a fenced json
+  block), `diff`/`patch`, `decision` (a four-column row), `command`. A reply that misses one is **refused** with the
+  shape quoted back (that refusal is the one automatic re-request; the peer reposts in shape or `blocked` with a
+  `missing:` line) and logged as a `shape_miss` ledger row (the same wrong body retried is one row); every `blocked`
+  reply is logged too. A shape offering alternatives (`json or a table`) is met by either; a negated token (`no
+  table`) is not asked for; `command output` asks for output, not a command. Not scored: the requester withdrawing
+  its own request (a later run of the same `<family>#<pid>` thread counts as the requester), a human, a reply to a
+  card, a reply to a request already closed, and a `shape:` with no checkable token. A live peer whose reply is
+  refused is asked once more with the refusal quoted; a second refusal keeps the text as a `note`.
 - **Cards — the one way to reach the human.** `board_ask_user(topic, kind=decision|fact, question, options,
   recommendation, if_undecided[, due])` posts a `request` to `user:<USER>` whose body is `boardlib.card()`: header
   `card:` / `shape: decision|fact` / `due:`, then the table question · options · recommendation · if undecided. A
@@ -404,6 +414,10 @@ A role file = frontmatter (`name`, `peer`, optional `model` → `-M`, optional `
 persona prompt; add a role by adding a file. Cursor roles run on `auto` (decision 2026-09-26, replacing the 2026-09-12
 pin to the latest Grok, which ran out of usage); set `model:` in a role file to pin one. See §2 for how `-m ask` maps to it. Rules: `-p` is the egress gate — roles whose peer is not in `-p` are skipped, so the user names every vendor that
 will see the repo; the leader never investigates, and the report may cite only evidence a role gave (else UNVERIFIED);
+a role whose citations — in its finding and its cross-examination — mostly failed the machine check (≥2 made,
+under half resolving) is named **low-evidence** in
+the synthesis prompt and the report header — its claims are weighed as UNVERIFIED unless another role's citation
+holds; the panel ledger row carries `citations` per role and `low_evidence`;
 a worker that asks back (exit 5) is listed at the top of the report with the exact `--conv` command to answer it; the
 report is a lead for the human — decisions stay with the user (`peer review: panel <name>, <date>`). Cost: 2 + 2 × roles
 peer runs with cross-examination (1 + roles without). Measured 2026-09-12 on one probe incident, three rounds, same
@@ -439,6 +453,16 @@ from them. `cost` is the run's own cost: Claude reports `total_cost_usd` cumulat
 cross-examination, synthesis), so the row keeps that as `cost_session` and subtracts the total the run resumed from. Quality: after verifying a peer's findings, `bridge-plan mark <panel|log> [-r role] --kept N --rejected M`
 appends a `type: verdict` row; `learn` prints kept-rate per peer/role and suggests dropping one below 50% over ≥10
 findings. `learn --backfill` rebuilds run/panel rows from disk and carries work/fix/verdict rows over.
+**Scorecard** (`bridge-plan learn --team [--days 30]`): one row per (role|kind, peer) from what a script could check —
+`runs`, `ok%` (rc 0), `ask` (asked back), `med $`, `tools` (median tool calls — how much the run did), `cites`
+(file:line citations in the answer that resolve / made;
+every run row now carries `citations_ok/total`, `tool_calls`, `tokens_in`, `asked_back`), `miss` (replies refused for
+missing the requested shape), `blk` (blocked replies), `decl` (the same request missed twice), `kept` (verdicts).
+Board rows carry a peer family, no role, so they sit under `board`. Suggestions name the better peer in the same row
+(≥3 runs) or the role's `fallback_peer`: under half the citations resolving (≥3), two shape misses, asked back in
+more than half the runs. `bridge-plan "<request>"` prints one `scorecard` line when another peer ended rc=0 at least
+20 points more often on that kind over 3+ runs — a lead; `-p` stays the human's choice. Never the peer's own word:
+tool calls and tokens say how much it did, citations and verdicts whether it was any good.
 **The tool proposes; a human edits the playbook.** Decisions (grain · gate · vocabulary · status) never move to a peer
 or to this loop.
 
@@ -489,7 +513,13 @@ bridge-work show <name>       # ~/.agent-bridge/state/work/<name>/report.md
    A role whose peer is unavailable (out of quota · binary missing · disabled) **falls back to claude once**, only
    when `claude` is in `-p` (the egress gate); the report header shows `cursor→claude` and the ledger row keeps `used`.
 5. **Loop** — a red verify, a file outside the set, or a must-fix=yes row goes back to the implementer with exactly
-   those points, at most `--rounds` times (default 2).
+   those points, at most `--rounds` times (default 2). A must-fix finding that comes back unchanged (`finding_key`:
+   file + finding text, line and case ignored) after **two red verifies in a row** hands the next round to the other
+   peer in `-p` — once, never back — with the old implementer reviewing (nobody reviews their own change) and the
+   failed attempt quoted as "already tried and FAILED — do not repeat; you may discard it with `git checkout <base>
+   -- <files>`"; a switch decided on the last round earns that one extra round (so it works with the default 2).
+   `rounds.json` keeps `repeat_findings` per round, the ledger row `verify_rc_per_round`, `repeat_findings` and
+   `switched`, the report header `switched implementer: round N: a→b`.
 6. **Report** — `work/<name>/report.md` + `work/<name>/rc` (cleared at start; written on every exit): READY FOR REVIEW / NOT DONE, diff stat, verify tail, the review table, the
    implementer's note, and the commands to read / take / discard the branch. Exit 0 = ready, 1 = not done.
    A ledger row `type: work` (includes `skill`) is appended.

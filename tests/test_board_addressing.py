@@ -22,6 +22,7 @@ import importlib.util  # noqa: E402
 
 USER, PRIMARY, CURSOR, COPILOT = "user:tester", "claude@primary", "cursor#41", "copilot#42"
 REQUEST = "owner: cursor#41\nshape: table file:line · claim · evidence\n\nList every caller of post()."
+DONE = "| file:line | claim | evidence |\n|---|---|---|\n| bin/boardlib.py:1 | one caller | read it |"   # in shape
 
 
 def _load(name: str):
@@ -183,7 +184,7 @@ class Waiting(Board):
         with mock.patch.dict(os.environ, {"AGENT_BRIDGE_IDENTITY": CURSOR, "AGENT_BRIDGE_HOP": "1"}):
             peer = board.Server()
         self.assertIn("kind=request", peer.call("board_read", {"topic": "room:r", "mine": True})["content"][0]["text"])
-        peer.call("board_post", {"topic": "room:r", "body": "done", "kind": "done", "reply_to": r1})
+        peer.call("board_post", {"topic": "room:r", "body": DONE, "kind": "done", "reply_to": r1})
         out = peer.call("board_wait", {"topic": "room:r", "timeout_s": 1})
         self.assertIn("timed_out", out["content"][0]["text"], out)                      # nothing new: no replay of r1
         for _ in range(3):
@@ -202,7 +203,7 @@ class Reading(Board):
         boardlib.post(self.conn, tid, USER, "copilot's", to=COPILOT)
         r3 = boardlib.post(self.conn, tid, USER, REQUEST, "request", to="*")
         # to=* request: anyone closes
-        r4 = boardlib.post(self.conn, tid, COPILOT, "done r3", "done", reply_to=r3, to=USER)
+        r4 = boardlib.post(self.conn, tid, COPILOT, DONE, "done", reply_to=r3, to=USER)
         mine, nxt = boardlib.read(self.conn, tid, CURSOR, None, mine=True, roles=["@member"])
         self.assertEqual([m["seq"] for m in mine], [r1, r3])                             # not seq 2 (copilot's) nor r4
         self.assertEqual(nxt, r3)
@@ -218,7 +219,7 @@ class Reading(Board):
         boardlib.post(self.conn, tid, CURSOR, "missing: repo access", "blocked", reply_to=r1)
         self.assertEqual(boardlib.read(self.conn, tid, CURSOR, None, open_requests=True)[0], [])
         r5 = boardlib.post(self.conn, tid, USER, REQUEST, "request", to="@member")        # a role: any holder closes it
-        boardlib.post(self.conn, tid, COPILOT, "on it, done", "done", reply_to=r5)
+        boardlib.post(self.conn, tid, COPILOT, DONE, "done", reply_to=r5)
         self.assertEqual(boardlib.read(self.conn, tid, CURSOR, None, open_requests=True)[0], [])
         r6 = boardlib.post(self.conn, tid, USER, REQUEST, "request", to=CURSOR)
         boardlib.post(self.conn, tid, USER, "never mind", "done", reply_to=r6)            # the requester withdraws it
@@ -319,7 +320,7 @@ class Membership(Board):
             boardlib.close_topic_as(self.conn, "room:r", COPILOT)
         boardlib.post(self.conn, tid, COPILOT, "shipped", "done", to=CURSOR)              # not to everyone: no summary
         r = boardlib.post(self.conn, tid, USER, REQUEST, "request", to="*")
-        boardlib.post(self.conn, tid, COPILOT, "that one is done", "done", to="*", reply_to=r)  # closes r, not the room
+        boardlib.post(self.conn, tid, COPILOT, DONE, "done", to="*", reply_to=r)                # closes r, not the room
         with self.assertRaises(boardlib.BoardError):
             boardlib.close_topic_as(self.conn, "room:r", COPILOT)
         boardlib.post(self.conn, tid, COPILOT, "did X, evidence Y, open Z", "done", to="*")
@@ -370,7 +371,7 @@ class ServerAndCli(Board):
         self.assertIn('"open_requests_to_me": 1', text(peer.call("board_status", {})))
         self.assertIn("kind=request to=cursor#41",
                       text(peer.call("board_read", {"topic": "room:r", "open_requests": True})))
-        done = {"topic": "room:r", "body": "done", "kind": "done", "reply_to": 1}
+        done = {"topic": "room:r", "body": DONE, "kind": "done", "reply_to": 1}
         self.assertFalse(peer.call("board_post", done)["isError"])
         self.assertIn('"open_requests_to_me": 0', text(peer.call("board_status", {})))
         self.assertTrue(peer.call("board_close", {"topic": "room:r"})["isError"])

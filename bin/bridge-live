@@ -146,6 +146,15 @@ def reply_target(batch: list[dict]) -> int:
     return batch[-1]["seq"]
 
 
+def retry_item(turn: dict, me: str, reason: str) -> dict:
+    """A refused reply fed back to the peer as one more turn on the same request: the refusal quotes the shape, the
+    peer answers again in it (or says what is missing); the retried turn keeps the original seq/to/last."""
+    return {"seq": turn["last"], "author": "board", "kind": "system", "to": me,
+            "body": f"your reply was refused: {reason}\nAnswer the same request again in that shape — or, if you "
+                    f"cannot, reply with a `missing: <what you lack>` line.",
+            "retry_of": {k: turn[k] for k in ("seq", "to", "last") if k in turn}}
+
+
 def role_slug(role: str | None) -> str:
     """A persona name as the peer's board role; the privileged board roles (leader, …) are never minted from one."""
     return role if role and boardlib.ROLE_RE.fullmatch(role) and role not in boardlib.ROLES else "member"
@@ -292,8 +301,10 @@ def broker(o, after: int, stop_floor: int, resume: str | None, base: float) -> i
                         first = False
                     proc.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n")
                     proc.stdin.flush()
-                    turn = {"seq": reply_target(batch), "t0": time.time(), "body": text, "to": answer_to(batch),
-                            "last": batch[-1]["seq"]}
+                    retry = batch[0].get("retry_of") if len(batch) == 1 else None
+                    turn = ({**retry, "t0": time.time(), "body": text, "retried": True} if retry else
+                            {"seq": reply_target(batch), "t0": time.time(), "body": text, "to": answer_to(batch),
+                             "last": batch[-1]["seq"]})
                     st["status"] = "busy"
                     print(f"[live] {peer}: turn {st['turns'] + 1} ← seq {', '.join(str(m['seq']) for m in batch)}")
             if (len(pending), st["status"]) != saved:              # `send --until-quiet` reads status + pending
@@ -311,7 +322,15 @@ def broker(o, after: int, stop_floor: int, resume: str | None, base: float) -> i
                 total = record_turn(peer, room, st, ev, turn, total, base, peer_log)
                 answer = ev.get("result") or "(the peer returned no text)"
                 agreed = bool(AGREE_RE.search(answer))
-                boardlib.post(conn, tid, me, answer, "answer", reply_to=turn["seq"], to=turn.get("to"))
+                try:
+                    boardlib.post(conn, tid, me, answer, "answer", reply_to=turn["seq"], to=turn.get("to"))
+                except boardlib.BoardError as exc:     # the board refused the reply (wrong shape): one retry, then keep
+                    if not turn.get("retried"):         # the text as a note so nothing the peer wrote is lost
+                        pending.insert(0, retry_item(turn, me, str(exc)))
+                        print(f"[live] {peer}: reply refused — {exc}; asking once more", file=sys.stderr)
+                    else:
+                        boardlib.post(conn, tid, me, f"(refused as an answer: {exc})\n\n{answer}", "note",
+                                      to=turn.get("to"))
                 print(f"[live] {peer}: turn {st['turns']} done in {time.time() - turn['t0']:.1f}s, "
                       f"${total - base:.3f} this start{' [[AGREE]]' if agreed else ''}")
                 quota = quota_hit(answer) if ev.get("is_error") else None

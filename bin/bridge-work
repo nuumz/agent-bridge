@@ -161,6 +161,48 @@ def must_fix(table: str, allowed: list[str], touched_files: list[str]) -> list[s
     return rows
 
 
+def finding_key(row: str) -> str:
+    """A must-fix row reduced to what makes it the same finding next round: the file (no line) and the finding text."""
+    cells = [c.strip() for c in row.strip().strip("|").split("|")]
+    file = re.split(r":\d", cells[0].strip("`") if cells else "")[0].strip()
+    finding = re.sub(r"[^a-z0-9]+", " ", (cells[1] if len(cells) > 1 else "").lower()).strip()
+    return f"{file}: {finding[:80]}"
+
+
+def repeated(previous: list[str], fixes: list[str]) -> list[str]:
+    """Must-fix findings of this round that the previous round already had — the fix did not land."""
+    before = {finding_key(r) for r in previous}
+    return sorted({finding_key(r) for r in fixes} & before)
+
+
+def should_switch(rounds: list[dict]) -> bool:
+    """Two red verifies in a row and a finding that came back: the same hands are not going to fix it — the next
+    round goes to the other peer, with what failed spelled out, instead of a third identical attempt."""
+    if len(rounds) < 2:
+        return False
+    a, b = rounds[-2], rounds[-1]
+    return bool(b.get("repeat_findings")) and a.get("verify_rc") not in (0, None) and b.get("verify_rc") not in (0, None)
+
+
+def next_hands(peers: list[str], implementer: str, reviewer: str) -> tuple[str, str]:
+    """The other peer writes next; the one that wrote so far reviews, so nobody reviews their own change."""
+    alt = next((p for p in peers if p != implementer), None)
+    if alt is None:
+        return implementer, reviewer
+    return alt, (implementer if reviewer == alt else reviewer)
+
+
+def anti_pattern(last: dict, base: str = "<base>") -> str:
+    """The failed attempt as a block the next implementer must not repeat — and may discard: the round-N rule
+    "keep everything else" does not protect an approach that failed twice."""
+    note = "\n".join("    " + ln for ln in (last.get("impl") or "")[:1500].splitlines())
+    files = ", ".join(last.get("files") or []) or "<file>"
+    return ("- already tried and FAILED by the previous implementer — do not repeat this approach:\n" + note
+            + "\n  findings that came back unchanged: " + "; ".join(last.get("repeat_findings") or [])
+            + f"\n  the failed attempt is still in this worktree; you may discard it (`git checkout {base[:12]} -- "
+              f"{files}`) and take a different approach — 'keep everything else' does not apply to it\n")
+
+
 def clear_rc(name: str, *, report: bool = False) -> None:
     d = WORK / name
     (d / "rc").unlink(missing_ok=True)
@@ -304,8 +346,11 @@ def run(o) -> int:
     review_by = reviewer
     impl_by = implementer
     used: dict[str, set] = {"implementer": set(), "reviewer": set()}
-    for n in range(1, o.rounds + 1):
-        print(f"[work] round {n}/{o.rounds}: {implementer} writes …", file=sys.stderr)
+    switched: list[str] = []
+    rounds_max, n = o.rounds, 0
+    while n < rounds_max:
+        n += 1
+        print(f"[work] round {n}/{rounds_max}: {implementer} writes …", file=sys.stderr)
         rc, answer, notes, impl_used = ask_with_fallback(implementer, "write", str(wt), write_prompt(o, allowed, n, feedback, impl_add),
                                                          o.timeout, f"work-{o.name}-impl", "implement", peers)
         impl_by = impl_used
@@ -333,22 +378,33 @@ def run(o) -> int:
         if not review_ok:
             print(f"[work] review not usable (rc={rrc}; needs a finished table or NONE) — the result cannot be READY",
                   file=sys.stderr)
+        rep = repeated(rounds[-1].get("must_fix", []), fixes) if rounds else []
         rounds.append({"round": n, "impl": answer, "files": files, "outside": bad, "verify_rc": vrc, "verify": vtail,
-                       "review_rc": rrc, "review": review, "must_fix": fixes})
+                       "review_rc": rrc, "review": review, "must_fix": fixes, "repeat_findings": rep})
         (out / "rounds.json").write_text(json.dumps(rounds, ensure_ascii=False, indent=2))
         if vrc == 0 and not fixes and not bad:
             break                       # review_ok False here still ends the loop: a re-write would not fix a missing review
         feedback = ((f"- verify command failed (exit {vrc}):\n{vtail}\n" if vrc else "")
                     + (f"- files outside the allowed set must be reverted or the change moved: {', '.join(bad)}\n" if bad else "")
                     + ("- reviewer must-fix findings:\n" + "\n".join(fixes) if fixes else ""))
+        if should_switch(rounds) and not switched:      # once: the other peer gets one round, never ping-pong
+            new_impl, new_rev = next_hands(peers, implementer, reviewer)
+            if new_impl != implementer:
+                rounds_max = max(rounds_max, n + 1)     # a switch decided on the last round earns that round
+                print(f"[work] round {n}: verify red twice and the same finding came back — round {n + 1} goes to "
+                      f"{new_impl} (reviewer {new_rev})", file=sys.stderr)
+                switched.append(f"round {n + 1}: {implementer}→{new_impl}")
+                feedback = anti_pattern(rounds[-1], base_sha) + feedback
+                implementer, reviewer = new_impl, new_rev
     ok = final_rc == 0 and review_ok and not bad and not (rounds and rounds[-1].get("must_fix"))
     verdict = "READY FOR REVIEW" if ok else ("NOT DONE — no review" if final_rc == 0 and not review_ok and not bad else "NOT DONE")
     who = " · ".join(f"{k}: {', '.join(sorted(v))}" for k, v in used.items() if v) or f"implementer: {implementer} · reviewer: {reviewer}"
     stamp = time.strftime("%Y-%m-%d %H:%M")
     report = (f"# Work `{o.name}` — {stamp} — {verdict}\n\n"
               f"Repo: {repo} · base: {base}@{base_sha[:9]} · branch: `bridge/{o.name}` · worktree: `{wt}`\n"
-              f"skill: `{skill['name'] if skill else 'none'}` · {who} (→ = fell back to a local peer) · rounds: {len(rounds)}/{o.rounds} · "
-              f"{round((time.time() - t0) / 60, 1)} min\n\n## Task\n\n{o.task}\n\n"
+              f"skill: `{skill['name'] if skill else 'none'}` · {who} (→ = fell back to a local peer) · rounds: {len(rounds)}/{rounds_max} · "
+              f"{round((time.time() - t0) / 60, 1)} min"
+              + (f" · switched implementer: {', '.join(switched)}" if switched else "") + f"\n\n## Task\n\n{o.task}\n\n"
               f"## Result\n\n- verify `{o.verify}` → {'not run (implementer failed)' if final_rc is None else f'exit {final_rc}'}\n- files: {', '.join(rounds[-1].get('files', [])) if rounds else '-'}\n"
               + (f"- **outside the allowed set**: {', '.join(bad)}\n" if bad else "")
               + f"\n```\n{diffstat or '(no diff)'}\n```\n\n### verify output (tail)\n\n```\n{final_tail}\n```\n\n"
@@ -366,6 +422,8 @@ def run(o) -> int:
                        "reviewer": reviewer, "used": {k: sorted(v) for k, v in used.items()}, "review_ok": review_ok,
                        "self_review": review_by == impl_by,
                        "rounds": len(rounds), "verify_rc": final_rc, "ok": ok,
+                       "verify_rc_per_round": [r.get("verify_rc") for r in rounds],
+                       "repeat_findings": sum(len(r.get("repeat_findings") or []) for r in rounds), "switched": switched,
                        "outside": bad, "duration_s": round(time.time() - t0)})
     except Exception:  # noqa: BLE001
         pass

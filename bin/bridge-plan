@@ -4,7 +4,8 @@
     bridge-plan "<request>" [-k kind] [-n name] [-p peers] [-d DIR]   classify → playbook card → session card / command
     bridge-plan kinds                                                the playbooks (~/.agent-bridge/playbooks/*.md)
     bridge-plan agree <name>                                         check a session card: exit 0 = no TODO left, else exit 3
-    bridge-plan learn [--backfill] [--days N]                        what the ledger says per kind, with suggestions
+    bridge-plan learn [--backfill] [--days N] [--team]               what the ledger says per kind, with suggestions;
+                                                                     --team: the scorecard per (role|kind, peer)
     bridge-plan mark <panel|run-log> [-r role] --kept N --rejected M  after verifying a peer's findings: what survived
 
 Session depth (frontmatter `level:` of each playbook — not a third agreement level; edit the file to change a default):
@@ -196,6 +197,9 @@ def plan(o) -> int:
           f"{'  (data leaves the machine — cursor)' if 'cursor' in peers else ''}")
     if book.get("alt_peers") and not o.peers:
         print(f"alt peers  {book['alt_peers']}  (opt in with -p; each named peer receives the repo content)")
+    hint = scorecard_hint(kind, peers.split(",")[0])
+    if hint:
+        print(hint)
     print(f"inputs     {book.get('inputs', '')}")
     if gaps:
         print(f"  missing  {' · '.join(gaps)}")
@@ -274,6 +278,131 @@ def citations() -> dict[str, int]:
     return out
 
 
+def family(identity: str | None) -> str:
+    """cursor#41, claude@live:p, copilot:task3 → cursor, claude, copilot."""
+    return re.split(r"[#@:]", identity or "")[0] or "?"
+
+
+def role_fallbacks() -> dict[str, str]:
+    """role → fallback_peer from roles/*.md frontmatter (what a suggestion can point at)."""
+    out = {}
+    for f in sorted((ledger.ROOT / "roles").glob("*.md")):
+        m = re.search(r"^fallback_peer:\s*(\S+)", f.read_text(), re.M)
+        if m:
+            out[f.stem] = m.group(1)
+    return out
+
+
+def scorecard(rows: list[dict]) -> dict[tuple[str, str], dict]:
+    """Per (role|kind, peer): what the ledger can prove about a peer's work — runs and rc, ask-backs, cost, citations
+    that resolved, replies that missed the requested shape, blocks, declines (the same request missed twice), and the
+    user's verdicts. Board rows carry a peer family and no role, so they land under ("board", family)."""
+    sc: dict[tuple[str, str], dict] = {}
+
+    def cell(key):
+        return sc.setdefault(key, {"runs": 0, "ok": 0, "asked_back": 0, "cost": [], "tools": [], "cites_ok": 0,
+                                   "cites_total": 0, "shape_miss": 0, "blocked": 0, "declined": 0, "kept": 0,
+                                   "verdicts": 0})
+    misses: dict[tuple[str, str, int], set] = {}
+    for r in rows:
+        t = r.get("type")
+        if t == "run":
+            c = cell((role_of(r) or r.get("kind") or "other", r.get("peer") or "?"))
+            c["runs"] += 1
+            c["ok"] += r.get("rc") == 0
+            c["asked_back"] += bool(r.get("asked_back") or r.get("rc") == 5)
+            if r.get("cost"):
+                c["cost"].append(r["cost"])
+            if r.get("tool_calls") is not None:
+                c["tools"].append(r["tool_calls"])
+            c["cites_ok"] += r.get("citations_ok") or 0
+            c["cites_total"] += r.get("citations_total") or 0
+        elif t in ("shape_miss", "blocked"):
+            c = cell(("board", family(r.get("peer"))))
+            c[t] += 1
+            if t == "shape_miss":                # distinct wrong bodies: a retried identical reply is one miss
+                k = (family(r.get("peer")), r.get("topic") or "", r.get("request_seq") or 0)
+                misses.setdefault(k, set()).add(r.get("body_hash") or r.get("ts"))
+        elif t == "verdict":                     # a run-log mark carries the run's kind, a panel mark its role
+            c = cell((r.get("role") or r.get("kind") or "verdict", r.get("peer") or "?"))
+            c["kept"] += r.get("kept", 0)
+            c["verdicts"] += r.get("kept", 0) + r.get("rejected", 0)
+    for (fam, _, _), bodies in misses.items():
+        if len(bodies) >= 2:
+            cell(("board", fam))["declined"] += 1
+    return sc
+
+
+def _rate(c: dict, ok: str, total: str) -> float:
+    return c[ok] / c[total] if c[total] else 0.0
+
+
+def team_suggestions(sc: dict[tuple[str, str], dict]) -> list[str]:
+    """What the scorecard says to change — a lead for the human who edits the playbook or the -p list."""
+    out = []
+    fallbacks = role_fallbacks()
+    for (role, peer), c in sorted(sc.items()):
+        peers = [(p, c2) for (r2, p), c2 in sc.items() if r2 == role and p != peer]
+        by_ok = sorted((x for x in peers if x[1]["runs"] >= 3 and _rate(x[1], "ok", "runs") > _rate(c, "ok", "runs")),
+                       key=lambda x: -_rate(x[1], "ok", "runs"))
+        by_cite = sorted((x for x in peers if x[1]["cites_total"] >= 3
+                          and _rate(x[1], "cites_ok", "cites_total") > _rate(c, "cites_ok", "cites_total")),
+                         key=lambda x: -_rate(x[1], "cites_ok", "cites_total"))
+        alt = by_ok[0][0] if by_ok else fallbacks.get(role)
+        hint = f" — prefer {alt}" if alt and alt != peer else ""
+        if c["cites_total"] >= 3 and _rate(c, "cites_ok", "cites_total") < 0.5:
+            cite_alt = by_cite[0][0] if by_cite else fallbacks.get(role)
+            out.append(f"{role} on {peer}: only {c['cites_ok']}/{c['cites_total']} citations resolved"
+                       + (f" — prefer {cite_alt}" if cite_alt and cite_alt != peer else ""))
+        if c["shape_miss"] >= 2:
+            out.append(f"{peer}: {c['shape_miss']} replies missed the requested shape"
+                       + (f", {c['declined']} request(s) missed twice" if c["declined"] else "")
+                       + " — give its requests a tighter `shape:` or route them elsewhere")
+        if c["runs"] >= 3 and c["asked_back"] / c["runs"] > 0.5:
+            out.append(f"{role} on {peer}: asked back in {c['asked_back']}/{c['runs']} runs — the request lacks an "
+                       f"input it needs (see `bridge-plan` missing inputs){hint}")
+    return out
+
+
+def team(rows: list[dict], days: int) -> int:
+    sc = scorecard(rows)
+    if not sc:
+        print("bridge-plan: no run, board or verdict rows in the window")
+        return 0
+    print(f"scorecard — last {days} days, per (role|kind, peer); what a script could check, never the peer's own word")
+    print(f"{'role|kind':22} {'peer':8} {'runs':>4} {'ok%':>4} {'ask':>3} {'med $':>6} {'tools':>5} {'cites':>9} "
+          f"{'miss':>4} {'blk':>3} {'decl':>4} {'kept':>7}")
+    for (role, peer), c in sorted(sc.items()):
+        okp = f"{round(100 * c['ok'] / c['runs'])}%" if c["runs"] else "-"
+        cites = f"{c['cites_ok']}/{c['cites_total']}" if c["cites_total"] else "-"
+        kept = f"{c['kept']}/{c['verdicts']}" if c["verdicts"] else "-"
+        med = f"{statistics.median(c['cost']):.2f}" if c["cost"] else "-"
+        tools = f"{statistics.median(c['tools']):.0f}" if c["tools"] else "-"
+        print(f"{role[:22]:22} {peer[:8]:8} {c['runs']:4} {okp:>4} {c['asked_back']:3} {med:>6} {tools:>5} {cites:>9} "
+              f"{c['shape_miss']:4} {c['blocked']:3} {c['declined']:4} {kept:>7}")
+    print("\nsuggestions (a lead — the human edits the playbook, the role file or -p):")
+    for s in team_suggestions(sc) or ["- none"]:
+        print("- " + s if not s.startswith("- ") else s)
+    return 0
+
+
+def scorecard_hint(kind: str, peer: str, days: int = 30) -> str:
+    """One line for `bridge-plan`: a peer that did this kind better over the window, when the data says so."""
+    cutoff = time.time() - days * 86400
+    sc = scorecard([r for r in ledger.rows() if r.get("ts", 0) >= cutoff and r.get("type") == "run"])
+    mine = sc.get((kind, peer))
+    rate = (mine["ok"] / mine["runs"]) if mine and mine["runs"] >= 3 else None
+    best = max(((p, c) for (k, p), c in sc.items() if k == kind and p != peer and c["runs"] >= 3),
+               key=lambda x: x[1]["ok"] / x[1]["runs"], default=None)
+    if best is None:
+        return ""
+    b_rate = best[1]["ok"] / best[1]["runs"]
+    if rate is None or b_rate >= rate + 0.2:
+        return (f"scorecard  ({days}d) {kind}: {best[0]} ended rc=0 in {best[1]['ok']}/{best[1]['runs']} runs"
+                + (f" vs {peer} {mine['ok']}/{mine['runs']}" if mine else f"; {peer} has fewer than 3") + f" — consider -p {best[0]}")
+    return ""
+
+
 def role_of(r: dict) -> str | None:
     """Panel role of a run row: backfilled rows carry `role`; live rows name it in the conv (`panel-<name>-<role>[-<peer>]`)."""
     if r.get("role"):
@@ -321,6 +450,8 @@ def learn(o) -> int:
     rows = ledger.rows()
     cutoff = time.time() - o.days * 86400
     rows = [r for r in rows if r.get("ts", 0) >= cutoff]
+    if getattr(o, "team", False):
+        return team(rows, o.days)
     if not rows:
         print("bridge-plan: ledger empty — run `bridge-plan learn --backfill` once")
         return 0
@@ -453,6 +584,7 @@ def main() -> int:
     ln = sub.add_parser("learn")
     ln.add_argument("--backfill", action="store_true")
     ln.add_argument("--days", type=int, default=30)
+    ln.add_argument("--team", action="store_true", help="the scorecard per (role|kind, peer) instead of the kind table")
     mk = sub.add_parser("mark", help="record findings kept / rejected after verifying a panel or run")
     mk.add_argument("target", help="panel name, or the log= path (or its file name) from the [bridge] line")
     mk.add_argument("-r", "--role", help="panel role the counts belong to (default: the whole panel / the run's own role)")
