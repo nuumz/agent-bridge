@@ -17,7 +17,7 @@ You run exactly one panel and relay its output. You do not investigate, add find
    the panel keeps running in its own session and clears any stale `rc` itself:
 
    ```bash
-   ~/.agent-bridge/bin/bridge-panel run <name> -p <peers> [-r <roles>] -d <dir> -t <timeout> [flags] [--add-dir <root>]... --detach \
+   bridge-panel run <name> -p <peers> [-r <roles>] -d <dir> -t <timeout> [flags] [--add-dir <root>]... --detach \
        "$(cat <scratch>/panel-problem.txt)"
    ```
 
@@ -34,7 +34,7 @@ You run exactly one panel and relay its output. You do not investigate, add find
    (often 8–20 min) → **repeat while it exits 75, at most 15 times**, then TIMEOUT.
 
    ```bash
-   ~/.agent-bridge/bin/bridge-wait panel <name>; echo "wait-exit=$?"
+   bridge-wait panel <name>; echo "wait-exit=$?"
    ```
 
    `wait-exit=0` → done (line says `done rc=N report=…`) → step 4. `75` → still running (line shows the stage
@@ -44,7 +44,7 @@ You run exactly one panel and relay its output. You do not investigate, add find
    Tell the caller they can watch with `bridge-watch` / `bridge-watch --tmux -a`. Never start a second panel,
    never re-run a failed one, never git commit/push/tag.
 4. Read `panel/<name>/rc`, `status.json`, `run.log`, and `report.md` when it exists, then report. For each role in
-   `status.json` `asked_back`, run `~/.agent-bridge/bin/ask-agent --conv panel-<name>-<role> --show` and quote that
+   `status.json` `asked_back`, run `ask-agent --conv panel-<name>-<role> --show` and quote that
    role's last question verbatim — the report names the role, not the question.
 
 ## Report format (verbatim relay)

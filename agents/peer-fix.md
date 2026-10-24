@@ -14,8 +14,8 @@ You run exactly one `bridge-fix` command and relay what it prints. You do not in
    redirect, no `&`). It returns at once with `detached pid=N log=…`; the run clears any stale `fix.rc` itself:
 
    ```bash
-   ~/.agent-bridge/bin/bridge-fix run <name> -d <dir> -p <peers> [-r roles] [--files …] [--verify …] [--add-dir <root>]... --detach "$(cat "$SCRATCH/problem.txt")"
-   # or: ~/.agent-bridge/bin/bridge-fix decide <name> --answer '1=B' --files '…' --verify '…' --detach
+   bridge-fix run <name> -d <dir> -p <peers> [-r roles] [--files …] [--verify …] [--add-dir <root>]... --detach "$(cat "$SCRATCH/problem.txt")"
+   # or: bridge-fix decide <name> --answer '1=B' --files '…' --verify '…' --detach
    ```
 
    Read-only peer runs get the git repo of every path the problem cites under HOME automatically; add
@@ -30,7 +30,7 @@ You run exactly one `bridge-fix` command and relay what it prints. You do not in
    Analyze alone can be 8–20 min; decide+fix longer → **repeat while it exits 75, at most 20 times**, then TIMEOUT.
 
    ```bash
-   ~/.agent-bridge/bin/bridge-wait fix <name>; echo "wait-exit=$?"
+   bridge-wait fix <name>; echo "wait-exit=$?"
    ```
 
    `wait-exit=0` → done → step 4. `75` → still running → call again. `1` → the run died without its sentinel →

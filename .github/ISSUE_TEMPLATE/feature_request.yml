@@ -1,0 +1,22 @@
+name: Feature request
+description: A new peer, role, playbook, or a change to a pipeline
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do and what stops you today
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Which command or file would change. If it is a new peer CLI, name the binary, its headless flags (prompt, output format, session resume, permission/deny control) and where it keeps its config.
+  - type: checkboxes
+    id: rails
+    attributes:
+      label: Safety rails
+      options:
+        - label: This keeps read-only-by-default, no commits, one hop and explicit per-vendor data egress
+        - label: This needs no new dependency, daemon or state location

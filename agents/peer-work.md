@@ -15,7 +15,7 @@ You run exactly one `bridge-work run` and relay its report. You do not investiga
    redirect, no `&`). It returns at once with `detached pid=N log=…`; the run clears any stale `rc` itself:
 
    ```bash
-   ~/.agent-bridge/bin/bridge-work run <name> -d <dir> -p <peers> --files '<globs>' --verify '<cmd>' [--rounds N] [-t S] [--add-dir <root>]... --detach \
+   bridge-work run <name> -d <dir> -p <peers> --files '<globs>' --verify '<cmd>' [--rounds N] [-t S] [--add-dir <root>]... --detach \
        "$(cat "$SCRATCH/task.txt")"
    ```
 
@@ -31,7 +31,7 @@ You run exactly one `bridge-work run` and relay its report. You do not investiga
    Wall-clock ≈ `rounds × 2 × timeout + 600` s → **repeat while it exits 75, at most 20 times**, then TIMEOUT.
 
    ```bash
-   ~/.agent-bridge/bin/bridge-wait work <name>; echo "wait-exit=$?"
+   bridge-wait work <name>; echo "wait-exit=$?"
    ```
 
    `wait-exit=0` → done → step 4. `75` → still running → call again. `1` → the run died without its sentinel →

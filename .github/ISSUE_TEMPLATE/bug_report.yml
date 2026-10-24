@@ -1,0 +1,34 @@
+name: Bug report
+description: A bridge command misbehaves
+labels: [bug]
+body:
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: The exact command, with prompt text replaced by a placeholder if it is private
+      placeholder: ask-agent cursor -d ~/src/x -m ask "<prompt>"
+    validations:
+      required: true
+  - type: textarea
+    id: bridge-line
+    attributes:
+      label: "`[bridge]` lines and exit code"
+      description: Everything the bridge printed on stdout/stderr that starts with `[bridge]`, plus `rc=`. The run log it names is local — attach only what you are willing to share.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Output of `ask-agent --list`, `python3 --version`, OS, and `git -C ~/.agent-bridge log -1 --oneline`
+      render: text
+    validations:
+      required: true

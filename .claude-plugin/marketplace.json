@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "agent-bridge",
+  "description": "agent-bridge — peer coding agents on one machine calling each other",
+  "owner": { "name": "nuumz", "url": "https://github.com/nuumz" },
+  "plugins": [
+    {
+      "name": "agent-bridge",
+      "source": ".",
+      "description": "Second opinions, role panels, isolated implement→verify→review loops and a shared board across Claude Code, Cursor Agent and Copilot CLI. Run `bridge-sync` once after installing.",
+      "category": "productivity"
+    }
+  ]
+}

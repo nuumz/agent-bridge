@@ -483,6 +483,12 @@ def card(kind: str, rows: list[tuple[str, str, str, str]], due: str | None = Non
     return head + "\n" + table
 
 
+def card_questions(body: str) -> list[str]:
+    """The question cells of a card body — what a one-line view shows instead of the header and table scaffolding."""
+    rows = [ln for ln in body.splitlines() if ln.startswith("|") and not re.match(r"^\|\s*:?-{3,}", ln)]
+    return [ln.strip("| ").split("|")[0].strip() for ln in rows[1:]]
+
+
 def user_cards(conn: sqlite3.Connection) -> list[dict]:
     """Every open request addressed to the user across open topics, oldest first — the one list a human answers."""
     rows = conn.execute(f"SELECT t.name AS topic, {MSG_COLS} FROM messages m JOIN topics t ON t.id=m.topic_id "

@@ -28,6 +28,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Installed as a Claude Code plugin, the subagents in agents/ are namespaced `agent-bridge:peer-*`
+SUBAGENT = "agent-bridge:" if "/.claude/plugins/" in str(Path(__file__).resolve()) else ""
 from bridgelib import ledger  # noqa: E402
 from bridgelib import grill as grill_plan  # noqa: E402
 from bridgelib.core import (  # noqa: E402
@@ -171,21 +173,21 @@ def plan(o) -> int:
         card = session_card_path("panel", name)
         cmd = (f"bridge-panel run {name} -p {peers} -r {roles} -d {o.dir} -t 420"
                + (f" --agreement {card}" if level != "routine" else "") + ' "<problem>"')
-        via = f'Agent(subagent_type="peer-panel", prompt="name={name} peers={peers} roles={roles} dir={o.dir} — <problem>")'
+        via = f'Agent(subagent_type="{SUBAGENT}peer-panel", prompt="name={name} peers={peers} roles={roles} dir={o.dir} — <problem>")'
     elif form == "fix-flow":
         card = session_card_path("fix-flow", name)
         cmd = (f"bridge-fix run {name} -d {o.dir} -p {peers} "
                f'"<symptom · expected vs actual · files · verify>"   # stops at decide; then bridge-fix decide {name} …')
-        via = f'Agent(subagent_type="peer-fix", prompt="name={name} dir={o.dir} peers={peers} — <problem>")'
+        via = f'Agent(subagent_type="{SUBAGENT}peer-fix", prompt="name={name} dir={o.dir} peers={peers} — <problem>")'
     elif form == "pipeline":
         card = session_card_path("pipeline", name)
         cmd = (f"bridge-work run {name} -d {o.dir} -p {peers} --files '<globs>' --verify '<cmd>' \"<task>\""
                "   # without --files + --verify it stops with a session card under work/<name>/")
-        via = f'Agent(subagent_type="peer-work", prompt="name={name} dir={o.dir} peers={peers} files=<globs> verify=<cmd> — <task>")'
+        via = f'Agent(subagent_type="{SUBAGENT}peer-work", prompt="name={name} dir={o.dir} peers={peers} files=<globs> verify=<cmd> — <task>")'
     else:
         peer = peers.split(",")[0]
         cmd = f"ask-agent {peer} -m {book.get('mode', 'ask')} -d {o.dir} -t 420 --kind {kind} \"<prompt>\""
-        via = f'Agent(subagent_type="peer-ask", prompt="peer={peer} mode={book.get("mode", "ask")} dir={o.dir} timeout=420 — <prompt>")'
+        via = f'Agent(subagent_type="{SUBAGENT}peer-ask", prompt="peer={peer} mode={book.get("mode", "ask")} dir={o.dir} timeout=420 — <prompt>")'
     print(f"playbook   {kind} — {book.get('summary', '')}")
     if alt:
         print(f"also fits  {', '.join(alt)}  (override with -k)")

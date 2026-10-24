@@ -31,6 +31,16 @@ import sqlite3
 import sys
 from pathlib import Path
 
+# Background runs redirect stdout to a file. The default block buffer keeps the answer invisible until the
+# process exits, and a kill drops it. Line buffering flushes each bridge line as it is printed.
+for _stream in (sys.stdout, sys.stderr):
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if _reconfigure is not None:
+        try:
+            _reconfigure(line_buffering=True)
+        except (OSError, ValueError):
+            pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boardlib  # noqa: E402
 from bridgelib.adapters import ADAPTERS, Adapter  # noqa: E402

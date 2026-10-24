@@ -13,8 +13,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .core import (BOARD_TOOLS, STATE, BRIDGE_CMDS, CLAUDE_READ_ONLY_BASH, CLAUDE_WRITE_BASH, DISABLED, GIT_DENY, HOME,
-                   find_bin, last_json, sum_keys)
+from .core import (BOARD_TOOLS, CURSOR_PULL, STATE, BRIDGE_CMDS, CLAUDE_READ_ONLY_BASH, CLAUDE_WRITE_BASH, DISABLED,
+                   GIT_DENY, HOME, find_bin, last_json, sum_keys)
 
 class Parsed:
     def __init__(self, result: str, session: str | None = None, tok_in: Any = "?", tok_out: Any = "?",
@@ -345,6 +345,8 @@ class Cursor(Adapter):
                 "Before anything else, read and follow ~/.agent-bridge/state/mirror/agent-bridge.md and "
                 "~/.agent-bridge/state/mirror/user-rules.md (machine-wide rules; this worktree has no copy).\n\n"
             )
+        if o.board and o.conv:          # only a --conv run has a topic to pull from; without one the protocol says [[ASK]]
+            bits.append(CURSOR_PULL + "\n\n")
         return "".join(bits)
 
     def _base(self, o):

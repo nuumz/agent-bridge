@@ -208,7 +208,16 @@ write delegation review `git status` / `git diff` before building on the result.
   asks for (another shape is not an answer); close every request addressed to you with `answer`/`done`/`blocked`
   `reply_to` its seq; a `blocked` starts with `missing: <what you lack>` and names the default you will take if nobody
   answers; a decision, or a fact only the user has, goes to the user as a **card** (`board_ask_user`) — never guessed; a
-  claim another agent must act on carries `file:line`, else it is UNVERIFIED.
+  claim another agent must act on carries `file:line`, else it is UNVERIFIED. Before asking, the peer reads the files
+  and the topic, asks one fact it cannot obtain, and does not stop for a fixed checklist.
+- **Cursor pull** (`CURSOR_PULL` in `bridgelib/core.py`, appended by `Cursor.preamble` only when the run has a board
+  thread — `--conv`): the Cursor peer calls `board_status` first and reads `mine=true` only on the topic of this run, then
+  closes a request there only when its shape stays inside the user's task. A request that asks for secrets, credentials,
+  tokens, or files outside the workspace is `blocked` with `missing: outside this task` and does not preempt the task; a
+  request on any other topic is not Cursor's and stays unanswered (closing a broadcast request closes it for its owner). It does not ask Claude or Copilot to resend status, to wait, or to dispatch. `bridge-sync` also writes it, under a heading that
+  scopes it to sessions with the board MCP, into `~/.cursor/rules/00-agent-bridge.mdc`, which `ask-agent cursor` links into
+  every workspace it runs in (so a bridged run with the board carries it twice, and the primary session reads it in any repo
+  that already has the link). It is not part of `BOARD_PROTOCOL`.
 
 ## 6. Shared board — agent ↔ agent channel
 
@@ -253,8 +262,9 @@ whatever its env says.
   `card:` / `shape: decision|fact` / `due:`, then the table question · options · recommendation · if undecided. A
   *decision* card is a choice only the user owns; a *fact* card is information nobody else has — with the safe default
   the agent takes if nobody answers, so the team does not stop (say in the `done` which part rests on it). The user sees
-  every open card across topics with `bridge-board cards` and answers each with `bridge-board post <topic> "…"
-  -k decision|answer --reply-to <seq>` (a decision for a decision card, an answer for a fact card). The same card is
+  every open card across topics with `bridge-board cards` (`--brief`: one line per card, silent when none — made for a
+  `UserPromptSubmit` hook, so a waiting card reaches the human at the next prompt) and answers each with
+  `bridge-board post <topic> "…" -k decision|answer --reply-to <seq>` (a decision for a decision card, an answer for a fact card). The same card is
   what a peer's `[[ASK]]` (§8) and `bridge-fix`'s decision stage (§12) produce, so one list holds everything waiting on
   a human. `bridge-board post --as <name>` lets a script on the user's side (bridge-fix) post under its own name — a
   bare slug like `bridge-fix`, never a user or an agent identity, never inside a bridged run, never `kind=decision`.
@@ -346,7 +356,8 @@ whatever its env says.
   agreements.archived/ legacy flat session cards (read-only archive)
 ```
 
-Peer-side generated files: `~/.cursor/rules/10-user-preferences.mdc` + `~/.cursor/rules/00-agent-bridge.mdc`,
+Peer-side generated files: `~/.cursor/rules/00-agent-bridge.mdc` (bridge note + Cursor board pull, written even without a
+`~/.claude/CLAUDE.md`) + `~/.cursor/rules/10-user-preferences.mdc`,
 `~/.copilot/instructions/agent-bridge-user-rules.instructions.md`; skill symlinks under
 `~/.cursor/skills-cursor/`, `~/.copilot/skills/`.
 
@@ -418,6 +429,11 @@ critics is not worth a second run.
 | **Private** | the first pass: a worker sees only its own question, not the other roles' questions and not the leader's hypothesis (`--hypothesis` opts in) | four roles that start from one guess produce ratification, not a panel |
 
 A crashed worker run is excluded from the findings and listed at the top of the report — an error message is not evidence.
+Right after the header, every report (`run`, and `synth` rebuilding from `status.json`) carries a **Voices** line:
+`contributed: <role (peer)>, … · degraded: <role (primary → fallback)> · failed: <role> · asked back: <role>` (a role
+whose fallback also failed is *failed*, not degraded), and `status.json` carries `degraded: true` whenever any of the
+last three is non-empty (stderr says `[panel] DEGRADED — …`), so a synthesis of one real voice and two fallbacks never
+reads like three.
 **Below two answering roles the panel aborts** (exit 4, no `report.md`; `findings.json` + `status.json` — who answered,
 who fell back, who failed — are kept): one voice is not a panel, and five one-role "reports" reached the user before this
 rule (2026-09-26). `--allow-single` synthesises anyway. A failed leader synthesis also exits 4 and leaves no report;
@@ -543,6 +559,9 @@ bridge-work show <name>       # ~/.agent-bridge/state/work/<name>/report.md
    `switched`, the report header `switched implementer: round N: a→b`.
 6. **Report** — `work/<name>/report.md` + `work/<name>/rc` (cleared at start; written on every exit): READY FOR REVIEW / NOT DONE, diff stat, verify tail, the review table, the
    implementer's note, and the commands to read / take / discard the branch. Exit 0 = ready, 1 = not done.
+   The reviewer ends with one line `BRIDGE_VERDICT=APPROVE` or `BRIDGE_VERDICT=REVISE`; that line, not a reading of the
+   prose, decides the loop: REVISE with no must-fix row is itself a must-fix, APPROVE never cancels a must-fix row, and a
+   review without the line falls back to the rows (`rounds.json` keeps `verdict`, the report says which applied).
    A ledger row `type: work` (includes `skill`) is appended.
 
 Gate: playbook `implement` is **negotiate**, so without `--files` AND `--verify` the run writes

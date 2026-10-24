@@ -5,18 +5,23 @@ Source of truth : ~/.claude/CLAUDE.md      (+ its @-imports, minus Claude-only p
                   ~/.claude/skills/*       (minus skills disabled in settings.json / bridge-internal)
 Generated       : ~/.agent-bridge/state/mirror/user-rules.md            canonical stripped body
                   ~/.agent-bridge/state/mirror/agent-bridge.md          protocol note for peers
-                  ~/.cursor/rules/10-user-preferences.mdc         Cursor  (linked into <repo>/.cursor/rules/ by ask-agent —
-                                                                  cursor-agent does not read ~/.cursor/rules itself)
+                  ~/.cursor/rules/00-agent-bridge.mdc             Cursor  bridge note + board pull contract
+                  ~/.cursor/rules/10-user-preferences.mdc         Cursor  user rules (both linked into <repo>/.cursor/rules/
+                                                                  by ask-agent — cursor-agent does not read ~/.cursor/rules)
                   ~/.copilot/instructions/agent-bridge-user-rules.instructions.md   Copilot CLI
                   ~/.cursor/skills-cursor/<name>, ~/.copilot/skills/<name>  (symlinks)
                   MCP server `bridge_board` (bin/bridge-board serve) registered for Claude (user scope, via
                   `claude mcp add`) and Cursor (~/.cursor/mcp.json) so peers share one board; board gc (14 days)
 
 Idempotent. Safe to run from a SessionStart hook. Never edits the Claude-side sources. A peer file that
-exists and does NOT carry the GENERATED marker is left alone (it is the user's) and reported.
+exists and does NOT carry the GENERATED marker is left alone (it is the user's) and reported. Without a
+~/.claude/CLAUDE.md the user-rules mirrors are skipped; every installed peer still gets the bridge note.
+
+    bridge-sync [--quiet]
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -27,7 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boardlib  # noqa: E402
-from bridgelib.core import STATE  # noqa: E402
+from bridgelib.core import CURSOR_PULL, STATE  # noqa: E402
 
 HOME = Path.home()
 CLAUDE_MD = HOME / ".claude" / "CLAUDE.md"
@@ -63,7 +68,14 @@ PEERS = {
                    "---\n"
                    f"<!-- {MARKER} — DO NOT EDIT. Edit ~/.claude/CLAUDE.md instead; this file is overwritten. -->\n\n"),
         "skills": HOME / ".cursor" / "skills-cursor",
-        "note": False,   # Cursor has its own 00-agent-bridge.mdc
+        "note": False,   # the bridge note is its own rule file (below), so the user-rules file stays a pure mirror
+        "note_file": HOME / ".cursor" / "rules" / "00-agent-bridge.mdc",
+        "note_header": ("---\n"
+                        "description: Cross-agent bridge — how to reach a peer agent and how to behave in a bridged run\n"
+                        "alwaysApply: true\n"
+                        "---\n"
+                        f"<!-- {MARKER} — DO NOT EDIT. Edit BRIDGE_NOTE_BODY / CURSOR_PULL in the bridge checkout; "
+                        "this file is overwritten. -->\n\n"),
     },
     "copilot": {
         "rules": HOME / ".copilot" / "instructions" / "agent-bridge-user-rules.instructions.md",
@@ -111,7 +123,7 @@ BOARD_GC_DAYS = 14
 CLAUDE_JSON = HOME / ".claude.json"
 CURSOR_MCP = HOME / ".cursor" / "mcp.json"
 
-QUIET = "--quiet" in sys.argv
+QUIET = False     # set by main() from --quiet; tests flip it on the module
 
 
 def say(msg: str) -> None:
@@ -178,11 +190,11 @@ def write_if_changed(path: Path, content: str, label: str, current: str | None =
     say(f"bridge-sync: wrote {path} ({len(content.splitlines())} lines)")
 
 
-def retire(path: Path, label: str) -> None:
-    """Remove a bridge-owned generated file for a disabled peer (a user-owned file is left alone)."""
+def retire(path: Path, label: str, why: str = "disabled") -> None:
+    """Remove a bridge-owned generated file whose source is gone (a user-owned file is left alone)."""
     if path.is_file() and MARKER in path.read_text(encoding="utf-8", errors="replace"):
         path.unlink()
-        say(f"bridge-sync: removed {path} — {label} disabled")
+        say(f"bridge-sync: removed {path} — {label} {why}")
 
 
 def bridge_owned(current: str | None) -> bool:
@@ -190,29 +202,44 @@ def bridge_owned(current: str | None) -> bool:
     return current is None or MARKER in current
 
 
+def cursor_note() -> str:
+    """The Cursor rule file: the shared bridge note plus the board pull contract only Cursor carries."""
+    return (PEERS["cursor"]["note_header"] + BRIDGE_NOTE_BODY
+            + "\n## Cursor on the shared board (only when the `bridge_board` MCP is connected in this session)\n\n"
+            + CURSOR_PULL + "\n")
+
+
 def sync_rules() -> None:
-    if not CLAUDE_MD.is_file():
-        say(f"bridge-sync: no {CLAUDE_MD}, skipping rules mirror")
-        return
-    body = strip_claude_only(resolve_imports(CLAUDE_MD)) + "\n"
-    write_if_changed(RULES_MIRROR, f"<!-- {MARKER} — canonical stripped mirror of ~/.claude/CLAUDE.md -->\n\n" + body,
-                     "canonical mirror")
+    body = ""
+    if CLAUDE_MD.is_file():
+        body = strip_claude_only(resolve_imports(CLAUDE_MD)) + "\n"
+        write_if_changed(RULES_MIRROR, f"<!-- {MARKER} — canonical stripped mirror of ~/.claude/CLAUDE.md -->\n\n" + body,
+                         "canonical mirror")
+    else:
+        say(f"bridge-sync: no {CLAUDE_MD}, skipping the user-rules mirror (peers still get the bridge note)")
     write_if_changed(BRIDGE_NOTE, BRIDGE_NOTE_BODY, "bridge note")
     for name, peer in PEERS.items():
-        target: Path = peer["rules"]
-        if name in DISABLED:
-            retire(target, f"{name} rules ({DISABLED[name]})")
-            continue
-        if not target.parent.parent.exists():          # ~/.copilot, ~/.cursor absent → peer not installed
-            say(f"bridge-sync: {name}: {target.parent.parent} missing, skipped")
-            continue
-        current = current_text(target)
-        if not bridge_owned(current):
-            say(f"bridge-sync: {name}: {target} is not bridge-owned — left alone "
-                f"(import the mirror instead: {RULES_MIRROR})")
-            continue
-        note = (BRIDGE_NOTE_BODY + "\n") if peer["note"] else ""
-        write_if_changed(target, peer["header"] + note + body, f"{name} rules", current)
+        targets: list[tuple[Path, str, str]] = []            # (file, content, label); "" content = nothing to mirror
+        rules = peer["header"] + (BRIDGE_NOTE_BODY + "\n" if peer["note"] else "") + body if body or peer["note"] else ""
+        targets.append((peer["rules"], rules, f"{name} rules"))
+        if "note_file" in peer:
+            targets.append((peer["note_file"], cursor_note(), f"{name} bridge note"))
+        for target, content, label in targets:
+            if name in DISABLED:
+                retire(target, f"{label} ({DISABLED[name]})")
+                continue
+            if not target.parent.parent.exists():          # ~/.copilot, ~/.cursor absent → peer not installed
+                say(f"bridge-sync: {name}: {target.parent.parent} missing, skipped")
+                break
+            if not content:                                    # no CLAUDE.md: a stale mirror must not outlive its source
+                retire(target, label, f"(no {CLAUDE_MD})")
+                continue
+            current = current_text(target)
+            if not bridge_owned(current):
+                say(f"bridge-sync: {name}: {target} is not bridge-owned — left alone "
+                    f"(delete it to get the generated one; the user-rules mirror is {RULES_MIRROR})")
+                continue
+            write_if_changed(target, content, label, current)
 
 
 def disabled_skills() -> set[str]:
@@ -286,6 +313,9 @@ def sync_agents() -> None:
     Only the Claude side gets these: a peer running one would bridge back (hop guard exit 3)."""
     if not AGENTS_SRC.is_dir() or not CLAUDE_AGENTS.parent.is_dir():
         return
+    if "/.claude/plugins/" in str(AGENTS_SRC):            # installed as a Claude Code plugin: it ships agents/ itself
+        say("bridge-sync: claude: subagents come from the plugin — nothing linked")
+        return
     CLAUDE_AGENTS.mkdir(parents=True, exist_ok=True)
     linked, removed = [], []
     for entry in CLAUDE_AGENTS.iterdir():
@@ -322,12 +352,15 @@ def sync_mcp() -> None:
             have = (json.loads(CLAUDE_JSON.read_text(encoding="utf-8")).get("mcpServers") or {}) if CLAUDE_JSON.is_file() else {}
         except json.JSONDecodeError:
             have = {}
-        if BOARD_SERVER in have:
+        entry = have.get(BOARD_SERVER)
+        if entry is not None and str(BOARD_BIN) in json.dumps(entry):
             say("bridge-sync: claude: board MCP up to date")
         else:      # `claude mcp add` is the supported writer for ~/.claude.json (a large state file — never edit it by hand)
+            if entry is not None:      # registered from another checkout (a plugin version that was swept, an old clone)
+                subprocess.run(["claude", "mcp", "remove", "-s", "user", BOARD_SERVER], capture_output=True, text=True)
             r = subprocess.run(["claude", "mcp", "add", "-s", "user", BOARD_SERVER, "-e", "AGENT_BRIDGE_AGENT=claude", "--",
                                 "python3", str(BOARD_BIN), "serve"], capture_output=True, text=True)   # name before -e (variadic)
-            say(f"bridge-sync: claude: board MCP {'registered' if r.returncode == 0 else 'FAILED: ' + r.stderr.strip()}")
+            say(f"bridge-sync: claude: board MCP {'re-registered at ' + str(BOARD_BIN) if entry is not None and r.returncode == 0 else 'registered' if r.returncode == 0 else 'FAILED: ' + r.stderr.strip()}")
     if "cursor" not in DISABLED and CURSOR_MCP.parent.is_dir():
         current = current_text(CURSOR_MCP)
         try:
@@ -339,7 +372,7 @@ def sync_mcp() -> None:
         want, have = board_entry("cursor"), servers.get(BOARD_SERVER)
         if have == want:
             say("bridge-sync: cursor: board MCP up to date")
-        elif have is not None and str(BOARD_BIN) not in json.dumps(have):
+        elif have is not None and "bin/bridge-board" not in json.dumps(have):
             say(f"bridge-sync: cursor: mcpServers.{BOARD_SERVER} is not bridge-owned — left alone")
         else:
             servers[BOARD_SERVER] = want
@@ -349,6 +382,12 @@ def sync_mcp() -> None:
 
 
 def main() -> int:
+    global QUIET
+    ap = argparse.ArgumentParser(prog="bridge-sync", description=__doc__.split("\n\n")[0],
+                                 epilog="Writes only files that carry its GENERATED marker (or do not exist yet); "
+                                        "a user's own file is reported and left alone.")
+    ap.add_argument("--quiet", action="store_true", help="print nothing (for a SessionStart hook)")
+    QUIET = ap.parse_args().quiet
     sync_rules()
     if SKILLS_SRC.is_dir():
         skills, off = bridged_skills()
@@ -356,7 +395,11 @@ def main() -> int:
             sync_skills_into(peer["skills"], name, skills, off, peer.get("also_reads"))
     sync_agents()
     sync_mcp()
-    removed = boardlib.gc(boardlib.connect(), BOARD_GC_DAYS)
+    conn = boardlib.connect()
+    try:
+        removed = boardlib.gc(conn, BOARD_GC_DAYS)
+    finally:
+        conn.close()
     if removed:
         say(f"bridge-sync: board gc removed {removed} closed topic(s) older than {BOARD_GC_DAYS} days")
     # run logs / threads / panels: `bridge-panel gc` existed since 2026-09-12 but nothing called it (1447 log files,

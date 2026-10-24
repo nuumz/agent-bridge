@@ -100,6 +100,7 @@ class Scoring(unittest.TestCase):
         r = boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to=CURSOR)
         with mock.patch.dict(os.environ, {"AGENT_BRIDGE_IDENTITY": CURSOR, "AGENT_BRIDGE_HOP": "1"}):
             srv = board.Server()
+            self.addCleanup(srv.conn.close)
         out = srv.call("board_post", {"topic": "room:r", "body": "done, trust me", "kind": "done", "reply_to": r})
         self.assertTrue(out["isError"])
         self.assertIn("refused: incomplete", out["content"][0]["text"])
