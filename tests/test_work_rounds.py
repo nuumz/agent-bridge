@@ -78,7 +78,7 @@ class Loop(unittest.TestCase):
         calls: list[str] = []
         state = {"n": 0}
 
-        def ask(peer, mode, cwd, prompt, timeout, conv, kind):
+        def ask(peer, mode, cwd, prompt, timeout, conv, kind, peers=None):
             calls.append(f"{mode}:{peer}")
             if mode == "write":
                 return 0, f"attempt by {peer}", "", peer
@@ -109,7 +109,7 @@ class Loop(unittest.TestCase):
         return {"rounds": json.loads(rounds_json)}, calls, report
 
     def test_switch_once_and_earn_the_round(self):
-        red = "| src/x.py:1 | null check missing | high | yes | boom |"
+        red = "| file:line | finding | severity | must-fix | why |\n|---|---|---|---|---|\n| src/x.py:1 | null check missing | high | yes | boom |"
         got, calls, report = self.run_loop(2, [1, 1, 1], [red, red, red])
         self.assertEqual(calls, ["write:claude", "ask:cursor", "write:claude", "ask:cursor", "write:cursor", "ask:claude"])
         self.assertEqual([r["repeat_findings"] for r in got["rounds"]], [[], ["src/x.py: null check missing"],
@@ -118,7 +118,8 @@ class Loop(unittest.TestCase):
         self.assertIn("rounds: 3/3", report)
 
     def test_no_switch_without_a_repeat_or_when_green(self):
-        got, calls, report = self.run_loop(2, [1, 0], ["| src/x.py:1 | a | high | yes | x |", "NONE"])
+        one = "| file:line | finding | severity | must-fix | why |\n|---|---|---|---|---|\n| src/x.py:1 | a | high | yes | x |"
+        got, calls, report = self.run_loop(2, [1, 0], [one, "NONE"])
         self.assertEqual(calls, ["write:claude", "ask:cursor", "write:claude", "ask:cursor"])
         self.assertIn("READY FOR REVIEW", report)
         self.assertNotIn("switched", report)

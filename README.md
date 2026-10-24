@@ -88,6 +88,36 @@ bridge-watch
 
 Inside Claude Code, the `peer-*` subagents run the same commands in the background and relay the result verbatim.
 
+### Giving Copilot a complete task
+
+Start in the target repo (`-d`), not the bridge installation directory. A Copilot run gets a workspace bootstrap
+in its saved prompt: the actual working directory, nearest repo root, existing root-to-cwd instruction files,
+explicit access roots and the mode's tool limits. Copilot still discovers personal instructions and skills itself;
+the inventory does not prove instructions loaded. Check discovery locally with `copilot -C <repo> instruction list`
+on CLI versions supporting that command. No generated context directory, automatic folder trust or global path
+permission is added. If evidence lives in another repo, grant only that root with `--add-dir`; a source path inside
+the prompt alone does not grant access. Copilot also loads that root's `.github/skills` and `.github/agents`, so grant
+only repos whose config you trust.
+
+Give analysis tasks a bounded question, source paths/logs, expected versus actual behavior and the output needed
+(evidence, root cause, smallest safe fix, remaining uncertainty). In `ask`/`plan`, shell and writes stay denied:
+native search/read tools work inside permitted roots, but git/build/test evidence must be supplied by the caller.
+The bootstrap directs Copilot not to retry denied tools or guess paths, and to ask back if essential access is missing.
+
+For implementation or a targeted improvement, use the existing isolated pipeline:
+
+```bash
+bridge-work run mapper-fix -d ~/src/myrepo -p copilot,claude --implementer copilot --reviewer claude \
+  --files 'src/mapper.py,tests/test_mapper.py' --verify 'python3 -m unittest discover -s tests' \
+  "Fix the mapper's empty-input regression; add a regression test and preserve other mappings."
+```
+
+The script runs verification and an independent review before reporting READY; nothing is committed. Peer
+selection remains explicit, and the default does not change to Copilot. Use `bridge-plan learn` to compare task/mode,
+API duration, reported premium usage and tool failures; missing historical values stay unknown. Premium usage is
+the CLI's reported value, not a dollar estimate or a quality score. Use `bridge-plan mark <run-log> --kept N --rejected M`
+after verifying analysis findings, and the work report's verify/review results for implementation quality.
+
 ## Commands
 
 | Command | Purpose |

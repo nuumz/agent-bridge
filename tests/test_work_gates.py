@@ -1,13 +1,16 @@
 """parse_card_gates + guarded_rc."""
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import os
 import signal
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
@@ -60,6 +63,40 @@ class ParseCardGates(unittest.TestCase):
         )
         self.assertEqual(files, ["src/X.java"])
         self.assertEqual(verify, "pytest -q")
+
+
+class FallbackAndReviewGates(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.bw = _load_bridge_work()
+
+    def test_fallback_only_to_a_peer_the_user_allowed(self):
+        calls = []
+
+        def fake_ask(peer, *a):
+            calls.append(peer)
+            return (7, "quota", "") if peer == "copilot" else (0, "done", "")
+
+        with mock.patch.object(self.bw, "ask", fake_ask), contextlib.redirect_stderr(io.StringIO()):
+            rc, _, _, used = self.bw.ask_with_fallback("copilot", "write", "/r", "p", 5, "c", "implement", ["copilot"])
+            self.assertEqual((rc, used, calls), (7, "copilot", ["copilot"]))
+            calls.clear()
+            rc, _, _, used = self.bw.ask_with_fallback("copilot", "write", "/r", "p", 5, "c", "implement",
+                                                       ["copilot", "claude"])
+            self.assertEqual((rc, used, calls), (0, "claude", ["copilot", "claude"]))
+
+    def test_review_counts_only_when_it_finished_in_the_requested_shape(self):
+        table = "| file:line | finding | severity | must-fix | why |\n|---|---|---|---|---|\n| a.py:1 | x | low | no | y |"
+        self.assertTrue(self.bw.review_valid(0, table))
+        self.assertTrue(self.bw.review_valid(0, " NONE \n"))
+        self.assertFalse(self.bw.review_valid(5, "[[ASK]] which branch?"))
+        self.assertFalse(self.bw.review_valid(0, "Looks good to me overall."))
+        self.assertFalse(self.bw.review_valid(1, table))
+        self.assertFalse(self.bw.review_valid(0, "| I could not inspect the diff"))
+
+    def test_self_review_is_disclosed(self):
+        self.assertIn("not independent", self.bw.review_label("claude", "claude"))
+        self.assertNotIn("not independent", self.bw.review_label("claude", "copilot"))
 
 
 class GuardedRc(unittest.TestCase):

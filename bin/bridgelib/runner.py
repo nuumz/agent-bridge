@@ -247,10 +247,12 @@ def execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | N
                            "tokens_out": parsed.tok_out if parsed and isinstance(parsed.tok_out, int) else None,
                            "turns": int(turns.group(1)) if turns else None,
                            "cache_write": int(cache_write.group(1)) if cache_write else None,
-                           "tool_calls": int(tools.group(1)) if tools else None,
+                           "log": str(log) if log else None,
+                           **(parsed.metrics if parsed else {}),      # Copilot: tool_calls, failures, denials, premium
+                           "tool_calls": (int(tools.group(1)) if tools else      # Claude: counted from the transcript
+                                          (parsed.metrics.get("tool_calls") if parsed else None)),
                            "citations_ok": sum(1 for c in cites if c["status"] == "ok"), "citations_total": len(cites),
-                           "asked_back": bool(parsed and ASK_RE.search(parsed.result or "")),
-                           "log": str(log) if log else None})
+                           "asked_back": bool(parsed and ASK_RE.search(parsed.result or ""))})
         except Exception:  # noqa: BLE001 — the ledger must never break a run
             pass
 
@@ -304,9 +306,13 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
         print("\n".join(err_txt.splitlines()[-20:]), file=sys.stderr)
         if out_txt:
             print(out_txt[-2000:], file=sys.stderr)
-        return status, None, log
+        return status, agent.parse(out_txt) if out_txt.strip() else None, log
 
     parsed = agent.parse(log.read_text(encoding="utf-8", errors="replace"))
+    if parsed.metrics.get("tool_failures"):
+        print(f"[bridge] warning: {agent.name} had {parsed.metrics['tool_failures']} tool failures "
+              f"({parsed.metrics.get('permission_denials', 0)} permission denials); "
+              f"rc=0 alone does not prove the task was verified — inspect {log}", file=sys.stderr)
     if parsed.is_error:
         board.finish(1, parsed)
         quota = quota_hit(parsed.result, log.with_suffix(".err").read_text(errors="replace"))
