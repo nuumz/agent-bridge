@@ -17,3 +17,6 @@ __pycache__/
 
 # CI lives in .github/ — re-include it in case a global excludes file ignores that directory
 !.github/
+# the repo's own agent instructions — re-include them in case a global excludes file ignores these names
+!AGENTS.md
+!CLAUDE.md

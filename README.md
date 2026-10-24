@@ -7,7 +7,9 @@ share a message board, and run multi-agent reviews and fixes. The bridge wraps t
 
 > **Document boundary.** This README owns install, first-run, and the command map.
 > Protocol (exit codes, hop guard, egress, session cards): [SHARED-RULES.md](SHARED-RULES.md).
-> Changing the code: [CONTRIBUTING.md](CONTRIBUTING.md).
+> What leaves the machine and which rail is enforced where: [SECURITY.md](SECURITY.md).
+> How it compares with other multi-agent tools: [docs/landscape.md](docs/landscape.md).
+> Changing the code: [CONTRIBUTING.md](CONTRIBUTING.md) (agents: [AGENTS.md](AGENTS.md)).
 
 - `ask-agent claude|cursor|copilot` — one command, one set of options (mode, model, dir, session, worktree, timeout)
   mapped onto each CLI's own flags; the answer comes back as text plus a `[bridge]` line (session id, tokens, log path).
@@ -16,6 +18,15 @@ share a message board, and run multi-agent reviews and fixes. The bridge wraps t
 - `bridge-work` / `bridge-fix` — implement or fix in an isolated git worktree: write → run your verify command →
   a second peer reviews the diff → fix loop → report. The branch is the deliverable; nothing is ever committed.
 - `bridge-board` — a SQLite-backed board and task queue, exposed to every agent as an MCP server.
+
+## Why this and not a GUI, an MCP model gateway, or a swarm framework
+
+- **Nothing to run.** No daemon, database, tmux or desktop app: one git clone, Python's standard library, and the CLIs
+  you already have. Orchestrator GUIs come and go; a CLI wrapper survives as long as the CLIs do.
+- **The subscriptions you already pay for.** No API keys and no credits: each peer runs under its own login, so a
+  second opinion from another model family costs what that plan already costs.
+- **Rails first, then evidence.** Read-only by default, no commit ever, one hop, and per-vendor consent before a repo
+  is shared. A finding without `file:line` is marked UNVERIFIED instead of being averaged into a "consensus".
 
 ## Safety rails
 
@@ -42,13 +53,27 @@ peers allowed to see the repo.
 
 ## Install
 
-The bridge lives at `~/.agent-bridge` — the subagent wrappers and the peer prompts refer to that path, and runtime state
-is written there.
+Two ways; runtime state goes to `~/.agent-bridge/state/` either way.
+
+**From Claude Code, as a plugin** (one step on Claude Code 2.1.275 or later; Copilot CLI and Codex read the same
+marketplace file):
+
+```
+/plugin install agent-bridge --marketplace nuumz/agent-bridge
+```
+
+The plugin puts `bin/` on the PATH of Claude's Bash tool, ships the `peer-*` subagents (as `agent-bridge:peer-ask` and
+so on) and a `UserPromptSubmit` hook that shows open cards. Then run `bridge-sync` once from that Bash tool to mirror
+your rules into Cursor/Copilot and register the board MCP; run it again after a plugin update (it re-points the MCP
+entry at the new plugin directory). For `ask-agent` from your own terminal, add the plugin's `bin/` to your shell PATH
+or use the clone below.
+
+**As a clone** (any shell, contributors):
 
 ```bash
 git clone https://github.com/nuumz/agent-bridge.git ~/.agent-bridge
 echo 'export PATH="$HOME/.agent-bridge/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
-exec $SHELL
+exec $SHELL             # and restart any running Claude Code session — its Bash tool keeps the old PATH
 ask-agent --list        # which peers are installed and logged in
 bridge-sync             # wire the peers together (below)
 ```
@@ -59,9 +84,10 @@ leaves alone any peer file that does not carry its `GENERATED` marker. What it w
 | Target | What |
 |---|---|
 | `~/.agent-bridge/state/mirror/` | your `~/.claude/CLAUDE.md` (plus `@`-imports, minus Claude-only parts) and the protocol note for peers |
-| `~/.cursor/rules/`, `~/.copilot/instructions/` | the same rules, in each peer's format |
+| `~/.cursor/rules/00-agent-bridge.mdc` | the bridge note for Cursor (how to reach a peer, one hop, board pull); written even without a `CLAUDE.md` |
+| `~/.cursor/rules/`, `~/.copilot/instructions/` | the same rules, in each peer's format (Copilot's file carries the bridge note inline) |
 | `~/.cursor/skills-cursor/`, `~/.copilot/skills/` | symlinks to your `~/.claude/skills/*` |
-| `~/.claude/agents/` | symlinks to [`agents/`](agents) — `peer-ask`, `peer-panel`, `peer-work`, `peer-fix` subagents |
+| `~/.claude/agents/` | symlinks to [`agents/`](agents) — `peer-ask`, `peer-panel`, `peer-work`, `peer-fix` subagents (skipped under a plugin install, which ships them itself) |
 | MCP `bridge_board` | registered for Claude (`claude mcp add -s user`) and Cursor (`~/.cursor/mcp.json`) |
 
 ## Quick start
@@ -87,6 +113,30 @@ bridge-watch
 ```
 
 Inside Claude Code, the `peer-*` subagents run the same commands in the background and relay the result verbatim.
+
+### When a peer needs more information
+
+A bridged run never has the caller's conversation, so the protocol tells every peer to ask for one concrete fact it
+cannot read itself rather than guess, and never to stall on a checklist. Three channels, from cheapest to last resort:
+
+| Channel | How the peer uses it | How you (or the calling agent) answer |
+|---|---|---|
+| Live question while it runs | `board_ask_user` (a fact card) on the thread's topic, then `board_wait` | `bridge-board cards` shows it as seq N; `bridge-board post conv:<name> "<answer>" -k answer --reply-to N` — the run continues and the card closes |
+| Ask-back at the end | the reply ends with one line `[[ASK]] <question>`; `ask-agent` exits **5** and prints how to resume | `ask-agent <peer> --conv <name> "<answer>"` (or `--session <id>` for a run without a thread) — same session, nothing is re-sent |
+| A decision only a human can make | a **card** (`board_ask_user`): question · options · recommendation · default if nobody answers | `bridge-board cards` lists every open card; `bridge-board post <topic> "…" -k decision --reply-to N` |
+
+`bridge-fix` stops at the same kind of card before it changes anything (exit 3), and every `bridge-panel` report carries
+a **Voices** line right after its header — who answered, who answered through a fallback peer, who failed, who asked
+back — so a report never silently drops a role (`status.json` carries the same as `degraded: true`). Over time
+`bridge-plan learn` shows which role/peer asks back most — a sign that the brief, not the peer, needs work.
+
+To see open cards at your next prompt instead of in a log: the plugin install ships this hook; on a clone install add a
+`UserPromptSubmit` hook to `~/.claude/settings.json` with the absolute path (hooks do not get the Bash tool's PATH). It
+prints nothing when nothing is waiting, and it quotes a peer's question as data, never as an instruction:
+
+```json
+{ "hooks": { "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "~/.agent-bridge/bin/bridge-board cards --brief" } ] } ] } }
+```
 
 ### Giving Copilot a complete task
 
@@ -127,7 +177,7 @@ after verifying analysis findings, and the work report's verify/review results f
 | `ask-agent`, `ask-claude`, `ask-cursor`, `ask-copilot` | run one task on a peer; `--conv` threads, `-w` worktree, `--dry-run` |
 | `bridge-plan` | pick a playbook for a request, prepare its session card, learn from the outcome ledger |
 | `bridge-panel` | role-based multi-peer review with a leader and cross-examination |
-| `bridge-work` | implement → verify → review → fix loop in an isolated worktree |
+| `bridge-work` | implement → verify → review → fix loop in an isolated worktree; the reviewer's `BRIDGE_VERDICT=APPROVE\|REVISE` line decides the loop |
 | `bridge-fix` | analyze → human decision → fix, as one resumable flow |
 | `bridge-wait` | one capped wait for a detached panel / work / fix run |
 | `bridge-board` | board + task queue: MCP server, CLI, `dispatch` (the only spawner) |
@@ -135,7 +185,7 @@ after verifying analysis findings, and the work report's verify/review results f
 | `bridge-watch` | live view of every bridged run |
 | `bridge-sync` | mirror rules, skills, subagents and the board MCP into every peer |
 
-Every command except `bridge-sync` takes `--help`.
+Every command takes `--help`.
 
 ## Repository layout
 
@@ -146,6 +196,7 @@ roles/          panel personas (root-cause, contract-checker, design-critic, …
 playbooks/      job kinds for bridge-plan: default roles, peers, session depth
 work-skills/    capability packs injected into bridge-work prompts (impl-test, impl-mapper, …)
 tests/          unit tests (standard-library unittest)
+docs/           landscape (comparable projects, what was borrowed) and the roadmap
 SHARED-RULES.md the protocol every peer follows
 ```
 
