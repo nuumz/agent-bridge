@@ -130,7 +130,7 @@ def kill_tree(proc: subprocess.Popen, sig: int = signal.SIGTERM, grace: int = 10
     for s, wait in ((sig, grace), (signal.SIGKILL, 5)):
         try:
             os.killpg(proc.pid, s)
-        except ProcessLookupError:
+        except OSError:                 # ESRCH: gone; EPERM: macOS, when what is left of the group is a zombie
             return
         try:
             proc.wait(timeout=wait)
@@ -149,7 +149,7 @@ def _signal_children(sig: int) -> None:
     for p in procs:
         try:
             os.killpg(p.pid, sig)
-        except ProcessLookupError:
+        except OSError:                 # ESRCH: gone; EPERM: macOS, when what is left of the group is a zombie
             pass
 
 
@@ -159,7 +159,7 @@ def _end_group(proc: subprocess.Popen, grace: int) -> None:
     kill_tree(proc, grace=grace)
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except OSError:                     # ESRCH: gone; EPERM: macOS, when what is left of the group is a zombie
         pass
 
 
