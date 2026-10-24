@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger  # noqa: E402
 from bridgelib.evidence import cite_score, citation_table, low_evidence, verify_citations  # noqa: E402
 from bridgelib.core import (BOARD_PROTOCOL, PEER_TALK_RULE, ROOT, STATE, detach, guarded_rc, hop_active,  # noqa: E402
-                            lang_rule, share_add_dirs)
+                            lang_rule, run_tool, share_add_dirs)
 
 ROLES = ROOT / "roles"
 PANELS = STATE / "panel"
@@ -89,7 +89,7 @@ def ask(peer: str, conv: str, prompt: str, o, model: str | None = None, mode: st
     if model:
         argv += ["-M", model]
     argv.append(prompt)
-    r = subprocess.run(argv, capture_output=True, text=True)
+    r = run_tool(argv)                              # a kill of this panel reaches the peer through ask-agent
     lines = [ln for ln in r.stdout.splitlines() if not ln.startswith("[bridge]")]
     text = "\n".join(lines).strip()
     if r.returncode not in (0, 5) and not text:

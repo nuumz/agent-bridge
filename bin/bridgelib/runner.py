@@ -18,7 +18,8 @@ import boardlib
 
 from . import evidence
 from .adapters import Adapter, Parsed
-from .core import (BOARD_PROTOCOL, STATE, HOP_VAR, IDENTITY_VAR, QUOTA_TTL, RUNS, TASK_VAR, err_summary, peer_env,
+from .core import (BOARD_PROTOCOL, STATE, HOP_VAR, IDENTITY_VAR, QUOTA_TTL, RUNS, TASK_VAR, err_summary, kill_tree,
+                   peer_env,
                    quota_block, quota_clear, quota_hit, quota_mark)
 
 CONV_DIR = STATE / "conv"
@@ -39,20 +40,6 @@ def protocol(conv: Conv | None) -> str:
             f"board_post your answer. If you need something only the caller can provide: board_ask_user (a fact card) on "
             f"that topic, then board_wait for the answer; if nothing arrives after two waits or the wait is refused, end "
             f"with one line `[[ASK]] <the same question>` and stop. {BOARD_PROTOCOL})")
-
-
-def kill_tree(proc: subprocess.Popen, sig: int = signal.SIGTERM, grace: int = 10) -> None:
-    """Signal the peer's whole process group (the CLI plus every tool/MCP child it spawned), SIGKILL after `grace` s."""
-    for s, wait in ((sig, grace), (signal.SIGKILL, 5)):
-        try:
-            os.killpg(proc.pid, s)
-        except ProcessLookupError:
-            return
-        try:
-            proc.wait(timeout=wait)
-            return
-        except subprocess.TimeoutExpired:
-            continue
 
 
 def run(binary: str, argv: list[str], cwd: str, timeout: int, log: Path, env_extra: dict[str, str] | None = None,
