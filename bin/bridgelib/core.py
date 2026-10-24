@@ -348,7 +348,9 @@ def version_of(binary: str | None) -> str:
     try:
         out = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
         m = re.search(r"\d+\.\d+[\w.\-]*", out.stdout + out.stderr)
-        return m.group(0) if m else (out.stdout.strip().splitlines() or ["?"])[0][:40]
+        # no version-looking token: show what the CLI said, and say plainly when it said nothing (a renamed or
+        # broken --version must read as "unknown", never as a version)
+        return m.group(0) if m else (out.stdout.strip().splitlines() or ["unknown version"])[0][:40]
     except Exception as exc:  # noqa: BLE001 — status display only
         return f"? ({type(exc).__name__})"
 
