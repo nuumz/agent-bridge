@@ -127,7 +127,7 @@ def backfill() -> tuple[int, int]:
                 panel_kind[d.name] = ranked[0][0] if ranked else "other"
                 break
     for p in sorted(RUNS.glob("*.prompt.txt")):
-        m = re.match(r"(\d{8})-(\d{6})(?:-\d+)?-(claude|cursor|copilot|codex)(\.recover)?\.prompt", p.name)
+        m = re.match(r"(\d{8})-(\d{6})(?:-\d+)?-(claude|cursor|copilot|codex|a2a)(\.recover)?\.prompt", p.name)
         if not m or m.group(4):
             continue
         prompt = p.read_text(errors="replace")

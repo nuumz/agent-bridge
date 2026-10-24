@@ -9,8 +9,9 @@ change checklist. This file is the short version.
 - `bin/` — one executable per command, Python 3.11+, **standard library only**. `bin/bridgelib/` is the shared library:
   `core` (paths, constants, hop guard, quota), `adapters` (one class per peer CLI), `runner` (execute a peer run, threads,
   board registration), `ledger` (outcome ledger, playbook loader), `grill`, `evidence`, `workskills`, `protocol` (the
-  message envelope of `docs/PROTOCOL.md`: export and schema check). `bin/boardlib.py` is the SQLite board behind
-  `bridge-board`.
+  message envelope of `docs/PROTOCOL.md`: export and schema check), `a2a` (the A2A transport behind `bridge-a2a`: the
+  mapping of an A2A task onto a board request, the server handler, the client). `bin/boardlib.py` is the SQLite board
+  behind `bridge-board`.
 - `roles/`, `playbooks/`, `work-skills/` — markdown with a flat `key: value` frontmatter; loaded at run time, no code change
   needed to add one. `work-skills.local/` is git-ignored but loaded too, so a test that passes only because of a local
   file there is a CI failure. `agents/` — Claude Code subagent wrappers (`peer-*`), symlinked into `~/.claude/agents/` by `bridge-sync`.

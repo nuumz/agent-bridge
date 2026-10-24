@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""bridge-a2a — the bridge as an A2A (Agent2Agent, JSON-RPC 2.0 over HTTP) agent, and a client for any A2A agent.
+
+    bridge-a2a serve [--bind 127.0.0.1] [--port 8411] [--name NAME] [--url URL] [--peers claude,cursor] [-d DIR]
+                     [--allow-write] [--max-block 60] [--cert PEM --key PEM] [--detach] [--quiet]
+                                     listen; the agent card is at /.well-known/agent-card.json
+    bridge-a2a stop | status         the detached server
+    bridge-a2a client add <name> | list | remove <name>      bearer tokens (state/a2a/clients.json, mode 0600)
+    bridge-a2a card [--url URL]      print a remote agent's card (default: the local server's)
+    bridge-a2a send [--url URL] [--to FAMILY] [--mode ask|plan|write] [--shape S] [--context ID|last] [--model M]
+                    [--add-dir D]... [--timeout 900] [--poll 2] -- "<prompt>"
+                                     one task on a remote agent; JSON Lines on stdout (card · task · result)
+    bridge-a2a --version
+
+Inbound: a client you gave a token to owns one board topic `a2a:<name>` and leads it. Its message/send becomes a
+`request` there, addressed to a family from --peers (your egress gate): a turn, queued as a task that only your
+`bridge-board dispatch` starts. tasks/get reads submitted · working · completed · failed · canceled off the board;
+tasks/cancel withdraws. A client never chooses the directory (-d is yours), sees only its own topic, and may ask for
+`write` only under --allow-write. Loopback by default; a non-loopback bind needs at least one client token; without
+--cert/--key the traffic is plain HTTP, so reach a remote machine through an SSH tunnel or put TLS in front.
+
+Outbound: `send` is what `ask-agent a2a` runs (the `a2a` adapter). URL from --url or AGENT_BRIDGE_A2A_URL; the token
+only from AGENT_BRIDGE_A2A_TOKEN — never on a command line. Exit 0 completed · 1 failed / canceled / rejected / timed
+out (the state and the peer's message go to stderr as `[a2a] <state>: …`) · 2 usage.
+Spec of the mapping: docs/PROTOCOL.md §10.4. State: ~/.agent-bridge/state/a2a/.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import ssl
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bridgelib import a2a, protocol  # noqa: E402
+from bridgelib.adapters import ADAPTERS  # noqa: E402
+from bridgelib.core import DISABLED, detach  # noqa: E402
+
+LOOPBACK = ("127.0.0.1", "::1", "localhost")
+
+
+def emit(obj: dict) -> None:
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
+def load_server_state() -> dict:
+    try:
+        return json.loads(a2a.SERVER_STATE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+# ----------------------------------------------------------------------------- serve / stop / status
+def serve(o) -> int:
+    families = [f for f in o.peers.split(",") if f]
+    bad = [f for f in families if f not in ADAPTERS or f in DISABLED]
+    if not families or bad:
+        print(f"bridge-a2a: --peers must name enabled adapters out of "
+              f"{', '.join(n for n in ADAPTERS if n not in DISABLED)} (got {o.peers!r})", file=sys.stderr)
+        return 2
+    workdir = Path(o.dir).resolve()
+    if not workdir.is_dir():
+        print(f"bridge-a2a: no such dir: {o.dir}", file=sys.stderr)
+        return 2
+    clients = a2a.load_clients()
+    if o.bind not in LOOPBACK and not clients:
+        print("bridge-a2a: a non-loopback bind needs at least one client token — `bridge-a2a client add <name>` first",
+              file=sys.stderr)
+        return 2
+    if bool(o.cert) != bool(o.key):
+        print("bridge-a2a: --cert and --key go together", file=sys.stderr)
+        return 2
+    scheme = "https" if o.cert else "http"
+    cfg = a2a.Config(o.name, o.url or "", families, str(workdir), clients, o.allow_write, o.max_block)
+    try:
+        srv = a2a.make_server(cfg, o.bind, o.port, o.quiet)
+    except OSError as exc:
+        print(f"bridge-a2a: cannot listen on {o.bind}:{o.port}: {exc}", file=sys.stderr)
+        return 1
+    if o.cert:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(o.cert, o.key)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    host = o.bind if ":" not in o.bind else f"[{o.bind}]"
+    cfg.url = o.url or f"{scheme}://{host}:{srv.server_port}"
+    if not clients:
+        print("[a2a] no client tokens yet: only the agent card is served (bridge-a2a client add <name>)", file=sys.stderr)
+    if o.detach:
+        detach(a2a.A2A_DIR / "server.log")               # the listening socket survives the fork
+    a2a.A2A_DIR.mkdir(parents=True, exist_ok=True)
+    a2a.SERVER_STATE.write_text(json.dumps({"pid": os.getpid(), "url": cfg.url, "bind": o.bind,
+                                            "port": srv.server_port, "families": families, "dir": str(workdir),
+                                            "allow_write": o.allow_write, "clients": sorted(clients),
+                                            "started": int(time.time())}, indent=2) + "\n")
+    print(f"[a2a] {cfg.name} listening at {cfg.url} — peers {','.join(families)}, dir {workdir}, "
+          f"write {'allowed' if o.allow_write else 'refused'}, clients {', '.join(sorted(clients)) or 'none'}",
+          file=sys.stderr, flush=True)
+
+    def stop_signal(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, stop_signal)
+    try:
+        srv.serve_forever()
+    except SystemExit:
+        pass
+    finally:
+        srv.server_close()
+        if load_server_state().get("pid") == os.getpid():
+            a2a.SERVER_STATE.unlink(missing_ok=True)
+    return 0
+
+
+def stop(_o) -> int:
+    st = load_server_state()
+    if not alive(st.get("pid")):
+        a2a.SERVER_STATE.unlink(missing_ok=True)
+        print("bridge-a2a: no server running")
+        return 0
+    os.kill(st["pid"], signal.SIGTERM)
+    for _ in range(20):
+        if not alive(st["pid"]):
+            print(f"[a2a] stopped pid={st['pid']} ({st.get('url')})")
+            return 0
+        time.sleep(0.5)
+    print(f"bridge-a2a: pid {st['pid']} still running after 10 s", file=sys.stderr)
+    return 1
+
+
+def status(_o) -> int:
+    st = load_server_state()
+    if not st or not alive(st.get("pid")):
+        print("no server running" + (f" (stale state for pid {st.get('pid')})" if st else ""))
+        return 1
+    print(json.dumps(st, indent=2))
+    return 0
+
+
+# ----------------------------------------------------------------------------- clients
+def client(o) -> int:
+    if o.ccmd == "add":
+        try:
+            token = a2a.add_client(o.name)
+        except Exception as exc:  # noqa: BLE001 — BoardError or ValueError: the name is wrong
+            print(f"bridge-a2a: {exc}", file=sys.stderr)
+            return 2
+        print(f"client {o.name} added — its token (shown once, give it to that agent's operator; on their side: "
+              f"export {a2a.TOKEN_VAR}=…):\n{token}")
+        return 0
+    clients = a2a.load_clients()
+    if o.ccmd == "list":
+        for name in sorted(clients):
+            print(name)
+        if not clients:
+            print("(no clients)")
+        return 0
+    if o.name not in clients:
+        print(f"bridge-a2a: no client {o.name!r}", file=sys.stderr)
+        return 1
+    del clients[o.name]
+    a2a.save_clients(clients)
+    print(f"client {o.name} removed (a running server keeps the old table until restarted)")
+    return 0
+
+
+# ----------------------------------------------------------------------------- card / send
+def resolve_url(o) -> str | None:
+    return o.url or os.environ.get(a2a.URL_VAR) or load_server_state().get("url")
+
+
+def card(o) -> int:
+    url = resolve_url(o)
+    if not url:
+        print(f"bridge-a2a: no URL (--url, {a2a.URL_VAR}, or a running local server)", file=sys.stderr)
+        return 2
+    try:
+        print(json.dumps(a2a.Client(url, os.environ.get(a2a.TOKEN_VAR)).card(), indent=2, ensure_ascii=False))
+    except a2a.A2AError as exc:
+        print(f"bridge-a2a: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def send(o) -> int:
+    url = o.url or os.environ.get(a2a.URL_VAR)
+    if not url:
+        print(f"bridge-a2a: no URL — pass --url or set {a2a.URL_VAR}", file=sys.stderr)
+        return 2
+    text = " ".join(o.prompt).strip()
+    if not text and not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+    if not text:
+        print("bridge-a2a: empty prompt", file=sys.stderr)
+        return 2
+    cli = a2a.Client(url, os.environ.get(a2a.TOKEN_VAR), timeout=min(30.0, float(o.timeout)))
+    context = o.context
+    if context == "last":
+        try:
+            context = json.loads(a2a.LAST_CONTEXT.read_text(encoding="utf-8")).get(url)
+        except (OSError, json.JSONDecodeError):
+            context = None
+    deadline = time.time() + o.timeout
+    try:
+        info = cli.card()
+        emit({"type": "card", "agent": info.get("name"), "url": url, "protocolVersion": info.get("protocolVersion")})
+        task = cli.send(text, o.to, o.mode, o.shape, context, o.model, o.add_dir)
+        tid, ctx = task.get("id"), task.get("contextId")
+        a2a.A2A_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            known = json.loads(a2a.LAST_CONTEXT.read_text(encoding="utf-8")) if a2a.LAST_CONTEXT.is_file() else {}
+        except json.JSONDecodeError:
+            known = {}
+        known[url] = ctx
+        a2a.LAST_CONTEXT.write_text(json.dumps(known, indent=2) + "\n", encoding="utf-8")
+        state = (task.get("status") or {}).get("state")
+        emit({"type": "task", "id": tid, "context_id": ctx, "state": state})
+        final = task
+        if state not in a2a.TERMINAL:
+            for final in cli.wait(tid, deadline, o.poll):
+                state = (final.get("status") or {}).get("state")
+                emit({"type": "task", "id": tid, "context_id": ctx, "state": state})
+    except a2a.A2AError as exc:
+        emit({"type": "error", "message": str(exc), "code": exc.code})
+        print(f"[a2a] error: {exc}", file=sys.stderr)
+        return 1
+    answer = a2a.text_of(final)
+    if state not in a2a.TERMINAL:
+        state = "timeout"
+    emit({"type": "result", "state": state, "text": answer, "task_id": tid, "context_id": ctx,
+          "agent": info.get("name"), "url": url})
+    if state != "completed":
+        print(f"[a2a] {state}: {answer or '(no message from the peer)'}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="bridge-a2a", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version",
+                    version=f"bridge-a2a {a2a.BRIDGE_VERSION} (A2A protocol {a2a.A2A_VERSION}, envelope v{protocol.VERSION})")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("serve")
+    p.add_argument("--bind", default="127.0.0.1"); p.add_argument("--port", type=int, default=8411)
+    p.add_argument("--name", default=f"agent-bridge@{os.uname().nodename}")
+    p.add_argument("--url", help="the URL to announce in the card (default: built from --bind/--port)")
+    p.add_argument("--peers", default="claude", help="families a client may address, comma-separated (the egress gate)")
+    p.add_argument("-d", "--dir", default=os.getcwd(), help="the workspace every inbound turn runs in")
+    p.add_argument("--allow-write", action="store_true", help="accept metadata.mode=write (dispatch still needs --allow-write)")
+    p.add_argument("--max-block", type=int, default=60, help="seconds a blocking message/send may wait")
+    p.add_argument("--cert"); p.add_argument("--key")
+    p.add_argument("--detach", action="store_true"); p.add_argument("--quiet", action="store_true")
+    sub.add_parser("stop"); sub.add_parser("status")
+    c = sub.add_parser("client").add_subparsers(dest="ccmd", required=True)
+    c.add_parser("add").add_argument("name"); c.add_parser("list"); c.add_parser("remove").add_argument("name")
+    p = sub.add_parser("card"); p.add_argument("--url")
+    p = sub.add_parser("send")
+    p.add_argument("prompt", nargs="*"); p.add_argument("--url")
+    p.add_argument("--to", help="family on the remote (its card lists them)"); p.add_argument("--mode", default="ask", choices=["ask", "plan", "write"])
+    p.add_argument("--shape", help="what the answer must look like (table, file:line, json, diff, decision, command)")
+    p.add_argument("--context", help="an A2A contextId to continue, or `last`"); p.add_argument("--model")
+    p.add_argument("--add-dir", action="append", default=[], help="a hint for the remote; it grants nothing here")
+    p.add_argument("--timeout", type=float, default=900); p.add_argument("--poll", type=float, default=2.0)
+    o = ap.parse_args()          # options before `--`, the prompt after it (what the a2a adapter sends)
+    return {"serve": serve, "stop": stop, "status": status, "client": client, "card": card, "send": send}[o.cmd](o)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

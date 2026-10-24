@@ -100,6 +100,19 @@ EXPECT = {
         resume=lambda s: ("resume", s), cont=("resume", "--last"),
         quota="You've hit your usage limit. Try again in 3 hours.",
     ),
+    "a2a": dict(
+        output="send", prompt_flag="--",
+        modes={"ask": dict(has=[("--mode", "ask")], not_=[("--mode", "write")]),
+               "plan": dict(has=[("--mode", "plan")], not_=[("--mode", "write")]),
+               "write": dict(has=[("--mode", "write")], not_=[("--mode", "ask")])},
+        board_ask=dict(has=[("--mode", "ask")], not_=[("--mode", "write")]),
+        git_deny=None, hold=None,
+        no_commit="the remote agent's own rails: the bridge sends text, a mode and a shape, never a credential, a "
+                  "path grant or a command",
+        add_dir=lambda d: ("--add-dir", d), model=lambda m: ("--model", m),
+        resume=lambda s: ("--context", s), cont=("--context", "last"),
+        quota="[a2a] failed: You've hit your usage limit. Try again in 3 hours.",
+    ),
 }
 
 

@@ -30,9 +30,10 @@ implement without reading SHARED-RULES.md; the adapter conformance kit (#11) is 
 third — a fourth family through the kit — landed the same day too: **Codex CLI** (`ask-codex`, `codex exec --json`
 with the read-only / workspace-write sandboxes as the rails, the board MCP as `-c` overrides on the run, `codex` in
 `boardlib.FAMILIES` for turns), written from the codex-rs sources and passing the kit; the first run against a real
-`codex` binary is still owed (SHARED-RULES §2 says what it must confirm). Left: an A2A transport (#16) when a
-cross-machine peer exists, and `bridge-sync` targets for Codex (`~/.codex/AGENTS.md` mirror, `codex mcp add` for the
-board) once the adapter is verified.
+`codex` binary is still owed (SHARED-RULES §2 says what it must confirm). The fourth step, the A2A transport (#16),
+landed too: the envelope crosses machines unchanged, with the board's own rails (tokens, one topic per client, human
+dispatch) as the trust model. Left: `bridge-sync` targets for Codex (`~/.codex/AGENTS.md` mirror, `codex mcp add` for
+the board) once the adapter is verified, and a real A2A peer on another machine to try the transport against.
 
 ## Next (M) — cheaper, safer runs
 
@@ -53,7 +54,7 @@ board) once the adapter is verified.
 | 13 | ◐ 2026-10-24 **Install in one command**: `.claude-plugin/plugin.json` + `marketplace.json` + `hooks/hooks.json` landed (`/plugin install agent-bridge --marketplace nuumz/agent-bridge`; no `version` field, so the plugin tracks the commit; `bridge-sync` skips the subagent links under a plugin root and re-points the board MCP when the plugin directory changes; MCP stays user-scope so the `mcp__bridge_board__*` tool names stay stable; `bridge-plan` names the subagents `agent-bridge:peer-*` there). Not done: root `plugin.json` (Agent Plugins 1.0 — its `mcp.json` cannot carry the per-client `AGENT_BRIDGE_AGENT` env the board uses for identity) and `pyproject.toml` for `uv tool install` | sync-agents-settings, codex-plugin-cc, uv | state must stay in `~/.agent-bridge/state`, never under the plugin root; `bin/` on PATH applies to Claude's Bash tool only |
 | 14 | **Durable thread handle across commands**: one `--conv` usable by ask/panel/fix, with file references deduplicated by path + hash and an explicit turn/TTL cap | PAL `continuation_id`, Codex `threadId` | PAL's stale-file bug is the thing to avoid |
 | 15 | **Skills convergence**: link `~/.agents/skills/<name>` to `~/.claude/skills/<name>` once Cursor's duplicate handling is verified; validate `SKILL.md` names against the Agent Skills spec before linking | agentskills.io, agent docs | verify first: Cursor also reads `~/.claude/skills` |
-| 16 | **A2A card** exposing the bridge to peers that speak A2A (Gemini `kind: remote`) | a2abridge | only when a real peer needs it; adds an HTTP surface |
+| 16 | ✅ 2026-10-24 **A2A transport** (`bridge-a2a`): the bridge as one A2A agent — card at `/.well-known/agent-card.json`, `message/send` → a board request on the client's own topic (a turn for a family the operator allowed; nothing runs until a human dispatches), `tasks/get` / `tasks/cancel` read and withdraw it — and `ask-agent a2a` as the client to any A2A agent. Loopback + bearer tokens, off by default, standard library only, started by the user like `bridge-live`; the envelope is unchanged (PROTOCOL.md §10.4). Not done: streaming / push (polling only), TLS beyond `--cert`/`--key`, per-family capability discovery | a2abridge | adds an HTTP surface — see SECURITY.md "Network surface" |
 
 ## Not planned
 

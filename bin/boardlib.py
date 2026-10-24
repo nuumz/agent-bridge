@@ -29,7 +29,7 @@ KINDS = ("note", "question", "answer", "decision", "task", "system", "request", 
 CLOSING_KINDS = ("answer", "done", "blocked")   # a request stays open until one of these replies to it (OPEN_REQUEST)
 ROLES = ("leader", "member", "observer")
 TASK_MODES = ("ask", "plan", "write")
-FAMILIES = ("claude", "cursor", "copilot", "codex")   # a request addressed to a family is a turn: a task, run by dispatch
+FAMILIES = ("claude", "cursor", "copilot", "codex", "a2a")   # a request addressed to a family is a turn: a task, run by dispatch
 
 # `addressee` is the column behind the `to` argument (TO is an SQLite keyword): NULL = broadcast, like every message
 # posted before the column existed; otherwise `*`, an agent identity, or `@<role>` of the topic's members.

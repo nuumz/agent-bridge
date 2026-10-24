@@ -91,6 +91,14 @@
       "envelope": {"v": 1, "topic": "tasks", "seq": 1, "author": "cursor@primary", "kind": "question", "body": "Who owns the ledger?"}
     },
     {
+      "name": "an A2A client's request: a turn on its own topic (docs/PROTOCOL.md §10.4)",
+      "envelope": {"v": 1, "topic": "a2a:alice", "seq": 1, "author": "a2a:alice", "kind": "request", "to": "claude",
+                   "reply_to": null, "created_at": 1761301200,
+                   "body": "shape: file:line findings\nmode: ask\ndir: /home/alice/src/myrepo\nmessage-id: 3f9c1a2b\n\nReview src/payment/ for retry bugs.",
+                   "headers": {"shape": "file:line findings", "mode": "ask", "dir": "/home/alice/src/myrepo", "message-id": "3f9c1a2b"},
+                   "citations": []}
+    },
+    {
       "name": "a header key the spec does not list is carried as a string",
       "envelope": {"v": 1, "topic": "room:design", "seq": 8, "author": "cursor#4120", "kind": "note", "to": null, "reply_to": null,
                    "created_at": 1761301100, "body": "prio: high\n\nOne more caller found.", "headers": {"prio": "high"}, "citations": []}

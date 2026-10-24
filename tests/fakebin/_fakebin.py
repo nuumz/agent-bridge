@@ -30,7 +30,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ANSWER = "The retry loop in src/retry.py:12 never backs off, and src/retry.py:30 swallows the timeout."
 VERSIONS = {"claude": "2.1.275 (Claude Code)", "cursor-agent": "2025.10.17-a1b2c3d", "copilot": "1.0.88",
-            "codex": "codex-cli 0.63.0"}
+            "codex": "codex-cli 0.63.0", "bridge-a2a": "bridge-a2a 1.0 (A2A protocol 0.3.0, envelope v1)"}
 ENV_PREFIXES = ("AGENT_BRIDGE_", "CLAUDE_CODE_", "CLAUDECODE", "CLAUDE_SESSION_")
 
 
