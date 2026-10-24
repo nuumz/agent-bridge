@@ -251,7 +251,8 @@ class Cursor(Adapter):
         what = what or "`Write(**)` + write-capable Shell denials"
 
         def fn(state):
-            text = self.CLI_CONFIG.read_text() if self.CLI_CONFIG.is_file() else "{}"
+            existed = self.CLI_CONFIG.is_file()
+            text = self.CLI_CONFIG.read_text() if existed else "{}"
             cfg = json.loads(text or "{}")
             deny = cfg.setdefault("permissions", {}).setdefault("deny", [])
             # Drop leftover Shell(*) from pre-2026-10-13 holds so read-only shell works; do not put it back on restore.
@@ -266,8 +267,11 @@ class Cursor(Adapter):
                 edited = state["added"] and text != state["written"]
                 deny.extend(missing)
                 written = json.dumps(cfg, indent=2) + "\n"
+                # a machine where cursor-agent is on PATH but ~/.cursor does not exist yet (a fresh install, a CI
+                # runner): the hold creates the file and the last holder out removes it again (orig=None)
+                self.CLI_CONFIG.parent.mkdir(parents=True, exist_ok=True)
                 self.CLI_CONFIG.write_text(written)
-                state.update(added=True, orig=state["orig"] if state["added"] else text,
+                state.update(added=True, orig=state["orig"] if state["added"] else (text if existed else None),
                              written="" if edited else written, entries=state.get("entries", []) + missing)
             if os.getpid() not in state["pids"]:
                 state["pids"].append(os.getpid())
@@ -301,7 +305,10 @@ class Cursor(Adapter):
         (cursor-agent rewrites cli-config.json itself — model choice, auth refresh) drop only the entries we added."""
         current = self.CLI_CONFIG.read_text() if self.CLI_CONFIG.is_file() else ""
         if current == state.get("written", ""):
-            self.CLI_CONFIG.write_text(state["orig"])
+            if state.get("orig") is None:                   # the file is the hold's own: nothing to put back
+                self.CLI_CONFIG.unlink(missing_ok=True)
+            else:
+                self.CLI_CONFIG.write_text(state["orig"])
         else:
             try:
                 cfg = json.loads(current or "{}")

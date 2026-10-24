@@ -19,6 +19,8 @@ change checklist. This file is the short version.
   until someone bumps it; without one the plugin tracks the commit) and `CLAUDE.md` at the root (it is for contributors'
   agents, not plugin context).
 - `tests/` — `unittest`, no third-party packages. Peer CLIs are stub scripts put first on `PATH`; `HOME` is a temp dir.
+  `tests/fakebin/` holds one stub per peer binary (driven by `FAKEBIN_*` variables, replaying `fixtures/<binary>.jsonl`);
+  `tests/test_adapter_conformance.py` runs every adapter through them — a new adapter is done when it passes there.
 - Runtime state is **never** in the checkout: `~/.agent-bridge/state/` (git-ignored). Tests must not read or write it.
   State paths are import-time constants, so patching `HOME` in a test does nothing: patch the constant the code reads
   (`ledger.LEDGER`, `boardlib.BOARD_DIR` / `DB_PATH`, `runner.CONV_DIR`, `core.STATE`) and give any subprocess its own
