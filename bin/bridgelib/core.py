@@ -41,6 +41,28 @@ def hop_active(env: dict | None = None) -> bool:
     """True inside a bridged run. Presence decides, not the value: `AGENT_BRIDGE_HOP=` must not open a second hop."""
     return HOP_VAR in (os.environ if env is None else env)
 
+
+# Extra readable roots an orchestrator (panel/work/fix) grants every peer run it spawns. Copilot and Cursor read only
+# under -d and --add-dir, so evidence a case cites in another repo was denied to them (2026-10 ledger: 156 denials).
+ADD_DIRS_VAR = "AGENT_BRIDGE_ADD_DIRS"
+
+
+def add_dirs_from_env() -> list[str]:
+    return [d for d in os.environ.get(ADD_DIRS_VAR, "").split(os.pathsep) if d]
+
+
+def share_add_dirs(dirs: list[str]) -> None:
+    """Export `--add-dir` roots so every ask-agent child (also after --detach) inherits them; a missing root exits."""
+    have = add_dirs_from_env()
+    for d in dirs:
+        p = Path(d).expanduser().resolve()
+        if not p.is_dir():
+            sys.exit(f"--add-dir: not a directory: {d}")
+        if str(p) not in have:
+            have.append(str(p))
+    if have:
+        os.environ[ADD_DIRS_VAR] = os.pathsep.join(have)
+
 def guarded_rc(name: str, write_rc: Callable[[str, int], int], body: Callable[[], int]) -> int:
     """Run `body` with SIGTERM → exit 143; always write_rc(name, rc), including on SIGTERM.
 

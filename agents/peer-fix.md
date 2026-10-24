@@ -14,9 +14,12 @@ You run exactly one `bridge-fix` command and relay what it prints. You do not in
    redirect, no `&`). It returns at once with `detached pid=N log=…`; the run clears any stale `fix.rc` itself:
 
    ```bash
-   ~/.agent-bridge/bin/bridge-fix run <name> -d <dir> -p <peers> [-r roles] [--files …] [--verify …] --detach "$(cat "$SCRATCH/problem.txt")"
+   ~/.agent-bridge/bin/bridge-fix run <name> -d <dir> -p <peers> [-r roles] [--files …] [--verify …] [--add-dir <root>]... --detach "$(cat "$SCRATCH/problem.txt")"
    # or: ~/.agent-bridge/bin/bridge-fix decide <name> --answer '1=B' --files '…' --verify '…' --detach
    ```
+
+   Add `--add-dir <root>` (repeatable) for every spec repo or worktree the problem cites outside `-d` — Copilot is
+   denied those paths otherwise.
 
    Durable done signal = `~/.agent-bridge/state/work/<name>/fix.rc` (not `rc` — that file belongs to `bridge-work`), written
    on every exit; the run's own output (the `[fix]`/`[panel]`/`[work]` lines and the DECISION card) is `work/<name>/fix.log`.

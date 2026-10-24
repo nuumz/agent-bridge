@@ -30,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boardlib  # noqa: E402 — card text only; every post goes through the bridge-board CLI (identity resolved there)
 from bridgelib import grill as grill_plan, ledger  # noqa: E402
-from bridgelib.core import ROOT, STATE, detach, guarded_rc, hop_active  # noqa: E402
+from bridgelib.core import ROOT, STATE, detach, add_dirs_from_env, guarded_rc, hop_active, share_add_dirs  # noqa: E402
 
 BIN = ROOT / "bin"
 BOARD = BIN / "bridge-board"
@@ -132,6 +132,7 @@ def analyze(fl: dict, o) -> int:
                f"if undecided · block?), and `Next actions` must name the files to change and the command that proves the fix.")
     argv = [str(BIN / "bridge-panel"), "run", panel, "-p", fl["peers"], "-r", fl["roles"], "-d", fl["repo"], "-t", str(o.timeout),
             "--kind", "defect-root-cause", "--fix", problem]
+    share_add_dirs(fl.get("add_dirs", []))
     print(f"[fix] analyze: bridge-panel run {panel} (roles {fl['roles']} on {fl['peers']}) — watch: bridge-watch", file=sys.stderr)
     rc = stream_filtered(argv, ("[panel]", "[bridge] error"))
     report = PANELS / panel / "report.md"
@@ -334,6 +335,7 @@ def fix(fl: dict, o) -> int:
             f"recommendation is NOT the ruling where they differ).\n\nProblem:\n{fl['problem']}\n\n{agreement}{sketch}")
     argv = [str(BIN / "bridge-work"), "run", f"fix-{fl['name']}", "-d", fl["repo"], "-p", fl["peers"], "--files", fl["files"],
             "--verify", fl["verify"], "--rounds", str(getattr(o, "rounds", 2) or 2), "-t", str(max(getattr(o, "timeout", 420) or 420, 600)), task]
+    share_add_dirs(fl.get("add_dirs", []))
     print(f"[fix] fix: bridge-work run fix-{fl['name']} (files {fl['files']}; verify `{fl['verify']}`)", file=sys.stderr)
     rc = stream_filtered(argv, ("[work]",))
     report = WORK / f"fix-{fl['name']}" / "report.md"
@@ -367,10 +369,13 @@ def run(o) -> int:
             return 2
         fl = {"name": o.name, "stage": "analyze", "problem": o.problem, "repo": repo, "peers": o.peers,
               "roles": o.roles or DEFAULT_ROLES, "files": o.files or "", "verify": o.verify or "",
-              "created": time.strftime("%Y-%m-%d %H:%M")}
+              "add_dirs": add_dirs_from_env(), "created": time.strftime("%Y-%m-%d %H:%M")}
         save(fl)
     else:
         print(f"[fix] resuming {o.name} at stage {fl['stage']}", file=sys.stderr)
+        if o.add_dir:
+            fl["add_dirs"] = [*fl.get("add_dirs", []), *(d for d in add_dirs_from_env() if d not in fl.get("add_dirs", []))]
+            save(fl)
     if fl["stage"] == "analyze":
         if analyze(fl, o) != 0:
             return 1
@@ -392,6 +397,8 @@ def main() -> int:
     r.add_argument("name")
     r.add_argument("problem", nargs="?")
     r.add_argument("-d", "--dir", default=os.getcwd())
+    r.add_argument("--add-dir", action="append", default=[],
+                   help="extra root every peer run may read (repeatable; kept in flow.json for later stages)")
     r.add_argument("-p", "--peers", default="claude", help="peers allowed to see the repo (egress gate)")
     r.add_argument("-r", "--roles", help=f"panel roles for analyze (default {DEFAULT_ROLES}; roles on a peer not in -p are skipped)")
     r.add_argument("--files", help="file globs the fix may touch (else proposed from the patch sketch, confirmed at decide)")
@@ -417,6 +424,7 @@ def main() -> int:
         s.add_argument("name")
     sub.add_parser("list")
     o = ap.parse_args()
+    share_add_dirs(getattr(o, "add_dir", []))
     if o.cmd in ("run", "decide"):
         if hop_active():                  # a peer neither starts a flow nor rules on one
             print("bridge-fix: refusing inside a bridged run (one hop only)", file=sys.stderr)

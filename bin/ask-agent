@@ -34,8 +34,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import boardlib  # noqa: E402
 from bridgelib.adapters import ADAPTERS, Adapter  # noqa: E402
-from bridgelib.core import (PEER_TALK_RULE, DISABLED, HOP_VAR, QUOTA_TTL, hop_active, quota_block,  # noqa: E402
-                            version_of)
+from bridgelib.core import (PEER_TALK_RULE, DISABLED, HOP_VAR, QUOTA_TTL, add_dirs_from_env, hop_active,  # noqa: E402
+                            quota_block, version_of)
 from bridgelib.runner import (AGREE_RE, CONV_DIR, USER_AUTHOR, BoardRun, Conv, execute, print_parsed,  # noqa: E402
                               protocol)
 
@@ -155,6 +155,7 @@ def main() -> int:
     # intermixed: `ask-agent claude -m ask "q"` puts options between the two positionals, which plain parse_args
     # rejects on Python 3.11/3.12 (3.13 accepts it) — every panel worker and dispatch call has that shape
     o = ap.parse_intermixed_args()
+    o.add_dir += [d for d in add_dirs_from_env() if d not in o.add_dir]   # roots granted by panel/work/fix
 
     if o.list:
         return list_agents()

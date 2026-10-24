@@ -97,7 +97,8 @@ the inventory does not prove instructions loaded. Check discovery locally with `
 on CLI versions supporting that command. No generated context directory, automatic folder trust or global path
 permission is added. If evidence lives in another repo, grant only that root with `--add-dir`; a source path inside
 the prompt alone does not grant access. Copilot also loads that root's `.github/skills` and `.github/agents`, so grant
-only repos whose config you trust.
+only repos whose config you trust. `bridge-panel`, `bridge-work` and `bridge-fix` take the same `--add-dir` and pass
+it to every peer run they start — use it whenever the case cites a spec repo or another worktree.
 
 Give analysis tasks a bounded question, source paths/logs, expected versus actual behavior and the output needed
 (evidence, root cause, smallest safe fix, remaining uncertainty). In `ask`/`plan`, shell and writes stay denied:
