@@ -22,6 +22,7 @@ class SkillLinks(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.bs = _load()
+        cls.bs.QUIET = True
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

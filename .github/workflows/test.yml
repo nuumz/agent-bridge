@@ -19,7 +19,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Every command parses and prints its help
         run: |
-          for c in ask-agent bridge-board bridge-fix bridge-live bridge-panel bridge-plan bridge-wait bridge-watch bridge-work; do
+          for c in ask-agent bridge-board bridge-fix bridge-live bridge-panel bridge-plan bridge-sync bridge-wait bridge-watch bridge-work; do
             python bin/$c --help > /dev/null
           done
       - name: Unit tests
