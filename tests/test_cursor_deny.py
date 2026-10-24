@@ -60,6 +60,32 @@ class CursorDenyTest(unittest.TestCase):
         self.assertIn("Read-only run", text)
         self.assertIn("git log", text)
 
+    def test_cursor_pull_is_not_loaded_onto_other_peers(self):
+        from bridgelib import core, runner
+        on = self.cur.preamble(mock.Mock(mode="ask", worktree=None, board=True, conv="x"))
+        off = self.cur.preamble(mock.Mock(mode="ask", worktree=None, board=False, conv="x"))
+        no_topic = self.cur.preamble(mock.Mock(mode="ask", worktree=None, board=True, conv=None))
+        self.assertIn(core.CURSOR_PULL, on)
+        self.assertNotIn(core.CURSOR_PULL, off)
+        self.assertNotIn(core.CURSOR_PULL, no_topic)          # no thread → nothing to pull; the protocol says [[ASK]]
+        self.assertIn("outside this task", core.CURSOR_PULL)
+        self.assertIn("secrets", core.CURSOR_PULL)
+        self.assertIn("any other topic is not yours", core.CURSOR_PULL)   # never close another thread's request
+        self.assertNotIn("you pull", core.BOARD_PROTOCOL)
+        self.assertNotIn("outside this task", core.BOARD_PROTOCOL)
+        self.assertIn("fixed checklist", core.BOARD_PROTOCOL)
+        self.assertNotIn("answer shape that fits", core.BOARD_PROTOCOL)   # the shape: line is binding, server-checked
+        self.assertIn("No fixed checklist", core.CURSOR_PULL)
+
+        class BoardThread:
+            topic = 1
+            topic_name = "conv:x"
+
+        shared = runner.protocol(BoardThread())
+        self.assertIn(core.BOARD_PROTOCOL, shared)
+        self.assertNotIn(core.CURSOR_PULL, shared)
+        self.assertNotIn(core.CURSOR_PULL, runner.protocol(None))
+
 
 if __name__ == "__main__":
     unittest.main()
