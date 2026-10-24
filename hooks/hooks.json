@@ -1,0 +1,8 @@
+{
+  "description": "Open cards (questions a peer or a bridge flow is waiting on) reach you at your next prompt; silent when none.",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/bin/bridge-board\" cards --brief" } ] }
+    ]
+  }
+}
