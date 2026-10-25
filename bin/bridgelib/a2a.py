@@ -26,6 +26,7 @@ import stat
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -182,6 +183,29 @@ def save_clients(clients: dict[str, str], path: Path | None = None) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(clients, indent=2) + "\n", encoding="utf-8")
     os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+    os.replace(tmp, path)
+
+
+def last_context(path: Path | None = None) -> dict[str, str]:
+    """{url: contextId} of the last send per remote — `--context last`; anything but an object of strings is nothing."""
+    try:
+        data = json.loads((path or LAST_CONTEXT).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {str(k): v for k, v in data.items() if isinstance(v, str)} if isinstance(data, dict) else {}
+
+
+def remember_context(url: str, context: Any, path: Path | None = None) -> None:
+    """Record the context a send got (atomically: parallel runs must not garble the file); None forgets it."""
+    path = path or LAST_CONTEXT
+    known = last_context(path)
+    if isinstance(context, str) and context:
+        known[url] = context
+    else:
+        known.pop(url, None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(known, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -489,62 +513,94 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_OPENER = urllib.request.build_opener(_NoRedirect)
+# no ProxyHandler from the environment: a tunnel URL (127.0.0.1:8411) must never leave through an http_proxy in clear
+_OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
+# states the client stops polling on: terminal ones, and the ones where the remote waits for a person, not for time
+STOP_STATES = TERMINAL + ("input-required", "auth-required")
 
 
 class Client:
-    def __init__(self, url: str, token: str | None = None, timeout: float = 30):
-        self.url, self.token, self.timeout = url.rstrip("/"), token, timeout
+    """The bridge's A2A client. Every failure — HTTP status, unreachable host, a connection dropped mid-read, a body
+    that is not the JSON shape expected — is an A2AError, so `bridge-a2a send` can print one `error` line and exit 1.
+    `deadline` (epoch) bounds every call: a slow remote costs the run at most the time it has left."""
 
-    def _http(self, path: str, data: dict | None = None) -> Any:
+    def __init__(self, url: str, token: str | None = None, timeout: float = 30, deadline: float | None = None):
+        self.url, self.token, self.timeout, self.deadline = url.rstrip("/"), token, timeout, deadline
+
+    def _budget(self) -> float:
+        if self.deadline is None:
+            return self.timeout
+        return max(0.5, min(self.timeout, self.deadline - time.time()))
+
+    def _http(self, path: str, data: dict | None = None, auth: bool = True, origin: bool = False) -> Any:
         headers = {"Accept": "application/json"}
         body = None
         if data is not None:
             body = json.dumps(data).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        if self.token:
+        if self.token and auth:
             headers["Authorization"] = f"Bearer {self.token}"
-        req = urllib.request.Request(self.url + path, data=body, headers=headers, method="POST" if data else "GET")
+        if origin:                                   # /.well-known/* lives at the host, not under the endpoint's path
+            parts = urllib.parse.urlsplit(self.url)
+            url = f"{parts.scheme}://{parts.netloc}{path}"
+        else:
+            url = self.url + path                    # "" = the endpoint as given (the card's url is the RPC endpoint)
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST" if data else "GET")
+        where = url if origin else f"{self.url}{path}"
         try:
-            with _OPENER.open(req, timeout=self.timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
+            with _OPENER.open(req, timeout=self._budget()) as r:  # noqa: S310 — the user named the URL
+                raw = r.read()
         except urllib.error.HTTPError as exc:
             if exc.code == 401:
                 raise A2AError(f"{self.url}: unauthorized — set {TOKEN_VAR} to a token the server knows", 401) from exc
             if 300 <= exc.code < 400:
-                raise A2AError(f"{self.url}{path}: redirect ({exc.code}) refused — the token stays with the URL you "
+                raise A2AError(f"{where}: redirect ({exc.code}) refused — the token stays with the URL you "
                                f"named; point {URL_VAR} at the final address", exc.code) from exc
-            raise A2AError(f"{self.url}{path}: HTTP {exc.code} {exc.reason}", exc.code) from exc
+            raise A2AError(f"{where}: HTTP {exc.code} {exc.reason}", exc.code) from exc
         except urllib.error.URLError as exc:
             raise A2AError(f"cannot reach {self.url}: {exc.reason}") from exc
-        except (OSError, http.client.HTTPException) as exc:   # socket timeout, reset, half-closed: still "unreachable"
-            raise A2AError(f"cannot reach {self.url}: {exc.__class__.__name__}: {exc}") from exc
+        except (OSError, http.client.HTTPException) as exc:      # timed out mid-read, closed unanswered, cut short
+            raise A2AError(f"cannot reach {self.url}: {type(exc).__name__}: {exc or 'connection lost'}") from exc
+        try:
+            return json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise A2AError(f"{self.url}{path}: not JSON ({exc})") from exc
+            raise A2AError(f"{where}: not JSON ({exc})") from exc
 
     def card(self) -> dict:
         last: A2AError | None = None
         for path in WELL_KNOWN:
             try:
-                return self._http(path)
+                card = self._http(path, auth=False, origin=True)   # public by definition: the token stays home
             except A2AError as exc:
                 if exc.code != 404:          # unreachable, refused, redirected: that error, with its code, is the answer
                     raise
                 last = exc
+                continue
+            if not isinstance(card, dict):
+                raise A2AError(f"{self.url}{path}: the agent card is not a JSON object")
+            return card
         raise A2AError(f"no agent card at {self.url}{WELL_KNOWN[0]} ({last})", 404)
 
     def rpc(self, method: str, params: dict) -> Any:
-        resp = self._http("/", {"jsonrpc": "2.0", "id": secrets.token_hex(8), "method": method, "params": params})
+        resp = self._http("", {"jsonrpc": "2.0", "id": secrets.token_hex(8), "method": method, "params": params})
         if not isinstance(resp, dict):
-            raise A2AError(f"{method}: malformed response")
+            raise A2AError(f"{method}: malformed response (not a JSON-RPC object)")
         if "error" in resp:
-            err = resp["error"] or {}
-            raise A2AError(f"{method}: {err.get('message', 'error')} (code {err.get('code')})", err.get("code"))
+            err = resp["error"] if isinstance(resp["error"], dict) else {"message": str(resp["error"])}
+            code = err.get("code")
+            raise A2AError(f"{method}: {err.get('message', 'error')} (code {code})", code if isinstance(code, int) else None)
         return resp.get("result")
+
+    def _object(self, method: str, params: dict) -> dict:
+        result = self.rpc(method, params)
+        if not isinstance(result, dict):
+            raise A2AError(f"{method}: malformed result (expected a Task or Message object)")
+        return result
 
     def send(self, text: str, to: str | None = None, mode: str | None = None, shape: str | None = None,
              context: str | None = None, model: str | None = None, add_dirs: list[str] | None = None,
              blocking: bool = False) -> dict:
+        """message/send → a Task, or (A2A allows it) a Message that is the whole answer; the caller checks `kind`."""
         meta = {k: v for k, v in {"to": to, "mode": mode, "shape": shape, "model": model,
                                   "add_dirs": add_dirs or None}.items() if v}
         msg = message("user", text)
@@ -552,26 +608,27 @@ class Client:
             msg["metadata"] = meta
         if context:
             msg["contextId"] = context
-        return self.rpc("message/send", {"message": msg,
-                                         "configuration": {"blocking": blocking, "acceptedOutputModes": ["text/plain"]}})
+        return self._object("message/send", {"message": msg,
+                                             "configuration": {"blocking": blocking,
+                                                               "acceptedOutputModes": ["text/plain"]}})
 
     def get(self, tid: str) -> dict:
-        return self.rpc("tasks/get", {"id": tid})
+        return self._object("tasks/get", {"id": tid})
 
     def cancel(self, tid: str) -> dict:
-        return self.rpc("tasks/cancel", {"id": tid})
+        return self._object("tasks/cancel", {"id": tid})
 
     def wait(self, tid: str, deadline: float, poll: float = 2.0):
-        """Yield the task on every state change until a terminal state or the deadline (the last yield may be
-        non-terminal: the caller reads the state)."""
-        last = None
+        """Yield the task on every state change until a stop state (terminal, or the remote waits for a person) or
+        the deadline (the last yield may be non-terminal: the caller reads the state)."""
+        last, poll = None, max(0.1, poll)
         while True:
             task = self.get(tid)
             state = (task.get("status") or {}).get("state")
             if state != last:
                 last = state
                 yield task
-            if state in TERMINAL or time.time() >= deadline:
+            if state in STOP_STATES or time.time() >= deadline:
                 return
             time.sleep(min(poll, max(0.0, deadline - time.time())))
 

@@ -18,6 +18,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -30,6 +31,77 @@ from bridgelib import a2a, ledger
 from bridgelib.adapters import ADAPTERS
 
 ANSWER = "The retry loop in src/retry.py:12 never backs off."
+
+
+class Fake:
+    """A scripted remote A2A endpoint for the client side: `on[method]` is the JSON-RPC result (a dict, an RpcError,
+    or `(delay, result)`); GET /.well-known/* serves `card`; `drop` closes every connection unanswered. Records each
+    request as (method or GET, path, headers)."""
+
+    def __init__(self, test: unittest.TestCase):
+        self.on: dict = {}
+        self.card: object = {"name": "fake", "protocolVersion": a2a.A2A_VERSION, "url": ""}
+        self.drop = False
+        self.seen: list[tuple[str, str, dict]] = []
+        fake = self
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _json(self, obj):
+                data = json.dumps(obj).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def _drop(self):
+                self.close_connection = True
+                self.connection.shutdown(socket.SHUT_RDWR)
+
+            def do_GET(self):
+                fake.seen.append(("GET", self.path, dict(self.headers)))
+                if fake.drop:
+                    return self._drop()
+                self._json(fake.card)
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                fake.seen.append((body.get("method"), self.path, dict(self.headers)))
+                if fake.drop:
+                    return self._drop()
+                r = fake.on.get(body.get("method"))
+                if callable(r):
+                    r = r(body)
+                if isinstance(r, tuple):
+                    time.sleep(r[0])
+                    r = r[1]
+                if isinstance(r, a2a.RpcError):
+                    self._json({"jsonrpc": "2.0", "id": body.get("id"), "error": r.as_dict()})
+                else:
+                    self._json({"jsonrpc": "2.0", "id": body.get("id"), "result": r})
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.srv.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self.srv.server_port}"
+        self.card["url"] = self.url
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        test.addCleanup(self.srv.server_close)
+        test.addCleanup(self.srv.shutdown)
+
+    def methods(self) -> list[str]:
+        return [m for m, _, _ in self.seen]
+
+    @staticmethod
+    def task(state: str, text: str = "", tid: str = "ctx/1") -> dict:
+        t = {"id": tid, "contextId": "ctx", "kind": "task", "status": {"state": state}}
+        if text:
+            t["status"]["message"] = a2a.message("agent", text)
+        return t
 
 
 class Server(unittest.TestCase):
@@ -565,6 +637,76 @@ class Server(unittest.TestCase):
         self.assertTrue(reply["body"].startswith("missing: "), reply["body"])
         self.assertIn("the build log", reply["body"])
         self.assertEqual(self.conn.execute("SELECT status FROM tasks WHERE id=?", (task,)).fetchone()["status"], "failed")
+
+    # -- the client against a scripted remote
+    def send_to(self, fake: Fake, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "send", "--url", fake.url, "--poll", "0.2",
+                               *args, "--", "Review it."], capture_output=True, text=True,
+                              env=env or self.cli_env(), timeout=60)
+
+    def test_every_client_failure_is_an_a2a_error_and_the_card_gets_no_token(self):
+        fake = Fake(self)
+        fake.drop = True                                         # accepts, says nothing, closes
+        with self.assertRaises(a2a.A2AError):
+            a2a.Client(fake.url, "tok", timeout=5).card()
+        fake.drop = False
+        fake.card = ["not", "an", "object"]
+        with self.assertRaises(a2a.A2AError):
+            a2a.Client(fake.url, "tok", timeout=5).card()
+        fake.card = {"name": "fake", "protocolVersion": a2a.A2A_VERSION, "url": fake.url}
+        self.assertEqual(a2a.Client(fake.url + "/agents/x", "tok", timeout=5).card()["name"], "fake",
+                         "the well-known path hangs off the origin, not the endpoint path")
+        self.assertEqual(fake.seen[-1][1], a2a.WELL_KNOWN[0])
+        self.assertNotIn("Authorization", fake.seen[-1][2], "the public card never sees the token")
+        fake.on["tasks/get"] = "a string, not a task"
+        with self.assertRaises(a2a.A2AError):
+            a2a.Client(fake.url, "tok", timeout=5).get("ctx/1")
+        fake.on["tasks/get"] = (3.0, Fake.task("working"))
+        slow = a2a.Client(fake.url, "tok", timeout=30, deadline=time.time() + 1)
+        t0 = time.time()
+        with self.assertRaises(a2a.A2AError):                   # the deadline bounds every call, not the 30 s timeout
+            slow.get("ctx/1")
+        self.assertLess(time.time() - t0, 3)
+        self.assertEqual(fake.seen[-1][1], "/agents/x" if False else "/", "the RPC goes to the URL as given")
+
+    def test_send_treats_a_message_result_as_the_answer_and_stops_on_input_required(self):
+        fake = Fake(self)
+        fake.on["message/send"] = a2a.message("agent", ANSWER)   # A2A lets a server answer with a Message, no task
+        p = self.send_to(fake)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        result = [json.loads(ln) for ln in p.stdout.splitlines()][-1]
+        self.assertEqual((result["type"], result["state"], result["text"]), ("result", "completed", ANSWER))
+        self.assertNotIn("tasks/get", fake.methods(), "an answer in hand is not polled for")
+        fake.seen.clear()
+        fake.on["message/send"] = Fake.task("input-required", "which branch?")
+        p = self.send_to(fake, "--timeout", "20")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("[a2a] input-required: which branch?", p.stderr)
+        self.assertLessEqual(fake.methods().count("tasks/get"), 1, "the remote waits for a person, not for time")
+        self.assertEqual(ADAPTERS["a2a"].parse(p.stdout).is_error, True)
+
+    def test_send_cancels_the_remote_task_at_the_deadline(self):
+        fake = Fake(self)
+        fake.on["message/send"] = Fake.task("submitted")
+        fake.on["tasks/get"] = (10.0, Fake.task("working"))      # a tasks/get that never comes back in time
+        fake.on["tasks/cancel"] = Fake.task("canceled")
+        t0 = time.time()
+        p = self.send_to(fake, "--timeout", "2")
+        self.assertLess(time.time() - t0, 6, "every call is bounded by the deadline")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("tasks/cancel", fake.methods(), "a task the client gave up on is withdrawn, not left running")
+        result = [json.loads(ln) for ln in p.stdout.splitlines()][-1]
+        self.assertEqual((result["type"], result["state"]), ("result", "timeout"))
+
+    def test_send_goes_on_without_a_card_and_ignores_a_proxy_for_the_url_it_was_given(self):
+        fake = Fake(self)
+        fake.card = None                                         # 200 with `null`: not a card
+        fake.on["message/send"] = Fake.task("completed", ANSWER)
+        env = self.cli_env(http_proxy="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9")   # a dead proxy
+        p = self.send_to(fake, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("no agent card", p.stderr)
+        self.assertIn(ANSWER, p.stdout)
 
     def test_serve_cli_refuses_what_it_must(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_BRIDGE_")} | {"HOME": str(self.home)}

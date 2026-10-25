@@ -98,7 +98,11 @@ sends one `message/send` and polls `tasks/get` until a terminal state, printing 
 `result`) that the adapter parses — `result.text` is the answer, `result.context_id` the session (`--session` /
 `--conv` continue that context; `-c` continues the last one used for that URL), a state other than `completed` is
 the error line (`[a2a] <state>: <the peer's message>` on stderr, so a usage-limit message there marks the quota like
-the others). The token is read from `AGENT_BRIDGE_A2A_TOKEN` only, never passed on a command line, never appears in
+the others). A `Message` result (A2A lets a server answer without a task) is the answer; `input-required` and
+`auth-required` stop the poll (the remote waits for a person, not for time); every HTTP call is bounded by the run's
+deadline, and a task the client gives up on (timeout, SIGTERM) is withdrawn with `tasks/cancel`; a missing card is a
+warning, not a failure; the card is fetched without the token and from the URL's origin; no `http_proxy` is honoured
+(a tunnel URL stays local). The token is read from `AGENT_BRIDGE_A2A_TOKEN` only, never passed on a command line, never appears in
 `--dry-run` or a run log, and is dropped from every other peer's environment (`core.PRIVATE_ENV_VARS`; the adapter's
 `env_keep` names what its run alone may see). No deny flag and no hold: the bridge sends text, a mode and a shape — the remote's own rails
 apply. `-w` is not supported; `--add-dir` is not sent (a local path grant means nothing to the remote). A send
