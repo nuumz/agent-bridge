@@ -638,6 +638,108 @@ class Server(unittest.TestCase):
         self.assertIn("the build log", reply["body"])
         self.assertEqual(self.conn.execute("SELECT status FROM tasks WHERE id=?", (task,)).fetchone()["status"], "failed")
 
+    # -- the server's own hygiene
+    def test_a_client_added_or_removed_while_the_server_runs_takes_effect_at_once(self):
+        carol = a2a.add_client("carol")
+        with self.assertRaises(a2a.A2AError) as cm:
+            a2a.Client(self.url, carol, timeout=10).get("a2a:carol/1")
+        self.assertEqual(cm.exception.code, a2a.TASK_NOT_FOUND, "authenticated: the table was re-read")
+        clients = a2a.load_clients()
+        del clients["carol"]
+        a2a.save_clients(clients)
+        with self.assertRaises(a2a.A2AError) as cm:
+            a2a.Client(self.url, carol, timeout=10).get("a2a:carol/1")
+        self.assertEqual(cm.exception.code, 401)
+        self.assertEqual(oct(a2a.CLIENTS.parent.stat().st_mode & 0o777), "0o700")
+        self.assertEqual(oct(a2a.CLIENTS.stat().st_mode & 0o777), "0o600")
+
+    def test_a_bad_configuration_is_refused_before_anything_is_posted(self):
+        req = {"jsonrpc": "2.0", "id": 1, "method": "message/send",
+               "params": {"message": a2a.message("user", "Review it."), "configuration": "yes"}}
+        _, resp = self.raw(json.dumps(req).encode(), self.token)
+        self.assertEqual(resp["error"]["code"], a2a.INVALID_PARAMS)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 0,
+                         "a retrying client must not find a task it was told failed")
+
+    def test_internal_errors_and_failure_notes_carry_nothing_local(self):
+        with mock.patch.object(a2a, "task_view", side_effect=RuntimeError("/home/op/.agent-bridge/state/x")):
+            with self.assertRaises(a2a.A2AError) as cm:
+                self.client().get("a2a:alice/1")
+        self.assertEqual(cm.exception.code, a2a.INTERNAL)
+        self.assertNotIn("/home/op", str(cm.exception))
+        self.assertIn("internal error", str(cm.exception))
+        task = self.client().send("Review it.")
+        board_task = task["metadata"]["board"]["task"]
+        boardlib.task_claim(self.conn, "claude:task1", "claude", board_task)
+        boardlib.task_done(self.conn, "claude:task1", board_task,
+                           f"peer exited 1 (see {self.home}/.agent-bridge/state/runs/x.err)", "failed")
+        failed = self.client().get(task["id"])
+        self.assertEqual(failed["status"]["state"], "failed")
+        note = a2a.text_of(failed)
+        self.assertIn("peer exited 1", note)
+        self.assertNotIn("(see", note)
+        self.assertNotIn(str(self.home), note)
+
+    def test_the_card_declares_bearer_auth_even_with_no_clients_and_odd_ids_get_an_answer(self):
+        bare = a2a.Config("bare", "", ["claude"], str(self.work), {}, max_block=1)
+        srv = a2a.make_server(bare, "127.0.0.1", 0, quiet=True)
+        self.addCleanup(srv.server_close)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        card = a2a.Client(f"http://127.0.0.1:{srv.server_port}", None, timeout=5).card()
+        self.assertEqual(card["securitySchemes"]["bearer"]["scheme"], "bearer")
+        body = json.dumps({"jsonrpc": "2.0", "id": "\ud800", "method": "tasks/get", "params": {"id": "x"}}).encode()
+        status, resp = self.raw(body, self.token)                            # a lone surrogate in the id
+        self.assertEqual((status, resp["error"]["code"]), (200, a2a.TASK_NOT_FOUND))
+
+    def test_ipv6_loopback_is_a_bind_the_server_can_do(self):
+        if not socket.has_ipv6:
+            self.skipTest("no IPv6")
+        try:
+            srv = a2a.make_server(self.cfg, "::1", 0, quiet=True)
+        except OSError as exc:
+            self.skipTest(f"::1 not available here: {exc}")
+        self.addCleanup(srv.server_close)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        with urllib.request.urlopen(f"http://[::1]:{srv.server_port}{a2a.WELL_KNOWN[0]}", timeout=5) as r:
+            self.assertEqual(json.loads(r.read())["name"], "test-bridge")
+
+    def test_a_connection_cap_answers_503_and_frees_up_again(self):
+        srv = a2a.make_server(self.cfg, "127.0.0.1", 0, quiet=True, conn_timeout=1, max_connections=2)
+        self.addCleanup(srv.server_close)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        url = f"http://127.0.0.1:{srv.server_port}{a2a.WELL_KNOWN[0]}"
+        hogs = [self.sock(srv), self.sock(srv)]                             # two silent connections hold the slots
+        time.sleep(0.3)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(url, timeout=5)
+        self.assertEqual(cm.exception.code, 503)
+        for h in hogs:
+            self.assertTrue(self.closed(h))                                  # the timeout frees them
+        with urllib.request.urlopen(url, timeout=5) as r:
+            self.assertEqual(r.status, 200)
+
+    def test_stop_and_status_do_not_trust_a_recycled_pid(self):
+        a2a.A2A_DIR.mkdir(parents=True, exist_ok=True)
+        a2a.SERVER_STATE.write_text(json.dumps({"pid": os.getpid(), "url": "http://127.0.0.1:1"}))   # us, not a server
+        env = self.cli_env()
+        status = subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "status"], capture_output=True, text=True,
+                                env=env, timeout=60)
+        self.assertEqual(status.returncode, 1, status.stdout)
+        self.assertIn("no server running", status.stdout)
+        stop = subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "stop"], capture_output=True, text=True,
+                              env=env, timeout=60)
+        self.assertEqual(stop.returncode, 0, stop.stderr)                   # and we are still here
+        self.assertFalse(a2a.SERVER_STATE.exists(), "stale state is cleaned up")
+        a2a.LAST_CONTEXT.write_text("[1, 2]")
+        self.assertEqual(a2a.last_context(), {})
+        a2a.remember_context("http://x", "ctx-1")
+        self.assertEqual(a2a.last_context(), {"http://x": "ctx-1"})
+        a2a.remember_context("http://x", None)
+        self.assertEqual(a2a.last_context(), {})
+
     # -- the client against a scripted remote
     def send_to(self, fake: Fake, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
         return subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "send", "--url", fake.url, "--poll", "0.2",

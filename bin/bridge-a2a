@@ -59,13 +59,8 @@ def load_server_state() -> dict:
 
 
 def alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    """The pid in server.json is a running bridge-a2a — not a process that inherited a recycled pid."""
+    return bool(pid) and boardlib.proc_alive(pid, "bridge-a2a")
 
 
 # ----------------------------------------------------------------------------- serve / stop / status

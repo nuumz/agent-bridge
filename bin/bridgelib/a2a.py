@@ -21,10 +21,13 @@ import json
 import os
 import re
 import secrets
+import socket
 import ssl
 import stat
 import sys
+import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,7 +37,7 @@ from typing import Any
 
 import boardlib
 
-from .core import STATE
+from .core import HOME, STATE
 
 A2A_VERSION = "0.3.0"           # the Agent2Agent protocol version the card announces
 BRIDGE_VERSION = "1.0"          # this transport's own version (the envelope stays v1: an A2A task is one request)
@@ -178,11 +181,15 @@ def load_clients(path: Path | None = None) -> dict[str, str]:
 
 
 def save_clients(clients: dict[str, str], path: Path | None = None) -> None:
+    """Write the token table privately: the directory 0700, the file created 0600 (never a window at the umask),
+    replaced atomically; a running server reads it again on its next request."""
     path = path or CLIENTS
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(clients, indent=2) + "\n", encoding="utf-8")
-    os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+    os.chmod(path.parent, stat.S_IRWXU)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(clients, indent=2) + "\n")
     os.replace(tmp, path)
 
 
@@ -243,7 +250,8 @@ class Config:
     def __init__(self, name: str, url: str, families: list[str], workdir: str, clients: dict[str, str],
                  allow_write: bool = False, max_block: int = 60):
         self.name, self.url, self.families, self.workdir = name, url, list(families), str(workdir)
-        self.clients, self.allow_write, self.max_block = dict(clients), allow_write, max_block
+        self.clients, self.allow_write, self.max_block = dict(clients), allow_write, max_block   # clients: at start;
+        # the handler authenticates against load_clients() per request, so `client add|remove` need no restart
 
 
 def ensure_topic(conn, client: str) -> int:
@@ -280,6 +288,10 @@ def submit(conn, cfg: Config, client: str, params: Any) -> dict:
     context = msg.get("contextId") or params.get("contextId")
     if context and context != topic:
         raise RpcError(INVALID_PARAMS, f"contextId must be {topic!r}: one context per client")
+    conf = params.get("configuration")
+    if conf is not None and not isinstance(conf, dict):   # checked before anything lands: a refused send posts nothing
+        raise RpcError(INVALID_PARAMS, "configuration must be an object")
+    blocking = bool((conf or {}).get("blocking"))
     head = f"shape: {shape}\nmode: {mode}\ndir: {cfg.workdir}\n"
     if msg.get("messageId"):
         head += f"message-id: {' '.join(str(msg['messageId']).split())}\n"
@@ -289,7 +301,7 @@ def submit(conn, cfg: Config, client: str, params: Any) -> dict:
     except boardlib.BoardError as exc:
         raise RpcError(INVALID_PARAMS, str(exc)) from exc
     view = task_view(conn, client, topic, seq)
-    if (params.get("configuration") or {}).get("blocking"):
+    if blocking:
         deadline = time.time() + cfg.max_block
         while view["status"]["state"] not in TERMINAL and time.time() < deadline:
             time.sleep(0.5)
@@ -335,7 +347,7 @@ def task_view(conn, client: str, topic: str, seq: int) -> dict:
     else:
         state = "submitted"
     if state == "failed":
-        note, result_text = result_text or "the peer could not answer", ""
+        note, result_text = public_note(result_text) or "the peer could not answer", ""
     tid_str = task_id(topic, seq)
     status: dict = {"state": state, "timestamp": iso(ts)}
     if note:
@@ -350,6 +362,12 @@ def task_view(conn, client: str, topic: str, seq: int) -> dict:
             "metadata": {"to": fam, "mode": head.get("mode"), "shape": head.get("shape"),
                          "board": {"topic": topic, "seq": seq, "task": task["id"] if task else None,
                                    "status": task["status"] if task else None}}}
+
+
+def public_note(text: str) -> str:
+    """A failure note as a remote client may see it: no run-log pointer, no path under the operator's home."""
+    text = re.sub(r"\s*\(see [^)]*\)", "", text or "")
+    return text.replace(str(HOME), "~").strip()
 
 
 def cancel(conn, client: str, topic: str, seq: int) -> dict:
@@ -382,7 +400,7 @@ def dispatch(cfg: Config, client: str, method: str, params: Any) -> Any:
         conn.close()
 
 
-def handle(cfg: Config, client: str, req: Any) -> dict:
+def handle(cfg: Config, client: str, req: Any, quiet: bool = False) -> dict:
     """One JSON-RPC request → one response object (errors included; the transport status stays 200)."""
     rid = req.get("id") if isinstance(req, dict) else None
     if not isinstance(req, dict) or req.get("jsonrpc") != "2.0" or not isinstance(req.get("method"), str):
@@ -391,8 +409,11 @@ def handle(cfg: Config, client: str, req: Any) -> dict:
         return {"jsonrpc": "2.0", "id": rid, "result": dispatch(cfg, client, req["method"], req.get("params"))}
     except RpcError as exc:
         return {"jsonrpc": "2.0", "id": rid, "error": exc.as_dict()}
-    except Exception as exc:  # noqa: BLE001 — never a traceback to a remote client
-        return {"jsonrpc": "2.0", "id": rid, "error": RpcError(INTERNAL, f"{type(exc).__name__}: {exc}").as_dict()}
+    except Exception:  # noqa: BLE001 — the traceback (sqlite paths, local state) stays on this side
+        if not quiet:
+            print(f"[a2a] internal error serving {client} {req['method']}:", file=sys.stderr)
+            traceback.print_exc()
+        return {"jsonrpc": "2.0", "id": rid, "error": RpcError(INTERNAL, "internal error").as_dict()}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -419,7 +440,7 @@ class Handler(BaseHTTPRequestHandler):
         super().log_message(fmt, *args)
 
     def _send(self, status: int, obj: Any, headers: dict[str, str] | None = None, close: bool = False) -> None:
-        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8", "replace")   # a lone surrogate in an id still answers
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
@@ -435,11 +456,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path.split("?", 1)[0] in WELL_KNOWN:          # the card is public; everything else needs a token
-            self._send(200, agent_card(self.cfg.name, self.cfg.url, self.cfg.families, auth=bool(load_clients())))
+            self._send(200, agent_card(self.cfg.name, self.cfg.url, self.cfg.families))   # bearer is always the rule
             return
         self._send(404, {"error": "not found", "agent_card": WELL_KNOWN[0]})
 
-    def do_POST(self) -> None:
+    def do_POST(self) -> None:  # noqa: N802
         # the token table is read per request: `bridge-a2a client add|remove` takes effect without a restart
         client = authenticate(self.headers.get("Authorization"), load_clients())
         if client is None:
@@ -468,18 +489,40 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"jsonrpc": "2.0", "id": None, "error": RpcError(PARSE_ERROR, "parse error").as_dict()},
                        close=True)
             return
+        quiet = getattr(self.server, "quiet", False)
         if isinstance(req, list):
             if not 1 <= len(req) <= BATCH_MAX:
                 self._send(200, {"jsonrpc": "2.0", "id": None, "error": RpcError(
                     INVALID_REQUEST, f"a batch holds 1..{BATCH_MAX} requests").as_dict()})
                 return
-            self._send(200, [handle(self.cfg, client, r) for r in req])
+            self._send(200, [handle(self.cfg, client, r, quiet) for r in req])
             return
-        self._send(200, handle(self.cfg, client, req))
+        self._send(200, handle(self.cfg, client, req, quiet))
 
 
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
+    slots: threading.BoundedSemaphore
+
+    def process_request(self, request, client_address) -> None:
+        """One thread per connection, up to `max_connections`; beyond that a 503 at once — a connection flood must
+        not grow threads and file descriptors until accept() fails for everyone."""
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 1\r\n"
+                                b"Content-Length: 0\r\n\r\n")
+            except OSError:                              # a TLS socket before its handshake, or a client gone
+                pass
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
 
     def handle_error(self, request, client_address) -> None:
         """A failed TLS handshake, a timed-out silent connection, a client gone mid-response: one line, no
@@ -491,12 +534,22 @@ class _Server(ThreadingHTTPServer):
             print(f"[a2a] {client_address[0]}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
 
 
+class _Server6(_Server):
+    address_family = socket.AF_INET6
+
+
+MAX_CONNECTIONS = 64
+
+
 def make_server(cfg: Config, bind: str, port: int, quiet: bool = False, conn_timeout: float = CONN_TIMEOUT,
-                cert: str | None = None, key: str | None = None) -> ThreadingHTTPServer:
-    srv = _Server((bind, port), Handler)
+                cert: str | None = None, key: str | None = None,
+                max_connections: int = MAX_CONNECTIONS) -> ThreadingHTTPServer:
+    cls = _Server6 if ":" in bind else _Server               # `--bind ::1` is an IPv6 socket, not an IPv4 one
+    srv = cls((bind, port), Handler)
     srv.cfg = cfg  # type: ignore[attr-defined]
     srv.quiet = quiet  # type: ignore[attr-defined]
     srv.conn_timeout = conn_timeout  # type: ignore[attr-defined]
+    srv.slots = threading.BoundedSemaphore(max(1, max_connections))
     if cert:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(cert, key)
