@@ -598,7 +598,11 @@ bridge-work show <name>       # ~/.agent-bridge/state/work/<name>/report.md
 ```
 
 1. **Worktree** `<repo>/.claude/worktrees/bridge-<name>` on branch `bridge/<name>` from the current HEAD (or `--base`):
-   the user's checkout is never touched; the branch is the deliverable.
+   the user's checkout is never touched; the branch is the deliverable. A second `run <name>` finds that worktree with
+   the earlier attempt still in it: the implementer's first prompt names the carried files and diff and how to discard
+   them against the base, the report says `earlier attempt: N file(s) carried`; `--fresh` resets the worktree to the
+   base first (`discarded`) and is refused when the branch carries commits beyond that base. The base of a second
+   run is the one the branch was cut from, not today's HEAD.
 2. **Write** — the implementer (first of `-p`, or `--implementer`) runs `ask-agent -m write` in the worktree with the
    task + agreement + an optional **work-skill** addendum (`work-skills/*.md`, auto-picked from task/files/verify or
    `--skill`; `--skill none` disables). Write mode pre-approves the build/test runners
@@ -660,8 +664,9 @@ One resumable flow (`work/<name>/flow.json`) over two existing tools, with the d
 
 `bridge-fix run <name>` on an existing flow resumes at its stage. A failed fix stays at `fix`: `bridge-fix decide` again
 replaces the earlier ruling in the agreement's Ruling section (what the implementer reads; the card is closed once —
-a re-rule closes it only if the first ruling could not), the next fix is told an earlier attempt sits in the worktree,
-and `bridge-fix run <name> --files … --verify …` records new gates on the flow and the agreement (validated like
+a re-rule closes it only if the first ruling could not); the next fix is told what the earlier attempt left in the
+worktree, or `decide --fresh` / `run --fresh` discards it first (refused when the branch carries commits beyond its
+base); `bridge-fix run <name> --files … --verify …` records new gates on the flow and the agreement (validated like
 `decide`; a done flow is left alone) before the fix re-runs — `--files`/`--verify` left out keep what the flow has.
 Hop guard and `-p` egress gate as everywhere (see §5/§6/§8).
 Subagent: `peer-fix` (one stage per spawn).

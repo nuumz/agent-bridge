@@ -154,8 +154,11 @@ class CursorHold(unittest.TestCase):
             str(BIN), str(self.cur.CLI_CONFIG), str(self.cur.DENY_STATE), str(self.cur.DENY_LOCK)])
         try:
             for _ in range(100):
-                if child.pid in json.loads(self.cur.DENY_STATE.read_text()).get("pids", []):
-                    break
+                try:                                            # read outside the lock: the child may be mid-write
+                    if child.pid in json.loads(self.cur.DENY_STATE.read_text()).get("pids", []):
+                        break
+                except (OSError, json.JSONDecodeError):
+                    pass
                 __import__("time").sleep(0.05)
             deny = self.deny()
             self.assertIn("Write(**)", deny)                              # the ask set landed on top of the write hold

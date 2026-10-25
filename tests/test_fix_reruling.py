@@ -197,6 +197,15 @@ class Reruling(unittest.TestCase):
         self.assertIn("An earlier attempt under a previous ruling is still in this worktree", tasks[1])
         self.assertEqual(self.fix.load("t")["attempts"], 2)
 
+    def test_fresh_is_handed_to_bridge_work(self):
+        self.decide(answer=["1=A guard", "2=A yes"], files="a.py", verify="pytest -q")
+        argvs = []
+        with mock.patch.object(self.fix, "stream_filtered", lambda argv, prefixes: argvs.append(argv) or 1):
+            self.fix.fix(self.fix.load("t"), argparse.Namespace(rounds=2, timeout=600))
+            self.fix.fix(self.fix.load("t"), argparse.Namespace(rounds=2, timeout=600, fresh=True))
+        self.assertNotIn("--fresh", argvs[0])
+        self.assertIn("--fresh", argvs[1])
+
 
 if __name__ == "__main__":
     unittest.main()

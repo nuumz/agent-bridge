@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """bridge-work — let the bridge implement a task in a project by itself: worktree → write → verify → review → report.
 
-    bridge-work run <name> -d <repo> [-p claude[,cursor]] [--base <ref>] [--files <glob>,...] [--verify "<cmd>"]
+    bridge-work run <name> -d <repo> [-p claude[,cursor]] [--base <ref>] [--fresh] [--files <glob>,...]
+                    [--verify "<cmd>"]
                     [--rounds 2] [-t 900] [--implementer claude] [--reviewer cursor|claude] "<task>"
     bridge-work show <name>            ~/.agent-bridge/state/work/<name>/report.md
     bridge-work list                   work items and their state
@@ -126,11 +127,21 @@ def verify(wt: Path, cmd: str, timeout: int = 600) -> tuple[int, str]:
     return r.returncode, tail
 
 
-def write_prompt(o, allowed: list[str], round_no: int, feedback: str, skill_addendum: str = "") -> str:
+def carried_block(files: list[str], diffstat: str, base: str) -> str:
+    """What an earlier run left in the worktree, for the implementer's first round: named, with the way to discard."""
+    names = ", ".join(files[:40]) + (f" … and {len(files) - 40} more" if len(files) > 40 else "")
+    return (f"\n\nAn earlier run left changes in this worktree ({len(files)} file(s): {names}). They were "
+            f"made for a previous task or ruling, not this one: re-read them, keep what this task still asks for, "
+            f"discard the rest (`git checkout {base[:12]} -- <file>`; delete a file the base does not have — untracked "
+            f"files are in the list above, not in the stat).\n{diffstat[:4000]}")
+
+
+def write_prompt(o, allowed: list[str], round_no: int, feedback: str, skill_addendum: str = "",
+                 carried: str = "") -> str:
     fb = (f"\n\nRound {round_no}: the previous attempt is already in this worktree. Fix ONLY these points, keep everything else:\n{feedback}"
           if feedback else "")
     return (f"You are implementing a task inside a dedicated git worktree (this directory, branch bridge/{o.name}). "
-            f"The task:\n\n{o.task}\n\n"
+            f"The task:\n\n{o.task}{carried}\n\n"
             f"Agreement:\n- touch only: {', '.join(allowed) if allowed else '(the files the task names)'}\n"
             f"- done when this command passes here: `{o.verify}`\n"
             f"- do not commit, stage, push or tag; do not create files outside the allowed set; no placeholder/stub code; "
@@ -357,6 +368,7 @@ def run(o) -> int:
     wt = repo / ".claude" / "worktrees" / f"bridge-{o.name}"
     out = WORK / o.name
     out.mkdir(parents=True, exist_ok=True)
+    carried, carried_note = "", ""
     if not wt.exists():
         r = git(repo, "worktree", "add", "-b", f"bridge/{o.name}", str(wt), base_sha)
         if r.returncode != 0:
@@ -364,6 +376,32 @@ def run(o) -> int:
             if r.returncode != 0:
                 print(f"bridge-work: worktree failed: {r.stderr.strip()}", file=sys.stderr)
                 return 2
+    else:
+        # a second run (a re-ruled fix, a retry): the worktree is where it was left, and the repo's HEAD may have
+        # moved since — the base is the one this branch was cut from, never today's HEAD
+        if git(wt, "rev-parse", "--is-inside-work-tree").returncode != 0:
+            print(f"bridge-work: {wt} exists but is not a usable worktree — `git -C {repo} worktree prune` and "
+                  f"remove the directory, then run again", file=sys.stderr)
+            return 2
+        head = git(wt, "rev-parse", "HEAD").stdout.strip()
+        base_sha = git(wt, "merge-base", head, base_sha).stdout.strip() or base_sha
+        files = touched(wt, base_sha)
+        if getattr(o, "fresh", False) and head != base_sha:
+            print(f"bridge-work: bridge/{o.name} has commits beyond its base {base_sha[:9]} — --fresh refused; remove "
+                  f"the worktree and branch yourself if they are to go", file=sys.stderr)
+            return 2
+        if files and getattr(o, "fresh", False):
+            for r in (git(wt, "reset", "-q", "--hard", base_sha), git(wt, "clean", "-fdq")):
+                if r.returncode != 0:
+                    print(f"bridge-work: --fresh could not reset {wt}: {r.stderr.strip()}", file=sys.stderr)
+                    return 2
+            carried_note = f"earlier attempt: {len(files)} file(s) discarded (--fresh)"
+        elif files:                             # the earlier attempt stays: the implementer is told, never silently
+            carried = carried_block(files, git(wt, "diff", "--stat", base_sha, "--").stdout.strip(), base_sha)
+            carried_note = (f"earlier attempt: {len(files)} file(s) carried ({', '.join(files[:8])}) — "
+                            f"--fresh discards it")
+        if carried_note:
+            print(f"[work] {carried_note}", file=sys.stderr)
     print(f"[work] worktree {wt} (branch bridge/{o.name} from {base}@{base_sha[:9]}) — watch: bridge-watch", file=sys.stderr)
     t0 = time.time()
     rounds: list[dict] = []
@@ -379,7 +417,8 @@ def run(o) -> int:
     while n < rounds_max:
         n += 1
         print(f"[work] round {n}/{rounds_max}: {implementer} writes …", file=sys.stderr)
-        rc, answer, notes, impl_used = ask_with_fallback(implementer, "write", str(wt), write_prompt(o, allowed, n, feedback, impl_add),
+        prompt = write_prompt(o, allowed, n, feedback, impl_add, carried if n == 1 else "")
+        rc, answer, notes, impl_used = ask_with_fallback(implementer, "write", str(wt), prompt,
                                                          o.timeout, f"work-{o.name}-impl", "implement", peers)
         impl_by = impl_used
         used["implementer"].add(implementer if impl_used == implementer else f"{implementer}→{impl_used}")
@@ -434,7 +473,8 @@ def run(o) -> int:
               f"Repo: {repo} · base: {base}@{base_sha[:9]} · branch: `bridge/{o.name}` · worktree: `{wt}`\n"
               f"skill: `{skill['name'] if skill else 'none'}` · {who} (→ = fell back to a local peer) · rounds: {len(rounds)}/{rounds_max} · "
               f"{round((time.time() - t0) / 60, 1)} min"
-              + (f" · switched implementer: {', '.join(switched)}" if switched else "") + f"\n\n## Task\n\n{o.task}\n\n"
+              + (f" · switched implementer: {', '.join(switched)}" if switched else "")
+              + (f" · {carried_note}" if carried_note else "") + f"\n\n## Task\n\n{o.task}\n\n"
               f"## Result\n\n- verify `{o.verify}` → {'not run (implementer failed)' if final_rc is None else f'exit {final_rc}'}\n- files: {', '.join(rounds[-1].get('files', [])) if rounds else '-'}\n"
               + f"- review verdict: {last_verdict or ('none (no BRIDGE_VERDICT line — table rows decided)' if review_ok else 'no usable review')}\n"
               + (f"- **outside the allowed set**: {', '.join(bad)}\n" if bad else "")
@@ -442,7 +482,7 @@ def run(o) -> int:
               f"## Review ({review_label(review_by, impl_by)})\n\n{review or '(no review)'}\n\n"
               + (f"### still must-fix\n\n" + "\n".join(rounds[-1]['must_fix']) + "\n\n" if rounds and rounds[-1].get("must_fix") else "")
               + f"## Implementer's last note\n\n{rounds[-1].get('impl', '') if rounds else ''}\n\n"
-              f"## How to take it\n\n```bash\ngit -C {repo} diff {base_sha[:9]} bridge/{o.name}      # read the whole change\n"
+              f"## How to take it\n\n```bash\ngit -C {wt} diff {base_sha[:9]}       # read the whole change\n"
               f"git -C {wt} status                                      # nothing is committed; the worktree holds it\n"
               f"# merge / cherry-pick / commit is yours — the bridge never commits\n"
               f"git -C {repo} worktree remove {wt} --force && git -C {repo} branch -D bridge/{o.name}   # to discard\n```\n")
@@ -480,6 +520,9 @@ def main() -> int:
     r.add_argument("--implementer", help="peer that writes (default: first of -p)")
     r.add_argument("--reviewer", help="peer that reviews (default: the other peer in -p, else the implementer in a fresh session)")
     r.add_argument("--base", help="ref to branch from (default: current HEAD)")
+    r.add_argument("--fresh", action="store_true",
+                   help="an existing worktree is reset to the base first (default: the earlier attempt stays and the "
+                        "implementer is told what it is)")
     r.add_argument("--files", help="comma-separated globs the implementer may touch (autonomy gate)")
     r.add_argument("--verify", help="command that must pass in the worktree (autonomy gate)")
     r.add_argument("--agreement", help="completed agreement file (from bridge-plan) appended to the task")

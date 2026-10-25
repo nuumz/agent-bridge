@@ -378,12 +378,14 @@ def fix(fl: dict, o) -> int:
         sketch = "\n\nPatch sketch from the analysis (accepted by `git apply --check` at analysis time — use it as guidance, re-read the files first):\n" + patch[:12000]
     earlier = ("\n\nAn earlier attempt under a previous ruling is still in this worktree (same branch). It is not the "
                "ruling: re-read the files, keep what the Ruling section still asks for, discard what contradicts it."
-               if fl.get("attempts") else "")
+               if fl.get("attempts") and not getattr(o, "fresh", False) else "")
     task = (f"Fix the defect below exactly as ruled in the agreement (Ruling section = what the human chose; the panel's "
             f"recommendation is NOT the ruling where they differ).\n\nProblem:\n{fl['problem']}\n\n{agreement}{sketch}"
             f"{earlier}")
     argv = [str(BIN / "bridge-work"), "run", f"fix-{fl['name']}", "-d", fl["repo"], "-p", fl["peers"], "--files", fl["files"],
-            "--verify", fl["verify"], "--rounds", str(getattr(o, "rounds", 2) or 2), "-t", str(max(getattr(o, "timeout", 420) or 420, 600)), task]
+            "--verify", fl["verify"], "--rounds", str(getattr(o, "rounds", 2) or 2),
+            "-t", str(max(getattr(o, "timeout", 420) or 420, 600)),
+            *(["--fresh"] if getattr(o, "fresh", False) else []), task]
     share_add_dirs(fl.get("add_dirs", []))
     print(f"[fix] fix: bridge-work run fix-{fl['name']} (files {fl['files']}; verify `{fl['verify']}`)", file=sys.stderr)
     rc = stream_filtered(argv, ("[work]",))
@@ -460,6 +462,7 @@ def main() -> int:
     r.add_argument("--files", help="file globs the fix may touch (else proposed from the patch sketch, confirmed at decide)")
     r.add_argument("--verify", help="command that fails now and must pass after the fix (else asked at decide)")
     r.add_argument("--rounds", type=int, default=2)
+    r.add_argument("--fresh", action="store_true", help="a resumed fix resets its worktree to the base first")
     r.add_argument("-t", "--timeout", type=int, default=420, help="seconds per peer run in the panel (default 420)")
     r.add_argument("--detach", action="store_true",
                    help="fork to the background at once: prints `detached pid=N log=work/<name>/fix.log`; wait with "
@@ -473,6 +476,7 @@ def main() -> int:
     d.add_argument("--note")
     d.add_argument("--no-fix", action="store_true", help="record the ruling only; `bridge-fix run <name>` starts the fix later")
     d.add_argument("--rounds", type=int, default=2)
+    d.add_argument("--fresh", action="store_true", help="a re-ruled fix resets its worktree to the base first")
     d.add_argument("-t", "--timeout", type=int, default=600)
     d.add_argument("--detach", action="store_true")
     for c in ("status", "show"):
