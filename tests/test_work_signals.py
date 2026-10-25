@@ -41,7 +41,7 @@ DRIVER = textwrap.dedent("""\
     import importlib.machinery, importlib.util, sys
     from concurrent.futures import ThreadPoolExecutor
     from pathlib import Path
-    bin_dir, stub, cwd, work, threads = sys.argv[1:6]
+    bin_dir, stub, cwd, work, threads, tasks = sys.argv[1:7]
     sys.path.insert(0, bin_dir)
     loader = importlib.machinery.SourceFileLoader("bw", str(Path(bin_dir) / "bridge-work"))
     bw = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
@@ -52,8 +52,8 @@ DRIVER = textwrap.dedent("""\
     if threads == "0":
         guarded_rc("t", bw.write_rc, lambda: ask(0))
     else:
-        with ThreadPoolExecutor(int(threads)) as ex:
-            guarded_rc("t", bw.write_rc, lambda: max(ex.map(ask, range(int(threads)))))
+        with ThreadPoolExecutor(int(threads)) as ex:           # the pool's `with` outside guarded_rc, as bridge-panel's
+            guarded_rc("t", bw.write_rc, lambda: max(ex.map(ask, range(int(tasks)))))
     """)
 
 
@@ -75,23 +75,27 @@ def wait_for(pred, seconds: float = 10) -> bool:
 
 
 class WorkSigterm(unittest.TestCase):
-    def kill_run(self, threads: int, sig: int) -> tuple[int, str, list[int], float]:
-        """Start the driver, wait for every stub peer, send `sig`; return (rc, rc file, peer pids, seconds to exit)."""
+    def kill_run(self, threads: int, sig: int, tasks: int | None = None) -> tuple[int, str, list[int], float, int]:
+        """Start the driver with `tasks` asks over `threads` workers, wait for the peers that can run at once, send
+        `sig`; return (rc, rc file, those peer pids, seconds to exit, how many peers ever started)."""
+        running = max(threads, 1)
+        tasks = tasks or running
         with tempfile.TemporaryDirectory() as d:
             stub = Path(d) / "ask-agent"
             stub.write_text(STUB)
             stub.chmod(0o755)
             cwd, work = Path(d) / "repo", Path(d) / "work"
-            dirs = [cwd / str(i) for i in range(max(threads, 1))]
+            dirs = [cwd / str(i) for i in range(tasks)]
             for sub_dir in dirs:
                 sub_dir.mkdir(parents=True)
             env = {**os.environ, "HOME": d}
             drv = subprocess.Popen([sys.executable, "-c", DRIVER, str(BIN), str(stub), str(cwd), str(work),
-                                    str(threads)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-                                   env=env)
+                                    str(threads), str(tasks)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                   text=True, env=env)
             peers: list[int] = []
+            started = 0
             try:
-                for sub_dir in dirs:
+                for sub_dir in dirs[:running]:
                     pid_file = sub_dir / "peer.pid"
                     self.assertTrue(wait_for(lambda: pid_file.is_file() and pid_file.read_text().strip() != ""),
                                     "a stub peer never started")
@@ -109,31 +113,43 @@ class WorkSigterm(unittest.TestCase):
                     except subprocess.TimeoutExpired:
                         drv.kill()
                         drv.wait()
-                for p in peers:                                   # never leave a `sleep 300` behind a failed assertion
+                late = [int((s / "peer.pid").read_text()) for s in dirs if (s / "peer.pid").is_file()]
+                started = len(late)
+                for p in {*peers, *late}:                         # never leave a `sleep 300` behind a failed assertion
                     try:
                         os.killpg(p, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
             rc_file = (work / "t" / "rc").read_text() if (work / "t" / "rc").is_file() else ""
-            return drv.returncode, rc_file, peers, took
+            return drv.returncode, rc_file, peers, took, started
 
     def test_sigterm_to_bridge_work_ends_the_peer_and_still_writes_143(self):
-        rc, rc_file, peers, took = self.kill_run(0, signal.SIGTERM)
+        rc, rc_file, peers, took, _ = self.kill_run(0, signal.SIGTERM)
         self.assertEqual((rc, rc_file), (143, "143\n"))
         self.assertTrue(wait_for(lambda: not alive(peers[0]), 10), "the peer outlived the killed bridge-work run")
         self.assertLess(took, 8, "rc must be written within the kill grace, not after the peer's -t")
 
     def test_sigterm_during_a_panels_parallel_phase_ends_every_peer(self):
-        rc, rc_file, peers, took = self.kill_run(2, signal.SIGTERM)
+        rc, rc_file, peers, took, _ = self.kill_run(2, signal.SIGTERM)
         self.assertEqual((rc, rc_file), (143, "143\n"))
         for p in peers:
             self.assertTrue(wait_for(lambda: not alive(p), 10), "a worker-thread peer outlived the killed panel")
         self.assertLess(took, 8)
 
     def test_sighup_is_handled_like_sigterm(self):
-        rc, rc_file, peers, _ = self.kill_run(0, signal.SIGHUP)
+        rc, rc_file, peers, _, _ = self.kill_run(0, signal.SIGHUP)
         self.assertEqual((rc, rc_file), (129, "129\n"))
         self.assertTrue(wait_for(lambda: not alive(peers[0]), 10))
+
+    def test_no_peer_starts_after_the_kill(self):
+        """A panel with more roles than --parallel: the pool's queued asks must not spawn a peer after the kill. The
+        pool's `with` is outside guarded_rc, so shutdown(wait=True) would run them; `ex.map` cancels its queue when
+        the kill interrupts the result loop, and core._STOP keeps run_tool from spawning for any other pool shape."""
+        rc, rc_file, peers, took, started = self.kill_run(1, signal.SIGTERM, tasks=2)
+        self.assertEqual((rc, rc_file), (143, "143\n"))
+        self.assertTrue(wait_for(lambda: not alive(peers[0]), 10))
+        self.assertEqual(started, 1, "the second ask was queued behind the kill and must never start a peer")
+        self.assertLess(took, 8)
 
     def test_verify_timeout_returns_even_when_a_child_ignores_sigterm(self):
         loader = importlib.machinery.SourceFileLoader("bw_verify2", str(BIN / "bridge-work"))

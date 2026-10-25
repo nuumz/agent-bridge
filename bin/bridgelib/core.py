@@ -109,16 +109,26 @@ def guarded_rc(name: str, write_rc: Callable[[str, int], int], body: Callable[[]
     Agent/Bash kills of a foreground bridge call send SIGTERM; without this the waiter never sees a
     done signal. SystemExit from the handler is intercepted so `rc` is 143 before write_rc runs.
     The handler first signals every child run_tool() has alive — in any thread, so a panel's parallel
-    workers are covered — then SIGKILLs whatever is still there 10 s later; the body unwinds as they exit.
+    workers are covered — then SIGKILLs, 10 s later, *those* children if still there; the body unwinds as they exit.
+    The timer takes a snapshot, never the live set: a child started later (another test, the next pool task) is not
+    this signal's to kill. The handler takes no lock — it runs on the main thread, which may be inside run_tool's
+    locked add/discard at that moment. After the signal `_STOP` holds it and run_tool starts nothing more, so a
+    pool's queued work exits instead of spawning a peer after the kill; the handlers and `_STOP` are restored when
+    the body has unwound.
     """
+    global _STOP
+
     def on_signal(signum: int, _frame: Any) -> None:
-        _signal_children(signal.SIGTERM)
-        t = threading.Timer(10, _signal_children, (signal.SIGKILL,))
+        global _STOP
+        _STOP = signum
+        procs = _CHILDREN.copy()                 # atomic under the GIL; the lock may be held by this very thread
+        _signal(procs, signal.SIGTERM)
+        t = threading.Timer(10, _signal, (procs, signal.SIGKILL))
         t.daemon = True
         t.start()
         sys.exit(128 + signum)
-    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):     # the set runner.run forwards for ask-agent
-        signal.signal(s, on_signal)
+    previous = {s: signal.signal(s, on_signal)
+                for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}     # the set runner.run forwards for ask-agent
     rc = 1
     try:
         rc = body()
@@ -128,6 +138,9 @@ def guarded_rc(name: str, write_rc: Callable[[str, int], int], body: Callable[[]
         raise
     finally:
         write_rc(name, rc)
+        for s, h in previous.items():
+            signal.signal(s, h)
+        _STOP = None
     return rc
 
 def kill_tree(proc: subprocess.Popen, sig: int = signal.SIGTERM, grace: int = 10) -> None:
@@ -146,12 +159,14 @@ def kill_tree(proc: subprocess.Popen, sig: int = signal.SIGTERM, grace: int = 10
 
 _CHILDREN: set[subprocess.Popen] = set()        # run_tool children alive now, in any thread (guarded_rc signals them)
 _CHILDREN_LOCK = threading.Lock()
+_STOP: int | None = None                        # the signal guarded_rc handled; while set, run_tool spawns nothing
 
 
-def _signal_children(sig: int) -> None:
-    with _CHILDREN_LOCK:
-        procs = list(_CHILDREN)
+def _signal(procs, sig: int) -> None:
+    """Signal the process group of each child in `procs` that is still running."""
     for p in procs:
+        if p.poll() is not None:
+            continue
         try:
             os.killpg(p.pid, sig)
         except OSError:                 # ESRCH: gone; EPERM: macOS, when what is left of the group is a zombie
@@ -175,12 +190,15 @@ def run_tool(argv, *, input: str | None = None, cwd: str | Path | None = None, t
     this call (guarded_rc turns SIGTERM into SystemExit), takes the whole group down with SIGTERM first, so ask-agent
     forwards it to the peer. subprocess.run would SIGKILL the direct child alone: an ask-agent killed that way never
     forwards anything, and its peer — in write mode, still editing — outlives the run whose rc file says 143."""
-    proc = subprocess.Popen(argv, cwd=cwd, shell=shell, text=True, process_group=0,
-                            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    with _CHILDREN_LOCK:
-        _CHILDREN.add(proc)
-    try:
+    if _STOP is not None:               # the run was killed: a pool's queued ask must not start a peer now
+        raise SystemExit(128 + _STOP)
+    proc = None
+    try:                                # Popen inside the try: a signal between spawn and registration still ends it
+        proc = subprocess.Popen(argv, cwd=cwd, shell=shell, text=True, process_group=0,
+                                stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with _CHILDREN_LOCK:
+            _CHILDREN.add(proc)
         out, err = proc.communicate(input, timeout=timeout)
     except subprocess.TimeoutExpired:
         _end_group(proc, grace=10)
@@ -188,11 +206,13 @@ def run_tool(argv, *, input: str | None = None, cwd: str | Path | None = None, t
         raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err)
     except BaseException:
         # grace 5: ask-agent's own forward SIGKILLs its peer at 3 s, so it has exited (or is past that) by then
-        _end_group(proc, grace=5)
+        if proc is not None:
+            _end_group(proc, grace=5)
         raise
     finally:
-        with _CHILDREN_LOCK:
-            _CHILDREN.discard(proc)
+        if proc is not None:
+            with _CHILDREN_LOCK:
+                _CHILDREN.discard(proc)
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 

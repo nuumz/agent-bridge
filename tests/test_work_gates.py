@@ -7,7 +7,11 @@ import importlib.util
 import io
 import os
 import signal
+import subprocess
 import sys
+import textwrap
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -100,13 +104,17 @@ class FallbackAndReviewGates(unittest.TestCase):
 
 
 class GuardedRc(unittest.TestCase):
+    SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
     def setUp(self):
-        self._prev = signal.getsignal(signal.SIGTERM)
+        self._prev = {s: signal.getsignal(s) for s in self.SIGNALS}
 
     def tearDown(self):
-        signal.signal(signal.SIGTERM, self._prev)
+        for s, h in self._prev.items():
+            signal.signal(s, h)
 
     def test_sigterm_writes_143(self):
+        from bridgelib import core
         from bridgelib.core import guarded_rc
         got = {}
 
@@ -118,10 +126,122 @@ class GuardedRc(unittest.TestCase):
             os.kill(os.getpid(), signal.SIGTERM)
             return 0
 
-        with self.assertRaises(SystemExit) as cm:
-            guarded_rc("unit-sigterm", write, body)
+        with mock.patch.object(core.threading, "Timer") as timer:        # the 10 s SIGKILL never fires for real here
+            with self.assertRaises(SystemExit) as cm:
+                guarded_rc("unit-sigterm", write, body)
         self.assertEqual(cm.exception.code, 143)
         self.assertEqual(got.get("rc"), 143)
+        for s in self.SIGNALS:                                            # the handlers are the caller's again
+            self.assertEqual(signal.getsignal(s), self._prev[s], s)
+        self.assertIsNone(core._STOP)
+        timer.assert_called_once()
+
+    def test_the_kill_timer_targets_the_children_of_that_signal_only(self):
+        """The handler SIGTERMs the run_tool children alive at the signal and arms a SIGKILL for *those* 10 s later.
+        It must not read _CHILDREN when it fires: that killed whatever another test had started meanwhile (the
+        intermittent -9 in test_work_signals), and in a real run the next pool task started after the kill."""
+        from bridgelib import core
+        stubborn = subprocess.Popen(["sh", "-c", 'trap "" TERM; sleep 30'], process_group=0)
+        self.addCleanup(lambda: (os.killpg(stubborn.pid, signal.SIGKILL), stubborn.wait()) if stubborn.poll() is None else None)
+        time.sleep(0.2)                                                   # the trap is installed
+        with core._CHILDREN_LOCK:
+            core._CHILDREN.add(stubborn)
+        self.addCleanup(core._CHILDREN.discard, stubborn)
+        real_timer, delays = threading.Timer, []
+
+        def quick(delay, fn, args=(), kwargs=None):                       # the real timer, 1 s instead of 10
+            delays.append(delay)
+            return real_timer(1.0, fn, args, kwargs)
+
+        with mock.patch.object(core.threading, "Timer", quick), self.assertRaises(SystemExit):
+            core.guarded_rc("unit-timer", lambda n, rc: rc, lambda: os.kill(os.getpid(), signal.SIGTERM))
+        later = subprocess.Popen(["sleep", "30"], process_group=0)      # started after the kill, by someone else
+        self.addCleanup(lambda: (os.killpg(later.pid, signal.SIGKILL), later.wait()) if later.poll() is None else None)
+        with core._CHILDREN_LOCK:
+            core._CHILDREN.add(later)
+        self.addCleanup(core._CHILDREN.discard, later)
+        self.assertEqual(delays, [10])
+        self.assertIsNone(stubborn.poll(), "ignores SIGTERM: still there, waiting for the SIGKILL")
+        try:
+            stubborn.wait(timeout=5)                                      # the timer fires: the snapshot child goes
+        except subprocess.TimeoutExpired:
+            self.fail("the kill timer did not SIGKILL the child that was alive at the signal")
+        time.sleep(0.3)
+        self.assertIsNone(later.poll(), "a child that did not exist at the signal is not the timer's business")
+
+    def test_run_tool_spawns_nothing_after_a_handled_signal(self):
+        """A pool worker that reaches run_tool while the main thread unwinds from the kill must not start a peer
+        (bridge-panel's `ex.map` cancels its queue, so this is the belt for any other pool shape)."""
+        from bridgelib import core
+        spawned = []
+
+        def body():
+            try:
+                os.kill(os.getpid(), signal.SIGTERM)
+            except SystemExit:                                            # a worker, meanwhile, asks for a run
+                with mock.patch.object(core.subprocess, "Popen", side_effect=lambda *a, **k: spawned.append(a)):
+                    core.run_tool(["sleep", "30"], timeout=1)
+            return 0
+
+        with mock.patch.object(core.threading, "Timer"), self.assertRaises(SystemExit) as cm:
+            core.guarded_rc("unit-stop", lambda n, rc: rc, body)
+        self.assertEqual(cm.exception.code, 143)
+        self.assertEqual(spawned, [], "nothing starts after the kill")
+        self.assertIsNone(core._STOP, "cleared once the body has unwound")
+
+    def test_a_signal_while_run_tool_holds_the_children_lock_still_exits_143(self):
+        """The handler runs on the main thread; if it took _CHILDREN_LOCK while the interrupted frame holds it, the
+        process would hang forever with no rc file — so it must not take the lock."""
+        script = textwrap.dedent("""\
+            import os, signal, sys
+            sys.path.insert(0, sys.argv[1])
+            from bridgelib import core
+            def body():
+                with core._CHILDREN_LOCK:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                return 0
+            core.guarded_rc("lock", lambda n, rc: rc, body)
+            """)
+        try:
+            p = subprocess.run([sys.executable, "-c", script, str(Path(__file__).resolve().parents[1] / "bin")],
+                               capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("guarded_rc deadlocked on _CHILDREN_LOCK")
+        self.assertEqual(p.returncode, 143, p.stderr)
+
+    def test_a_signal_right_after_popen_still_ends_the_child(self):
+        """Between Popen and the child's registration a signal (SystemExit from the handler) used to leak the child:
+        it was outside the try that ends the group."""
+        from bridgelib import core
+        seen: list[subprocess.Popen] = []
+        real_popen = subprocess.Popen
+
+        def spy(*a, **k):
+            proc = real_popen(*a, **k)
+            seen.append(proc)
+            return proc
+
+        class LockThatIsInterrupted:
+            """The first `with _CHILDREN_LOCK:` (the add) is where the signal lands."""
+            armed = True
+
+            def __enter__(self):
+                if self.armed:
+                    self.armed = False
+                    raise SystemExit(143)
+
+            def __exit__(self, *exc):
+                return False
+
+        self.addCleanup(lambda: [(os.killpg(p.pid, signal.SIGKILL), p.wait()) for p in seen if p.poll() is None])
+        with mock.patch.object(core.subprocess, "Popen", spy), \
+                mock.patch.object(core, "_CHILDREN_LOCK", LockThatIsInterrupted()), self.assertRaises(SystemExit):
+            core.run_tool(["sleep", "30"])
+        self.assertEqual(len(seen), 1)
+        try:
+            seen[0].wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.fail("the child spawned right before the signal was leaked")
 
     def test_normal_rc(self):
         from bridgelib.core import guarded_rc
