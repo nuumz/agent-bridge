@@ -58,11 +58,14 @@ DRIVER = textwrap.dedent("""\
 
 
 def alive(pid: int) -> bool:
+    """A process that still runs — a zombie (dead, not yet reaped by a container's init) does not count; waiting
+    for a reap here is what used to push the verify tests into another test's 10 s kill-timer window."""
     try:
         os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
+    except OSError:
         return False
+    stat = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(stat) and not stat.startswith("Z")
 
 
 def wait_for(pred, seconds: float = 10) -> bool:

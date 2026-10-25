@@ -37,6 +37,7 @@ class Server(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name).resolve()             # macOS: /var is a link to /private/var, and the board
         self.home, self.work = root / "home", root / "work"   # stores a turn's dir resolved
         self.work.mkdir()
@@ -50,8 +51,9 @@ class Server(unittest.TestCase):
                         mock.patch.object(a2a, "SERVER_STATE", a2a_dir / "server.json"),
                         mock.patch.object(a2a, "LAST_CONTEXT", a2a_dir / "last-context.json"),
                         mock.patch.dict(os.environ, {"HOME": str(self.home), "USER": "tester"})]
-        for p in self.patches:
-            p.start()
+        for p in self.patches:                           # cleanups run last-in first-out: the replier threads are
+            p.start()                                    # joined, then the server and the board close, then the
+            self.addCleanup(p.stop)                      # patches are undone — nothing ever reaches the real board
         for var in list(os.environ):
             if var.startswith("AGENT_BRIDGE_"):
                 os.environ.pop(var)
@@ -60,20 +62,23 @@ class Server(unittest.TestCase):
         self.cfg = a2a.Config("test-bridge", "", ["claude", "cursor"], str(self.work), a2a.load_clients(),
                               allow_write=False, max_block=5)
         self.srv = a2a.make_server(self.cfg, "127.0.0.1", 0, quiet=True)
+        self.addCleanup(self.srv.server_close)
         self.url = self.cfg.url = f"http://127.0.0.1:{self.srv.server_port}"
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.shutdown)
         self.conn = boardlib.connect()
+        self.addCleanup(self.conn.close)
+        self.stop, self.repliers = threading.Event(), []
+        self.addCleanup(self.join_repliers)
 
-    def tearDown(self):
-        self.srv.shutdown()
-        self.srv.server_close()
-        self.conn.close()
-        for p in self.patches:
-            p.stop()
-        self.tmp.cleanup()
+    def join_repliers(self) -> None:
+        self.stop.set()
+        for t in self.repliers:
+            t.join(timeout=10)
+            self.assertFalse(t.is_alive(), "a replier thread outlived its test")
 
     def client(self, token: str | None = "alice") -> a2a.Client:
-        return a2a.Client(self.url, self.token if token == "alice" else token, timeout=5)
+        return a2a.Client(self.url, self.token if token == "alice" else token, timeout=10)   # > max_block
 
     def raw(self, body: bytes, token: str | None = None, path: str = "/") -> tuple[int, object]:
         headers = {"Content-Type": "application/json"}
@@ -93,21 +98,25 @@ class Server(unittest.TestCase):
         return self.conn.execute("SELECT id FROM topics WHERE name=?", (topic,)).fetchone()["id"]
 
     def reply_when_asked(self, kind: str, body: str, author: str = "claude#5", after: int = 0) -> threading.Thread:
-        """A stand-in for the dispatched run: wait for the next request on alice's topic, answer it."""
+        """A stand-in for the dispatched run: wait for the next request on alice's topic, answer it. The thread
+        gives up when the test ends (join_repliers), so it can never post after the board patches are undone."""
         def run():
             conn = boardlib.connect()
-            deadline = time.time() + 20
-            while time.time() < deadline:
-                row = conn.execute("SELECT m.seq, m.topic_id FROM messages m JOIN topics t ON t.id=m.topic_id WHERE "
-                                   "t.name='a2a:alice' AND m.kind='request' AND m.seq>? ORDER BY m.seq LIMIT 1",
-                                   (after,)).fetchone()
-                if row:
-                    boardlib.post(conn, row["topic_id"], author, body, kind, row["seq"], "a2a:alice")
-                    break
-                time.sleep(0.1)
-            conn.close()
+            try:
+                deadline = time.time() + 20
+                while time.time() < deadline and not self.stop.is_set():
+                    row = conn.execute("SELECT m.seq, m.topic_id FROM messages m JOIN topics t ON t.id=m.topic_id "
+                                       "WHERE t.name='a2a:alice' AND m.kind='request' AND m.seq>? ORDER BY m.seq "
+                                       "LIMIT 1", (after,)).fetchone()
+                    if row:
+                        boardlib.post(conn, row["topic_id"], author, body, kind, row["seq"], "a2a:alice")
+                        break
+                    time.sleep(0.1)
+            finally:
+                conn.close()
         t = threading.Thread(target=run, daemon=True)
         t.start()
+        self.repliers.append(t)
         return t
 
     # -- card and auth
@@ -432,7 +441,8 @@ class Server(unittest.TestCase):
 
     # -- the CLI client and the adapter
     def cli_env(self, **extra: str) -> dict[str, str]:
-        env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_BRIDGE_")}
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("AGENT_BRIDGE_") and not k.lower().endswith("_proxy")}   # loopback, no proxy
         env.update({"HOME": str(self.home), "USER": "tester", a2a.TOKEN_VAR: self.token})
         env.update(extra)
         return env
@@ -465,7 +475,8 @@ class Server(unittest.TestCase):
         self.assertIn("A2A task failed: missing: the build log", bad.result)
         self.assertEqual(ADAPTERS["a2a"].parse("").is_error, True)
         no_url = subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "send", "--", "x"], capture_output=True,
-                                text=True, env={k: v for k, v in self.cli_env().items() if k != a2a.URL_VAR}, check=False)
+                                text=True, env={k: v for k, v in self.cli_env().items() if k != a2a.URL_VAR},
+                                timeout=60, check=False)
         self.assertEqual(no_url.returncode, 2)
 
     def test_send_refuses_a_second_hop_unless_it_is_the_a2a_run_itself(self):
@@ -507,11 +518,12 @@ class Server(unittest.TestCase):
         self.assertIn("[bridge] agent=a2a session=a2a:alice", p.stdout)
         self.assertNotIn(self.token, p.stdout + p.stderr, "the token never appears in output or argv")
         dry = subprocess.run([sys.executable, str(BIN / "ask-agent"), "a2a", "--dry-run", "-d", str(self.work), "q"],
-                             capture_output=True, text=True, env=env, check=False)
+                             capture_output=True, text=True, env=env, timeout=60, check=False)
         self.assertNotIn(self.token, dry.stdout)
         self.assertEqual(json.loads(dry.stdout)["binary"], str(BIN / "bridge-a2a"))
         with_dir = subprocess.run([sys.executable, str(BIN / "ask-agent"), "a2a", "--dry-run", "-d", str(self.work),
-                                   "--add-dir", str(self.home), "q"], capture_output=True, text=True, env=env)
+                                   "--add-dir", str(self.home), "q"], capture_output=True, text=True, env=env,
+                                  timeout=60)
         self.assertNotIn("--add-dir", json.loads(with_dir.stdout)["argv"], "a local path grant never leaves the machine")
 
     def turn_to_a2a(self, shape: str = "one line") -> tuple[int, int, int]:
@@ -559,8 +571,7 @@ class Server(unittest.TestCase):
         for args, text in ((["--bind", "0.0.0.0", "--port", "0"], "non-loopback"),
                            (["--peers", "bogus"], "--peers"),
                            (["--peers", "claude,a2a"], "a2a")):      # a relay: a client's text, the operator's token
-            with self.subTest(args=args):
-                home = tempfile.mkdtemp()                         # no clients.json there
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as home:   # no clients.json there
                 p = subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "serve", "-d", str(self.work), *args],
                                    capture_output=True, text=True, env=env | {"HOME": home}, timeout=30, check=False)
                 self.assertEqual(p.returncode, 2, p.stderr)
