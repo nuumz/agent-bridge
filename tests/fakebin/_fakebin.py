@@ -1,5 +1,5 @@
-"""tests/fakebin — stand-ins for the peer CLIs (`claude`, `cursor-agent`, `copilot`, `codex`) that tests put first on
-PATH.
+"""tests/fakebin — stand-ins for the peer CLIs (`claude`, `cursor-agent`, `copilot`, `codex`, and `bridge-a2a` for the
+`a2a` family) that tests put first on PATH.
 
 Each stub is the CLI's name beside this file and does two things: it records how it was called, and it replays its
 CLI's machine-readable output from `fixtures/<binary>.jsonl` (the event shapes the adapters' `parse()` were verified

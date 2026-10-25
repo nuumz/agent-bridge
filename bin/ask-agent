@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ask-agent — run a task on a peer coding agent from any shell (or from another agent).
 
-    ask-agent <agent> [options] "<prompt>"        agent = claude | cursor | copilot
+    ask-agent <agent> [options] "<prompt>"        agent = claude | cursor | copilot | codex | a2a
     ask-agent --list                              show which peers are installed / configured
 
 One adapter per CLI turns the common options (mode, model, dir, session, worktree, timeout) into
@@ -17,8 +17,9 @@ Hard rules baked in (see ~/.agent-bridge/SHARED-RULES.md):
   * quota: a peer that reports an exhausted plan is marked in ~/.agent-bridge/state/quota/ and every run of it fails fast
     (exit 7, `[bridge] error:` line on stderr) for QUOTA_TTL; `--ignore-quota` overrides, `--list` shows the mark.
 
-Exit codes: 0 ok · 1 peer error · 2 usage · 3 hop guard · 4 disabled · 5 peer asked back ([[ASK]]) · 6 cursor write
-refused while a read-only run holds the deny · 7 peer out of quota · 127 binary missing · 143 killed at timeout.
+Exit codes: 0 ok · 1 peer error · 2 usage · 3 hop guard · 4 disabled · 5 peer asked back ([[ASK]]) · 6 write refused
+(cursor: a read-only run holds the deny; codex: uncommitted changes in a checkout the bridge does not own) · 7 peer out
+of quota · 127 binary missing · 143 killed at timeout (the run's process group, SIGKILL for what ignored SIGTERM).
 Every failure prints one `[bridge] error: <peer's own first stderr line>` before the raw dump — callers parse that line.
 """
 from __future__ import annotations
