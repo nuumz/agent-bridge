@@ -11,7 +11,7 @@
     bridge-board join   <topic> <agent> [-r leader|member|observer|<role>] | leave <topic> [agent]
     bridge-board cards                                    every open card (request to user:*) across topics — answer
                                                           each with post <topic> "…" -k decision|answer --reply-to N
-    bridge-board task add "<title>" [-b body] [-t topic] [-a cursor|claude|any] [-m ask|plan|write] [-d dir] [-p prio]
+    bridge-board task add "<title>" [-b body] [-t topic] [-a FAMILY|any] [-m ask|plan|write] [-d dir] [-p prio]
     bridge-board task list | cancel <id>
     bridge-board dispatch [--max-agents 2] [--agents FAMILIES] [--allow-write DIR,...]
                           [--include-peer-tasks] [--watch SEC]      the ONLY thing that spawns agents (via ask-agent);

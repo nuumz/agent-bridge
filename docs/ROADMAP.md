@@ -32,8 +32,13 @@ with the read-only / workspace-write sandboxes as the rails, the board MCP as `-
 `boardlib.FAMILIES` for turns), written from the codex-rs sources and passing the kit; the first run against a real
 `codex` binary is still owed (SHARED-RULES §2 says what it must confirm). The fourth step, the A2A transport (#16),
 landed too: the envelope crosses machines unchanged, with the board's own rails (tokens, one topic per client, human
-dispatch) as the trust model. Left: `bridge-sync` targets for Codex (`~/.codex/AGENTS.md` mirror, `codex mcp add` for
-the board) once the adapter is verified, and a real A2A peer on another machine to try the transport against.
+dispatch) as the trust model. A stabilisation pass over the four (2026-10-25) closed what a review of them found:
+a turn to a family with a digit in its name, the bridge posting a turn's reply when the run cannot, the open-turn cap
+that never applied to an A2A client, request smuggling and a TLS handshake on the accept loop in `bridge-a2a serve`,
+the A2A token reaching every local peer, Codex writes into `--add-dir` roots and dirty checkouts, the kill timer that
+made the suite flake, and the validator's disagreements with the board. Left: `bridge-sync` targets for Codex
+(`~/.codex/AGENTS.md` mirror, `codex mcp add` for the board) once the adapter is verified, and a real A2A peer on
+another machine to try the transport against.
 
 ## Next (M) — cheaper, safer runs
 
