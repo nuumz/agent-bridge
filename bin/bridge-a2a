@@ -30,7 +30,6 @@ import argparse
 import json
 import os
 import signal
-import ssl
 import sys
 import time
 from pathlib import Path
@@ -87,14 +86,10 @@ def serve(o) -> int:
     scheme = "https" if o.cert else "http"
     cfg = a2a.Config(o.name, o.url or "", families, str(workdir), clients, o.allow_write, o.max_block)
     try:
-        srv = a2a.make_server(cfg, o.bind, o.port, o.quiet)
-    except OSError as exc:
+        srv = a2a.make_server(cfg, o.bind, o.port, o.quiet, cert=o.cert, key=o.key)
+    except OSError as exc:                       # the port is taken, or (ssl.SSLError) the cert/key do not load
         print(f"bridge-a2a: cannot listen on {o.bind}:{o.port}: {exc}", file=sys.stderr)
         return 1
-    if o.cert:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(o.cert, o.key)
-        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     host = o.bind if ":" not in o.bind else f"[{o.bind}]"
     cfg.url = o.url or f"{scheme}://{host}:{srv.server_port}"
     if not clients:

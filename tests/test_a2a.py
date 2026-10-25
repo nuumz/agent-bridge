@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -238,6 +240,36 @@ class Server(unittest.TestCase):
         # the server is still fine for the next client
         self.assertEqual(a2a.Client(f"http://127.0.0.1:{srv.server_port}", self.token, timeout=5).card()["name"],
                          "test-bridge")
+
+    @unittest.skipUnless(shutil.which("openssl"), "openssl not installed")
+    def test_the_tls_handshake_runs_on_the_connections_thread(self):
+        tls = Path(self.tmp.name) / "tls"
+        tls.mkdir()
+        cert, key = tls / "cert.pem", tls / "key.pem"
+        made = subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key),
+                               "-out", str(cert), "-days", "1", "-subj", "/CN=agent-bridge-test"],
+                              capture_output=True, text=True, timeout=60)
+        if made.returncode != 0:
+            self.skipTest(f"openssl cannot make a certificate here: {made.stderr.strip()[:200]}")
+        srv = a2a.make_server(self.cfg, "127.0.0.1", 0, quiet=True, conn_timeout=1, cert=str(cert), key=str(key))
+        self.addCleanup(srv.server_close)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        silent = self.sock(srv)                      # a TCP connection that never starts a handshake
+        plain = self.sock(srv)                       # and one that speaks HTTP to the TLS port
+        plain.sendall(b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: x\r\n\r\n")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False                   # the cert is its own CA; the name is not under test
+        ctx.load_verify_locations(str(cert))
+        t0 = time.time()
+        with urllib.request.urlopen(f"https://127.0.0.1:{srv.server_port}/.well-known/agent-card.json", timeout=3,
+                                    context=ctx) as r:                     # served while the others sit there
+            self.assertEqual(json.loads(r.read())["name"], "test-bridge")
+        self.assertLess(time.time() - t0, 3)
+        self.assertTrue(self.closed(silent), "a silent connection costs one thread for conn_timeout, no more")
+        self.assertTrue(self.closed(plain))
+        with self.assertRaises(a2a.A2AError):           # the client refuses a bad cert instead of sending the token
+            a2a.Client(f"https://127.0.0.1:{srv.server_port}", self.token, timeout=3).card()
 
     def test_a_batch_holds_one_to_thirty_two_requests(self):
         one = {"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "a2a:alice/1"}}

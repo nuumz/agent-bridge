@@ -20,7 +20,9 @@ import json
 import os
 import re
 import secrets
+import ssl
 import stat
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -381,6 +383,10 @@ class Handler(BaseHTTPRequestHandler):
         # BaseHTTPRequestHandler turns a timeout on the request line into a close
         self.timeout = getattr(self.server, "conn_timeout", CONN_TIMEOUT)
         super().setup()
+        if isinstance(self.connection, ssl.SSLSocket):
+            # the TLS handshake runs here, on this connection's thread and under its timeout — never on the accept
+            # loop, where one client that never sends a ClientHello would stall every other connection
+            self.connection.do_handshake()
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if getattr(self.server, "quiet", False):
@@ -446,13 +452,30 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, handle(self.cfg, client, req))
 
 
-def make_server(cfg: Config, bind: str, port: int, quiet: bool = False,
-                conn_timeout: float = CONN_TIMEOUT) -> ThreadingHTTPServer:
-    srv = ThreadingHTTPServer((bind, port), Handler)
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        """A failed TLS handshake, a timed-out silent connection, a client gone mid-response: one line, no
+        traceback (socketserver's default). Anything that is not an OSError is a bug and keeps its traceback."""
+        exc = sys.exc_info()[1]
+        if not isinstance(exc, OSError):
+            super().handle_error(request, client_address)
+        elif not getattr(self, "quiet", False):
+            print(f"[a2a] {client_address[0]}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+
+def make_server(cfg: Config, bind: str, port: int, quiet: bool = False, conn_timeout: float = CONN_TIMEOUT,
+                cert: str | None = None, key: str | None = None) -> ThreadingHTTPServer:
+    srv = _Server((bind, port), Handler)
     srv.cfg = cfg  # type: ignore[attr-defined]
     srv.quiet = quiet  # type: ignore[attr-defined]
     srv.conn_timeout = conn_timeout  # type: ignore[attr-defined]
-    srv.daemon_threads = True
+    if cert:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        # do_handshake_on_connect=False: accept() hands back an un-handshaken socket and Handler.setup finishes it
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
     return srv
 
 
