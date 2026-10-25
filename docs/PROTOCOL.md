@@ -334,7 +334,7 @@ listens on loopback unless told otherwise, and is needed for nothing local.
 | `tasks/get` | the request, its board task and its replies, read as the client only (another client's task is `TaskNotFound`) |
 | `configuration.blocking` | the server polls the board up to `--max-block` seconds before answering |
 | not offered: `message/stream`, push notifications (`capabilities` says so; `UnsupportedOperation` / `PushNotificationNotSupported`) | the board has no push channel either; polling is the model |
-| a JSON-RPC batch | 1..32 requests, answered in order; `[]` or more is one `InvalidRequest`. A body is at most 1 MiB with a plain-decimal `Content-Length`; an error response closes the connection |
+| a JSON-RPC batch | 1..32 requests, answered in order; `[]` or more is one `InvalidRequest`. A body is at most 1 MiB with a plain-decimal `Content-Length`; an error response closes the connection; at most 64 connections at once (503 beyond); an internal failure is the bare `InternalError` — its cause stays in the server's log |
 
 What the server enforces, on every request: the token, read from `clients.json` per request so `client add|remove`
 needs no restart (the card is the only unauthenticated resource); one topic
@@ -367,6 +367,13 @@ from the run's result (§6.5) — `answer`, or `blocked` with a `missing:` line 
 3. every kind the board accepts, posted on a real (temporary) board, exports as a conformant envelope, and
    `bridge-board read --json` prints exactly those;
 4. this file names every kind and every header key.
+
+The validator compares as JSON Schema does: `const` and `enum` by JSON equality (`true` is not `1`), `integer`
+accepting a number with a zero fractional part (`1.0`), and `$` in a pattern as the end of the string (Python's `$`
+would also match before a trailing newline; the board uses a full match). It is deliberately stricter than the board in
+one place: the `headers` subschema applies to every kind, so a `note` whose first line reads `mode: fast` fails
+`check()` although the board stores it — a writer keeps `key: value` first lines for real headers. `bridge-board post`
+accepts every kind but `task` and `system`, which only the transport writes.
 
 Another implementation (a new transport, a script in another language) is conformant when it passes the vectors and
 the requirements of §10.1. To add a vendor: an adapter class (CONTRIBUTING.md), its family name in `boardlib.FAMILIES`

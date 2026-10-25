@@ -316,6 +316,32 @@ class Turns(unittest.TestCase):
         last = self.conn.execute("SELECT body FROM messages WHERE kind='request' ORDER BY id DESC LIMIT 1").fetchone()
         self.assertNotIn(str(repo), last["body"])
 
+    def test_dispatch_runs_every_enabled_family_by_default_and_names_what_it_will_not_take(self):
+        board = _load()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ADAPTERS["a2a"].URL_VAR, None)
+            self.assertEqual(board.dispatch_families(), ["claude", "cursor", "copilot", "codex"],
+                             "a2a needs a remote URL to be worth a run")
+            os.environ[ADAPTERS["a2a"].URL_VAR] = "http://127.0.0.1:1"
+            self.assertEqual(board.dispatch_families()[-1], "a2a")
+        with mock.patch.dict(board.DISABLED, {"copilot": "off"}):
+            self.assertNotIn("copilot", board.dispatch_families())
+        with self.assertRaisesRegex(SystemExit, "2"):
+            board.parse_families("cursor,bogus")
+        self.assertEqual(board.parse_families("cursor, claude"), ["cursor", "claude"])
+        boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="codex")                 # #1: not in --agents
+        env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_BRIDGE_")}
+        bad = subprocess.run([sys.executable, str(BIN / "bridge-board"), "dispatch", "--agents", "bogus"],
+                             capture_output=True, text=True, env=env, timeout=60, check=False)
+        self.assertEqual(bad.returncode, 2, bad.stderr)
+        self.assertIn("bogus", bad.stderr)
+        p = subprocess.run([sys.executable, str(BIN / "bridge-board"), "dispatch", "--agents", "cursor"],
+                           capture_output=True, text=True, env=env, timeout=60, check=False)   # codex is not in --agents
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("[dispatch] not started", p.stderr)
+        self.assertIn("task #1 (codex): codex is not in --agents cursor", p.stderr)
+        self.assertEqual(self.tasks()[0]["status"], "queued")
+
     def test_the_cli_and_the_mcp_server_take_the_same_path(self):
         p = subprocess.run([sys.executable, str(BIN / "bridge-board"), "post", "room:r", REQUEST, "-k", "request",
                             "--to", "copilot"], capture_output=True, text=True, env=dict(os.environ), check=False)

@@ -634,10 +634,11 @@ class Codex(Adapter):
         # would become editable), and the read-only sandbox reads the whole disk without a grant
         if o.board:
             # the board MCP rides on the run as `-c` overrides (values parse as TOML), so nothing is written to
-            # ~/.codex/config.toml; identity is still resolved by the server from the run's pid, never from this env
+            # ~/.codex/config.toml; identity is still resolved by the server from the run's pid, never from this env —
+            # and should that lookup miss (no `ps`), the hop marker makes the fallback `codex@hop`, not the primary
             a += ["-c", f"mcp_servers.{self.BOARD_SERVER}.command={json.dumps(str(self.BOARD_BIN))}",
                   "-c", f'mcp_servers.{self.BOARD_SERVER}.args=["serve"]',
-                  "-c", f'mcp_servers.{self.BOARD_SERVER}.env={{AGENT_BRIDGE_AGENT="{self.name}"}}']
+                  "-c", f'mcp_servers.{self.BOARD_SERVER}.env={{AGENT_BRIDGE_AGENT="{self.name}", AGENT_BRIDGE_HOP="1"}}']
         return a
 
     def argv(self, o, prompt):

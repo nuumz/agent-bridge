@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import select
 import signal
 import sys
 import time
@@ -58,13 +59,8 @@ def load_server_state() -> dict:
 
 
 def alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+    """The pid in server.json is a running bridge-a2a — not a process that inherited a recycled pid."""
+    return bool(pid) and boardlib.proc_alive(pid, "bridge-a2a")
 
 
 # ----------------------------------------------------------------------------- serve / stop / status
@@ -198,6 +194,22 @@ def card(o) -> int:
     return 0
 
 
+class _Killed(Exception):
+    """SIGTERM / SIGINT / SIGHUP during a send: withdraw the remote task, then exit 128+signal."""
+
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
+def _read_stdin_prompt() -> str:
+    """The prompt from a pipe — but never a wait on a pipe nobody writes to (a detached run with stdin open)."""
+    if sys.stdin.isatty():
+        return ""
+    ready, _, _ = select.select([sys.stdin], [], [], 0.5)
+    return sys.stdin.read().strip() if ready else ""
+
+
 def send(o) -> int:
     # one hop: inside a bridged run only the a2a run itself (what `ask-agent a2a` spawns) may talk to the remote —
     # a local peer with a shell must not make a second hop over the network with the operator's token
@@ -209,63 +221,105 @@ def send(o) -> int:
     if not url:
         print(f"bridge-a2a: no URL — pass --url or set {a2a.URL_VAR}", file=sys.stderr)
         return 2
-    text = " ".join(o.prompt).strip()
-    if not text and not sys.stdin.isatty():
-        text = sys.stdin.read().strip()
+    text = " ".join(o.prompt).strip() or _read_stdin_prompt()
     if not text:
         print("bridge-a2a: empty prompt", file=sys.stderr)
         return 2
-    cli = a2a.Client(url, os.environ.get(a2a.TOKEN_VAR), timeout=max(5.0, min(30.0, float(o.timeout))))
+    deadline = time.time() + o.timeout
+    cli = a2a.Client(url, os.environ.get(a2a.TOKEN_VAR), timeout=max(5.0, min(30.0, float(o.timeout))),
+                     deadline=deadline)
     context = o.context
     if context == "last":
-        try:
-            context = json.loads(a2a.LAST_CONTEXT.read_text(encoding="utf-8")).get(url)
-        except (OSError, json.JSONDecodeError):
-            context = None
-    deadline = time.time() + o.timeout
+        context = a2a.last_context().get(url)
+
+    def on_signal(signum, _frame):
+        raise _Killed(signum)
+
+    for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(s, on_signal)
+    info: dict = {}
+    tid = ctx = state = None
+    final: dict = {}
     try:
-        info = cli.card()
+        try:
+            info = cli.card()
+        except a2a.A2AError as exc:              # a card is a courtesy: the endpoint is what we were given
+            print(f"[a2a] no agent card at {url} ({exc}) — sending anyway", file=sys.stderr)
         emit({"type": "card", "agent": info.get("name"), "url": url, "protocolVersion": info.get("protocolVersion")})
         task = cli.send(text, o.to, o.mode, o.shape, context, o.model, o.add_dir)
+        if task.get("kind") == "message":        # the answer itself, no task to poll (A2A allows it)
+            emit({"type": "result", "state": "completed", "text": a2a.text_parts(task), "task_id": task.get("taskId"),
+                  "context_id": task.get("contextId"), "agent": info.get("name"), "url": url})
+            return 0
         tid, ctx = task.get("id"), task.get("contextId")
-        a2a.A2A_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            known = json.loads(a2a.LAST_CONTEXT.read_text(encoding="utf-8")) if a2a.LAST_CONTEXT.is_file() else {}
-        except json.JSONDecodeError:
-            known = {}
-        known[url] = ctx
-        a2a.LAST_CONTEXT.write_text(json.dumps(known, indent=2) + "\n", encoding="utf-8")
+        a2a.remember_context(url, ctx)
         state = (task.get("status") or {}).get("state")
         emit({"type": "task", "id": tid, "context_id": ctx, "state": state})
         final = task
-        if state not in a2a.TERMINAL:
-            for final in cli.wait(tid, deadline, o.poll):
-                state = (final.get("status") or {}).get("state")
-                emit({"type": "task", "id": tid, "context_id": ctx, "state": state})
+        if state not in a2a.STOP_STATES:
+            try:
+                for final in cli.wait(tid, deadline, o.poll):
+                    state = (final.get("status") or {}).get("state")
+                    emit({"type": "task", "id": tid, "context_id": ctx, "state": state})
+            except a2a.A2AError as exc:
+                if time.time() < deadline - 0.5:   # a failure of its own, not the clock running out on a poll
+                    raise
+                print(f"[a2a] the last poll did not return in time: {exc}", file=sys.stderr)
+        if state not in a2a.STOP_STATES:         # out of time: withdraw, so the remote does not work for nobody
+            final, state = _withdraw(cli, tid, ctx, final)
+    except _Killed as k:
+        if tid and state not in a2a.STOP_STATES:
+            _cancel(cli, tid)
+        emit({"type": "error", "message": f"killed by signal {k.signum}", "code": None})
+        print(f"[a2a] killed by signal {k.signum}" + (f"; task {tid} withdrawn" if tid else ""), file=sys.stderr)
+        return 128 + k.signum
     except a2a.A2AError as exc:
+        if tid and state not in a2a.STOP_STATES and (exc.code is None or exc.code >= 500):
+            _cancel(cli, tid)                    # the remote may still be running what we can no longer wait for
         emit({"type": "error", "message": str(exc), "code": exc.code})
         print(f"[a2a] error: {exc}", file=sys.stderr)
         return 1
     answer = a2a.text_of(final)
-    if state not in a2a.TERMINAL:                 # the deadline passed: withdraw the task so nobody dispatches it later
-        try:
-            cli.cancel(tid)
-            emit({"type": "task", "id": tid, "context_id": ctx, "state": "canceled"})
-            answer, state = answer or "no reply within --timeout; the task was withdrawn (tasks/cancel)", "timeout"
-        except a2a.A2AError as exc:
-            if exc.code == a2a.NOT_CANCELABLE:    # it finished between the last poll and the cancel: that is the answer
-                final = cli.get(tid)
-                state, answer = (final.get("status") or {}).get("state"), a2a.text_of(final)
-                emit({"type": "task", "id": tid, "context_id": ctx, "state": state})
-            else:                                 # unreachable: say so, still a timeout
-                emit({"type": "error", "message": str(exc), "code": exc.code})
-                answer, state = answer or f"no reply within --timeout; withdrawal failed: {exc}", "timeout"
+    if state == "timeout":
+        answer = answer or "no reply within --timeout; the task was withdrawn (tasks/cancel)"
     emit({"type": "result", "state": state, "text": answer, "task_id": tid, "context_id": ctx,
           "agent": info.get("name"), "url": url})
     if state != "completed":
         print(f"[a2a] {state}: {answer or '(no message from the peer)'}", file=sys.stderr)
         return 1
     return 0
+
+
+def _cancel(cli: a2a.Client, tid: str) -> None:
+    """Best effort: a withdrawal that fails changes nothing on this side."""
+    cli.deadline = time.time() + 5
+    try:
+        cli.cancel(tid)
+    except a2a.A2AError as exc:
+        print(f"[a2a] could not withdraw {tid}: {exc}", file=sys.stderr)
+
+
+def _withdraw(cli: a2a.Client, tid: str, ctx, final: dict) -> tuple[dict, str]:
+    """The deadline passed: tasks/cancel, so the remote never dispatches what nobody waits for. A task that finished
+    between the last poll and the cancel is reported with its real state and text; a withdrawal that fails (the remote
+    unreachable) is still a timeout — the task may stay queued there, and the error line says so."""
+    cli.deadline = time.time() + 5
+    try:
+        cli.cancel(tid)
+        emit({"type": "task", "id": tid, "context_id": ctx, "state": "canceled"})
+        return final, "timeout"
+    except a2a.A2AError as exc:
+        if exc.code == a2a.NOT_CANCELABLE:
+            try:
+                final = cli.get(tid)
+                state = (final.get("status") or {}).get("state") or "timeout"
+                emit({"type": "task", "id": tid, "context_id": ctx, "state": state})
+                return final, state
+            except a2a.A2AError as exc2:
+                exc = exc2
+        emit({"type": "error", "message": f"could not withdraw {tid}: {exc}", "code": exc.code})
+        print(f"[a2a] could not withdraw {tid}: {exc}", file=sys.stderr)
+        return final, "timeout"
 
 
 def main() -> int:

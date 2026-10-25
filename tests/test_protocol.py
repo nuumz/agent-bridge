@@ -18,7 +18,7 @@ BIN = ROOT / "bin"
 sys.path.insert(0, str(BIN))
 
 import boardlib  # noqa: E402
-from bridgelib import ledger, protocol  # noqa: E402
+from bridgelib import evidence, ledger, protocol  # noqa: E402
 
 USER, PRIMARY, CURSOR, COPILOT = "user:tester", "claude@primary", "cursor#41", "copilot#42"
 SHAPED = "| file:line | claim | evidence |\n|---|---|---|\n| bin/boardlib.py:1 | one caller | read it |"
@@ -66,6 +66,34 @@ class Spec(unittest.TestCase):
                 self.assertTrue(protocol.check(case["envelope"], self.schema), case["why"])
         kinds = {c["envelope"]["kind"] for c in self.vectors["valid"]}
         self.assertEqual(kinds, set(boardlib.KINDS), "every kind has a valid vector")
+
+    def test_validator_compares_like_json_schema(self):
+        base = {"v": 1, "topic": "t", "seq": 1, "author": "user:a", "kind": "note", "body": ""}
+        self.assertTrue(protocol.validate({**base, "v": True}, self.schema), "true is not 1 (const compares as JSON)")
+        self.assertTrue(protocol.validate({**base, "kind": True}, self.schema), "enum compares as JSON")
+        self.assertEqual(protocol.validate({**base, "seq": 1.0}, self.schema), [], "1.0 is an integer in JSON Schema")
+        self.assertTrue(protocol.validate({**base, "seq": 1.5}, self.schema))
+        for field, value in (("author", "claude@primary\n"), ("to", "@leader\n"), ("author", "user:a\nuser:b")):
+            with self.subTest(field=field):
+                self.assertTrue(protocol.validate({**base, field: value}, self.schema),
+                                "$ means the end of the string, not the end of a line (the board uses fullmatch)")
+        with self.assertRaises(ValueError):       # the whole schema is walked, not only the parts a value reaches
+            protocol.check_schema({"type": "object", "properties": {"a": {"type": "string", "format": "email"}}})
+        protocol.check_schema(self.schema)
+        self.assertEqual(protocol.FAMILIES, boardlib.FAMILIES)
+        turn = {**base, "author": "user:a", "kind": "request", "to": "cursor", "body": "shape: diff\nmode: write\n\nx"}
+        self.assertTrue(any("dir" in e for e in protocol.check(turn, self.schema)), "a write turn needs dir:")
+        self.assertEqual(protocol.check({**turn, "body": "shape: diff\nmode: write\ndir: /w\n\nx"}, self.schema), [])
+        self.assertEqual(protocol.check({**turn, "to": "cursor#4", "body": "shape: diff\nmode: write\n\nx"},
+                                        self.schema), [], "mode: write on a non-turn request is just a header")
+        cites = protocol.citations("see .github/workflows/ci.yml:12, ../lib/a.py:3 and ./././x.py:1")
+        self.assertEqual([c["path"] for c in cites], [".github/workflows/ci.yml", "../lib/a.py", "x.py"])
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / ".github").mkdir()
+            (Path(d) / ".github" / "ci.yml").write_text("a\nb\n")
+            rows = evidence.verify_citations(d, {"r": "see .github/ci.yml:2 and ./.github/ci.yml:1"})
+            self.assertEqual({r["status"] for r in rows}, {"ok"}, rows)
+            self.assertEqual({r["cite"] for r in rows}, {".github/ci.yml:1", ".github/ci.yml:2"})
 
     def test_spec_names_every_kind_header_key_and_artifact(self):
         text = (ROOT / "docs" / "PROTOCOL.md").read_text(encoding="utf-8")
@@ -197,6 +225,10 @@ class Board(unittest.TestCase):
         plain = run("--after", "0")
         self.assertIn("-- next_after_seq=", plain.stdout)
         self.assertIn("[seq=1 author=user:tester kind=note]", plain.stdout)
+        for own in ("task", "system"):            # the transport's own rows: never posted by hand
+            forged = subprocess.run([sys.executable, str(BIN / "bridge-board"), "post", name, "x", "-k", own],
+                                    capture_output=True, text=True, env=dict(os.environ), timeout=60)
+            self.assertEqual(forged.returncode, 2, own)
 
 
 if __name__ == "__main__":

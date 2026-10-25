@@ -95,6 +95,14 @@ class BoardIdentity(unittest.TestCase):
         self.assertEqual(boardlib.bridged_identity(self.conn), ("cursor#777", None))
         self.assertEqual(boardlib.resolve_identity(self.conn, {}), ("cursor#777", True, None))
 
+    def test_an_mcp_server_that_knows_only_its_family_under_a_hop_is_that_familys_hop_identity(self):
+        # Codex's board MCP env carries AGENT_BRIDGE_AGENT and AGENT_BRIDGE_HOP, no identity: when the ancestor-pid
+        # lookup misses (no `ps`), the fallback must not be the primary, whose name may_spend trusts
+        self.assertEqual(boardlib.resolve_identity(self.conn, {"AGENT_BRIDGE_AGENT": "codex", "AGENT_BRIDGE_HOP": "1"}),
+                         ("codex@hop", True, None))
+        self.assertEqual(boardlib.resolve_identity(self.conn, {"AGENT_BRIDGE_AGENT": "codex"}),
+                         ("codex@primary", False, None))                    # the user's own session: no marker
+
     def test_user_cli_opens_posts_decides_and_closes(self):
         self.assertEqual(self.cli("post", "t1", "hello").returncode, 0)
         self.assertEqual(self.cli("post", "t1", "go", "-k", "decision").returncode, 0)

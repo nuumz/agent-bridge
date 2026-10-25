@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -165,6 +166,27 @@ class WorkSigterm(unittest.TestCase):
             self.assertLess(time.time() - t0, 25, "verify hung on a pipe held by a SIGTERM-ignoring child")
             child = int((Path(d) / "child.pid").read_text())
             self.assertTrue(wait_for(lambda: not alive(child), 10))
+
+    def test_verify_timeout_returns_when_a_detached_descendant_holds_the_pipes(self):
+        """A build daemon that called setsid() is outside the group run_tool kills, and it keeps stdout/stderr open:
+        the second communicate() must give up on the pipes instead of waiting for it forever."""
+        loader = importlib.machinery.SourceFileLoader("bw_verify3", str(BIN / "bridge-work"))
+        bw = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(bw)
+        with tempfile.TemporaryDirectory() as d:
+            daemon = f"{sys.executable} -c 'import os, time; os.setsid(); time.sleep(300)'"
+            result: list = []
+            t = threading.Thread(target=lambda: result.append(
+                bw.verify(Path(d), f"{daemon} & echo $! > child.pid; wait", timeout=1)), daemon=True)
+            t0 = time.time()
+            t.start()
+            t.join(timeout=40)
+            self.assertTrue(wait_for(lambda: (Path(d) / "child.pid").is_file(), 5))
+            child = int((Path(d) / "child.pid").read_text())
+            self.addCleanup(lambda: os.kill(child, signal.SIGKILL) if alive(child) else None)
+            self.assertFalse(t.is_alive(), "verify hung on pipes a detached descendant holds")
+            self.assertEqual(result[0][0], 124)
+            self.assertLess(time.time() - t0, 30)
 
     def test_verify_timeout_ends_the_commands_children(self):
         loader = importlib.machinery.SourceFileLoader("bw_verify", str(BIN / "bridge-work"))

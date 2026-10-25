@@ -32,7 +32,8 @@ ask-agent --list
 ```
 
 Exit codes: 0 ok · 1 peer error · 2 usage · 3 hop guard · 4 disabled · 5 peer asked back · 6 cursor/codex write refused ·
-**7 peer out of quota** · 127 not installed · 143 killed at `-t`. Every failure prints one `[bridge] error: <the peer's
+**7 peer out of quota** · 127 not installed · 143 killed at `-t` (SIGTERM to the run's process group, then SIGKILL for
+whatever in it ignored that). Every failure prints one `[bridge] error: <the peer's
 own first stderr line>` before the raw dump — scripts (`bridge-panel`) read that line, never the dump.
 
 - **Default mode is `ask` — read-only.** `plan` is read-only too. Only `-m write` may touch files.
@@ -75,7 +76,7 @@ How the common options map onto each CLI:
 | `--session id` / `-c` | `--resume id --fork-session` / `--continue --fork-session` (the peer never writes into the session it resumes — with `-c` in your own directory that is yours) | `--resume id` / `--continue` | `--resume=id` / `--continue` | `exec … resume <thread_id>` / `exec … resume --last` (the exec-level flags stay before `resume`: `--sandbox`, `--cd`, `--add-dir` are not global there) |
 | `-w [name]` | `--worktree [name]` → `<repo>/.claude/worktrees/<name>` (locked) | `--worktree [name]` → `~/.cursor/worktrees/<repo>/<name>` | not supported (use `git worktree add` + `-d`) | not supported (use `git worktree add` + `-d`) |
 | `--add-dir` | `--add-dir` | `--add-dir` | `--add-dir=` | not passed: an extra root would be *writable* in `workspace-write`, and the read-only sandbox reads the disk without a grant |
-| board MCP | `--allowed-tools mcp__bridge_board` (registered user-scope by `bridge-sync`) | `--approve-mcps` (`~/.cursor/mcp.json` by `bridge-sync`) | `~/.copilot/mcp-config.json` (not written yet) | `-c mcp_servers.bridge_board.command=… -c …args=["serve"] -c …env={AGENT_BRIDGE_AGENT="codex"}` on the run itself — nothing is written to `~/.codex/config.toml` |
+| board MCP | `--allowed-tools mcp__bridge_board` (registered user-scope by `bridge-sync`) | `--approve-mcps` (`~/.cursor/mcp.json` by `bridge-sync`) | `~/.copilot/mcp-config.json` (not written yet) | `-c mcp_servers.bridge_board.command=… -c …args=["serve"] -c …env={AGENT_BRIDGE_AGENT="codex", AGENT_BRIDGE_HOP="1"}` on the run itself — nothing is written to `~/.codex/config.toml`; the marker makes a server that cannot find the run's pid `codex@hop`, never `codex@primary` |
 | output parsed from | `--output-format stream-json --verbose` (last line = `result`: `result`, `session_id`, `usage`; earlier lines feed `bridge-watch`) | `--output-format stream-json` (`assistant` chunks, `result`) | `--output-format json` JSONL (`assistant.message` content, `result.sessionId` + `usage.premiumRequests`/`totalApiDurationMs`; `EDITED=` in the bridge line when `codeChanges.filesModified` is non-empty) | `exec --json` JSONL (`thread.started.thread_id` = the session; `item.completed` items: `agent_message.text` is the answer, `command_execution` / `mcp_tool_call` the tool calls, `file_change.changes` → `EDITED=`; `turn.completed.usage` the tokens; a `turn.failed` / `error` message is the error line; no `turn.completed` = incomplete, not a success) |
 
 **Codex.** Every Codex run is `codex exec --json --skip-git-repo-check --cd <dir> --sandbox <mode>` (the bridge decides
@@ -97,7 +98,11 @@ sends one `message/send` and polls `tasks/get` until a terminal state, printing 
 `result`) that the adapter parses — `result.text` is the answer, `result.context_id` the session (`--session` /
 `--conv` continue that context; `-c` continues the last one used for that URL), a state other than `completed` is
 the error line (`[a2a] <state>: <the peer's message>` on stderr, so a usage-limit message there marks the quota like
-the others). The token is read from `AGENT_BRIDGE_A2A_TOKEN` only, never passed on a command line, never appears in
+the others). A `Message` result (A2A lets a server answer without a task) is the answer; `input-required` and
+`auth-required` stop the poll (the remote waits for a person, not for time); every HTTP call is bounded by the run's
+deadline, and a task the client gives up on (timeout, SIGTERM) is withdrawn with `tasks/cancel`; a missing card is a
+warning, not a failure; the card is fetched without the token and from the URL's origin; no `http_proxy` is honoured
+(a tunnel URL stays local). The token is read from `AGENT_BRIDGE_A2A_TOKEN` only, never passed on a command line, never appears in
 `--dry-run` or a run log, and is dropped from every other peer's environment (`core.PRIVATE_ENV_VARS`; the adapter's
 `env_keep` names what its run alone may see). No deny flag and no hold: the bridge sends text, a mode and a shape — the remote's own rails
 apply. `-w` is not supported; `--add-dir` is not sent (a local path grant means nothing to the remote). A send
@@ -209,8 +214,11 @@ orphan loop firing "interim" notifications at the caller, and a bare `sleep` is 
 killed run does not leave waiters polling forever — launch with `--detach` (see `peer-*` agents). The same handler
 covers SIGHUP (`rc=129`) and SIGINT (`rc=130`), and the kill reaches the peers: every `ask-agent` (and `--verify`
 command) the run has alive — a panel's parallel workers included — sits in its own process group and gets SIGTERM
-at once, so `ask-agent` forwards it to the peer; whatever is still there 10 s later is SIGKILLed. The rc file is
-written once they have exited (normally within a few seconds), so `rc=143` means nothing is still editing.
+at once, so `ask-agent` forwards it to the peer; whatever is still there 10 s later is SIGKILLed — the children alive
+at the signal, never a run that started afterwards, and nothing starts afterwards. A `--verify` command that times
+out has its group SIGKILLed too, and a descendant that left the group (a `setsid` daemon holding the pipes) costs the
+run ten more seconds, not forever. The rc file is written once they have exited (normally within a few seconds), so
+`rc=143` means nothing is still editing.
 
 **Lost answers.** Cursor `-m plan` can spend its whole turn on tools and return one narration line.
 `ask-agent cursor` detects that (short result + large output tokens) and resumes the session once to fetch
@@ -298,7 +306,9 @@ token table on every request, so `bridge-a2a client add|remove` takes effect wit
   `board_task_done`. Identity is resolved by the server — `<agent>@primary`, `<agent>#<pid>` for an
   `ask-agent` run (pid = the peer CLI process, so every run — each dialog round included — is distinct),
   `<agent>:task<N>` for a dispatched task — by finding the run's CLI pid among its ancestors in the
-  `workers` table (cursor-agent does not forward env to MCP children), so an agent cannot impersonate another. The
+  `workers` table (cursor-agent does not forward env to MCP children), so an agent cannot impersonate another; a
+  server that finds no registered ancestor and knows only its family (`AGENT_BRIDGE_AGENT`) is `<agent>@primary`
+  without the hop marker and `<agent>@hop` with it — an env variable never grants the primary's rights. The
 `bridge-board` CLI resolves identity the same way: a shell inside a bridged run posts as that run, may not post
 `kind=decision`, open topics (a `dm:` it is one side of excepted), close a topic it does not lead, or dispatch —
 whatever its env says.
@@ -361,7 +371,9 @@ whatever its env says.
 - **Turns — a peer that is not running joins a room by the request.** A `request` with
   `to=claude|cursor|copilot|codex|a2a` (a family, not a running identity) is queued as a task in that topic for that family (`request_seq` links them;
   optional header lines `dir:` for the workspace and `mode: ask|plan|write`), and starts when a human runs
-  `bridge-board dispatch` — one run, identity `<family>:task<N>`, told it is answering request seq N from whom, in
+  `bridge-board dispatch` (every enabled family by default, `a2a` when `AGENT_BRIDGE_A2A_URL` is set; `--agents`
+  narrows it and must name known families) — one run, identity `<family>:task<N>`, told it is answering request seq
+  N from whom, in
   which shape. Only the user, the primary or the topic's leader may call a turn (each is a full run; a member's
   request to a family is refused — ask the leader); a leader's turn is `origin=user` (the leader was appointed by the
   user or the primary), so `dispatch` starts it without `--include-peer-tasks`, while a peer leader still pays into

@@ -102,6 +102,17 @@
       "name": "a header key the spec does not list is carried as a string",
       "envelope": {"v": 1, "topic": "room:design", "seq": 8, "author": "cursor#4120", "kind": "note", "to": null, "reply_to": null,
                    "created_at": 1761301100, "body": "prio: high\n\nOne more caller found.", "headers": {"prio": "high"}, "citations": []}
+    },
+    {
+      "name": "seq written as 1.0 is an integer (JSON Schema: a zero fractional part)",
+      "envelope": {"v": 1, "topic": "room:design", "seq": 9.0, "author": "user:alice", "kind": "note", "to": null,
+                   "reply_to": null, "created_at": 1761301200, "body": "Nine.", "headers": {}, "citations": []}
+    },
+    {
+      "name": "a dotfile path keeps its dot in the citation",
+      "envelope": {"v": 1, "topic": "room:design", "seq": 10, "author": "cursor#4120", "kind": "answer", "to": "user:alice",
+                   "reply_to": 1, "created_at": 1761301300, "body": "The job is in .github/workflows/ci.yml:12.",
+                   "headers": {}, "citations": [{"path": ".github/workflows/ci.yml", "line": 12}]}
     }
   ],
   "invalid": [
@@ -229,6 +240,27 @@
       "name": "body that is not a string",
       "why": "body is text",
       "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "note", "body": ["x"]}
+    },
+    {
+      "name": "v that is the boolean true",
+      "why": "const compares as JSON: true is not 1",
+      "envelope": {"v": true, "topic": "t", "seq": 1, "author": "user:alice", "kind": "note", "body": "x"}
+    },
+    {
+      "name": "author with a trailing newline",
+      "why": "an identity has no whitespace; $ in the pattern is the end of the string, not of a line",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "claude@primary\n", "kind": "note", "body": "x"}
+    },
+    {
+      "name": "role with a trailing newline",
+      "why": "same: @leader followed by a newline is not a role reference",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "note", "to": "@leader\n", "body": "x"}
+    },
+    {
+      "name": "write turn without dir",
+      "why": "§6.5: a mode: write turn needs a dir: header line (the board refuses it)",
+      "envelope": {"v": 1, "topic": "t", "seq": 1, "author": "user:alice", "kind": "request", "to": "cursor",
+                   "body": "shape: diff\nmode: write\n\nFix the retry loop."}
     }
   ]
 }
