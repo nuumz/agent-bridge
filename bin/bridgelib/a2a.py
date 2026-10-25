@@ -16,6 +16,7 @@ human read the same stream. The token travels in the environment (AGENT_BRIDGE_A
 from __future__ import annotations
 
 import hmac
+import http.client
 import json
 import os
 import re
@@ -86,7 +87,7 @@ def split_task_id(tid: Any) -> tuple[str, int]:
     return topic, int(seq)
 
 
-def iso(ts: int | float | None) -> str:
+def iso(ts: float | None) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts if ts else time.time()))
 
 
@@ -379,14 +380,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         if self.path.split("?", 1)[0] in WELL_KNOWN:          # the card is public; everything else needs a token
-            self._send(200, agent_card(self.cfg.name, self.cfg.url, self.cfg.families, auth=bool(self.cfg.clients)))
+            self._send(200, agent_card(self.cfg.name, self.cfg.url, self.cfg.families, auth=bool(load_clients())))
             return
         self._send(404, {"error": "not found", "agent_card": WELL_KNOWN[0]})
 
-    def do_POST(self) -> None:  # noqa: N802
-        client = authenticate(self.headers.get("Authorization"), self.cfg.clients)
+    def do_POST(self) -> None:
+        # the token table is read per request: `bridge-a2a client add|remove` takes effect without a restart
+        client = authenticate(self.headers.get("Authorization"), load_clients())
         if client is None:
             self._send(401, {"error": "unauthorized: Authorization: Bearer <token> (bridge-a2a client add <name>)"},
                        {"WWW-Authenticate": "Bearer"})
@@ -421,7 +423,7 @@ def make_server(cfg: Config, bind: str, port: int, quiet: bool = False) -> Threa
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """A redirect would carry the bearer token to whatever host the remote names: refuse it (HTTPError 3xx)."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
 
@@ -442,7 +444,7 @@ class Client:
             headers["Authorization"] = f"Bearer {self.token}"
         req = urllib.request.Request(self.url + path, data=body, headers=headers, method="POST" if data else "GET")
         try:
-            with _OPENER.open(req, timeout=self.timeout) as r:  # noqa: S310 — the user named the URL
+            with _OPENER.open(req, timeout=self.timeout) as r:
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             if exc.code == 401:
@@ -453,6 +455,8 @@ class Client:
             raise A2AError(f"{self.url}{path}: HTTP {exc.code} {exc.reason}", exc.code) from exc
         except urllib.error.URLError as exc:
             raise A2AError(f"cannot reach {self.url}: {exc.reason}") from exc
+        except (OSError, http.client.HTTPException) as exc:   # socket timeout, reset, half-closed: still "unreachable"
+            raise A2AError(f"cannot reach {self.url}: {exc.__class__.__name__}: {exc}") from exc
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise A2AError(f"{self.url}{path}: not JSON ({exc})") from exc
 

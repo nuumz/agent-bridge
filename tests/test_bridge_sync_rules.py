@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import io
-import json
 import importlib.machinery
 import importlib.util
+import io
+import json
 import os
 import subprocess
 import sys
@@ -38,7 +38,7 @@ class RuleFiles(unittest.TestCase):
         (home / ".cursor" / "rules").mkdir(parents=True)
         (home / ".copilot").mkdir()
         peers = copy.deepcopy(self.bs.PEERS)
-        for name, peer in peers.items():
+        for peer in peers.values():
             for key in ("rules", "skills", "note_file", "also_reads"):
                 if key in peer:
                     peer[key] = home / peer[key].relative_to(self.bs.HOME)
@@ -132,7 +132,8 @@ class Help(unittest.TestCase):
     def test_help_prints_usage_and_touches_nothing(self):
         with tempfile.TemporaryDirectory() as home:
             env = {**os.environ, "HOME": home}
-            r = subprocess.run([sys.executable, str(BIN / "bridge-sync"), "--help"], env=env, capture_output=True, text=True)
+            r = subprocess.run([sys.executable, str(BIN / "bridge-sync"), "--help"], env=env, capture_output=True, text=True,
+                               check=False)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("usage: bridge-sync", r.stdout)
             self.assertEqual(os.listdir(home), [])

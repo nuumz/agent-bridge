@@ -427,10 +427,15 @@ def send(o) -> int:
               f"{' — ' + st['reason'] if st.get('reason') else ''}; `bridge-live start <peer> --room {o.room} -d DIR`",
               file=sys.stderr)
         return 2
+    body = o.message
+    if o.to in boardlib.FAMILIES and "dir" not in boardlib.header(body):
+        room_dir = next((st["dir"] for st in peers.values() if st.get("dir")), None)
+        if room_dir:                        # a dispatched turn works in the room's repo, not in dispatch's cwd
+            body = f"dir: {room_dir}\n{body}"
     conn = boardlib.connect()
     tid = boardlib.topic_id(conn, topic(o.room), USER_AUTHOR)
     try:
-        seq = boardlib.post(conn, tid, USER_AUTHOR, o.message, o.kind, to=o.to)
+        seq = boardlib.post(conn, tid, USER_AUTHOR, body, o.kind, to=o.to)
     except boardlib.BoardError as exc:
         print(f"bridge-live: {exc}", file=sys.stderr)
         return 2
