@@ -367,7 +367,9 @@ whatever its env says.
 - **Turns — a peer that is not running joins a room by the request.** A `request` with
   `to=claude|cursor|copilot|codex|a2a` (a family, not a running identity) is queued as a task in that topic for that family (`request_seq` links them;
   optional header lines `dir:` for the workspace and `mode: ask|plan|write`), and starts when a human runs
-  `bridge-board dispatch` — one run, identity `<family>:task<N>`, told it is answering request seq N from whom, in
+  `bridge-board dispatch` (every enabled family by default, `a2a` when `AGENT_BRIDGE_A2A_URL` is set; `--agents`
+  narrows it and must name known families) — one run, identity `<family>:task<N>`, told it is answering request seq
+  N from whom, in
   which shape. Only the user, the primary or the topic's leader may call a turn (each is a full run; a member's
   request to a family is refused — ask the leader); a leader's turn is `origin=user` (the leader was appointed by the
   user or the primary), so `dispatch` starts it without `--include-peer-tasks`, while a peer leader still pays into
