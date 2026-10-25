@@ -164,7 +164,10 @@ def load_clients(path: Path | None = None) -> dict[str, str]:
         data = json.loads((path or CLIENTS).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    # only a non-empty string is a token: an empty or null value (a hand-edited file) must authenticate nobody
+    return {str(k): v for k, v in data.items() if isinstance(v, str) and v.strip()}
 
 
 def save_clients(clients: dict[str, str], path: Path | None = None) -> None:
@@ -197,8 +200,10 @@ def authenticate(header: str | None, clients: dict[str, str]) -> str | None:
     if not header or not header.lower().startswith("bearer "):
         return None
     given = header[7:].strip()
+    if not given:
+        return None
     for name, token in clients.items():
-        if hmac.compare_digest(given.encode(), token.encode()):
+        if token and hmac.compare_digest(given.encode(), token.encode()):
             return name
     return None
 

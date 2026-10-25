@@ -131,6 +131,14 @@ class Server(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as cm2:
             urllib.request.urlopen(req, timeout=5)
         self.assertEqual(cm2.exception.code, 404)
+        # a client row whose token is empty or null (a hand-edited clients.json) must authenticate nobody
+        a2a.CLIENTS.write_text(json.dumps({"alice": self.token, "bob": "", "eve": None}))
+        clients = a2a.load_clients()
+        self.assertEqual(clients, {"alice": self.token})
+        for header in ("Bearer ", "Bearer", "Bearer None", "Bearer null", "Bearer  "):
+            self.assertIsNone(a2a.authenticate(header, clients), header)
+            self.assertIsNone(a2a.authenticate(header, {"bob": ""}), header)   # a table that slipped past the loader
+        self.assertEqual(a2a.authenticate(f"Bearer {self.token}", clients), "alice")
 
     # -- the mapping onto the board
     def test_send_becomes_a_turn_on_the_clients_own_topic(self):
