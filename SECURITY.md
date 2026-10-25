@@ -40,7 +40,7 @@ Nothing listens unless you run `bridge-a2a serve`. When you do:
 | What a client can do | post requests on its own topic `a2a:<name>`, addressed to the families you listed with `--peers`; read and cancel those requests. It cannot read any other topic, choose a directory (yours, `-d`), run anything (a request waits for your `bridge-board dispatch`), or ask for `write` unless you started the server with `--allow-write` |
 | What leaves the machine | to a client: the reply text of its own requests. To a remote agent you call (`ask-agent a2a`, or a turn `to=a2a` that `dispatch` runs): the prompt — for a dispatched turn the request body alone, no topic, identity, requester or other board messages — a mode and a shape; never a credential, a path grant (`--add-dir` is not forwarded) or a command; the token travels in `AGENT_BRIDGE_A2A_TOKEN`, never on a command line, and does not appear in `--dry-run` or run logs |
 | Transport | plain HTTP unless `--cert`/`--key`; across machines use an SSH tunnel or put TLS in front. Request bodies are capped at 1 MiB |
-| Known gaps | no rate limit beyond the board's five open turns per topic; a client's turns are user-origin for `dispatch` (you issued its token), so `--include-peer-tasks` does not gate them; the remote agent's rails are its own — the bridge cannot deny a command on the other side |
+| Known gaps | no rate limit beyond the board's cap of five open turns per client (its own topic); a client's turns are user-origin for `dispatch` (you issued its token), so `--include-peer-tasks` does not gate them; the remote agent's rails are its own — the bridge cannot deny a command on the other side |
 
 ## Reporting a vulnerability
 

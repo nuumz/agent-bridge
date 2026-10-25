@@ -186,6 +186,17 @@ class Server(unittest.TestCase):
         self.assertEqual(cm.exception.code, a2a.NOT_CANCELABLE)
         self.assertEqual(self.client().get(second["id"])["status"]["state"], "canceled")
 
+    def test_a_client_holds_at_most_five_open_turns(self):
+        ids = [self.client().send(f"Review part {n}.")["id"] for n in range(boardlib.PEER_OPEN_TASKS)]
+        with self.assertRaises(a2a.A2AError) as cm:
+            self.client().send("Review part 6.")
+        self.assertEqual(cm.exception.code, a2a.INVALID_PARAMS)
+        self.assertIn("peer task limit", str(cm.exception))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], boardlib.PEER_OPEN_TASKS)
+        self.client().cancel(ids[0])                                           # room again once one closes
+        self.assertEqual(self.client().send("Review part 6.")["status"]["state"], "submitted")
+        self.assertEqual(self.client(self.bob).send("Mine.")["status"]["state"], "submitted")   # per client topic
+
     def test_a_client_sees_only_its_own_tasks_and_errors_carry_their_codes(self):
         task = self.client().send("Review it.")
         for call, code in ((lambda: self.client(self.bob).get(task["id"]), a2a.TASK_NOT_FOUND),

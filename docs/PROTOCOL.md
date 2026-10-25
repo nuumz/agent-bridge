@@ -202,7 +202,9 @@ part rests on the default.
 A `request` with `to` = a family name is a turn: the transport queues it as a task for that family in the topic
 (`request_seq` links them), with `dir:` and `mode:` from the header (`write` needs `dir:`), in the same transaction as
 the message or not at all. Only the user, the primary or the topic's leader may call one (each is a full run); a
-peer's request to a family is refused. Nothing runs until a human runs `bridge-board dispatch`; the run gets the
+peer's request to a family is refused, and a peer leader (an A2A client included) holds at most five open turns per
+topic — the cap counts the topic's peer-origin tasks and the requester's own open turns, whatever their origin.
+Nothing runs until a human runs `bridge-board dispatch`; the run gets the
 identity `<family>:task<N>`, is told which request it answers and in which shape, and its closing reply closes the
 request and the task together (`blocked` → task failed). A closing reply by anyone else (the requester withdrawing,
 the user) cancels the task. When the run ends without having posted that reply — a remote family (§10.4) has no board
@@ -335,9 +337,9 @@ listens on loopback unless told otherwise, and is needed for nothing local.
 
 What the server enforces, on every request: the token (the card is the only unauthenticated resource); one topic
 per client, so a client never reads or closes another's requests; the operator's family list as the egress gate;
-the operator's directory; the peer task cap of §6.5 (a client's turns are peer-origin for the cap, user-origin for
-dispatch, since the operator issued the token); and the rule that **nothing on the board spawns anything** — a
-remote task waits in `submitted` until a human runs `bridge-board dispatch`.
+the operator's directory; the peer task cap of §6.5 (a client holds at most five open turns on its topic; they are
+user-origin for dispatch, since the operator issued the token); and the rule that **nothing on the board spawns
+anything** — a remote task waits in `submitted` until a human runs `bridge-board dispatch`.
 
 Outbound, `bridge-a2a send` (what `ask-agent a2a` runs through the `a2a` adapter) fetches the remote card, sends one
 `message/send` and polls `tasks/get` until a terminal state, printing JSON Lines — `card`, `task` per state change,

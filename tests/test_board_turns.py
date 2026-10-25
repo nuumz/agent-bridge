@@ -207,6 +207,17 @@ class Turns(unittest.TestCase):
             boardlib.post(self.conn, self.tid, "cursor#7", REQUEST, "request", to="copilot")
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM messages WHERE kind='request'").fetchone()[0], 0)
         self.assertEqual(len(self.tasks()), boardlib.PEER_OPEN_TASKS)
+        for t in self.tasks():                                                # the cap counts the leader's own turns
+            boardlib.task_cancel(self.conn, t["id"], USER)
+        for _ in range(boardlib.PEER_OPEN_TASKS):
+            boardlib.post(self.conn, self.tid, "cursor#7", REQUEST, "request", to="copilot")
+        with self.assertRaisesRegex(boardlib.BoardError, "peer task limit"):
+            boardlib.post(self.conn, self.tid, "cursor#7", REQUEST, "request", to="copilot")
+        boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="copilot")        # the user is not capped
+        self.assertEqual(len([t for t in self.tasks() if t["status"] == "queued"]), boardlib.PEER_OPEN_TASKS + 1)
+        for t in self.tasks():
+            if t["status"] == "queued":
+                boardlib.task_cancel(self.conn, t["id"], USER)
         with self.assertRaisesRegex(boardlib.BoardError, "mode: write needs"):
             boardlib.post(self.conn, self.tid, USER, f"mode: write\n{REQUEST}", "request", to="cursor")
         boardlib.post(self.conn, self.tid, USER, f"dir: .\nmode: write\n{REQUEST}", "request", to="cursor")

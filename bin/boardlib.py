@@ -273,7 +273,7 @@ def post(conn: sqlite3.Connection, tid: int, author: str, body: str, kind: str =
         if turn_dir:
             turn_dir = str(Path(turn_dir).expanduser().resolve())
         # a peer leader still pays into the peer task cap; checked here so the request never lands without its task
-        _task_checks(conn, tid, not may_spend(author), turn_mode, turn_dir)
+        _task_checks(conn, tid, not may_spend(author), turn_mode, turn_dir, author)
     target = None
     if reply_to is not None:
         target = conn.execute("SELECT seq, author, kind, body, addressee FROM messages WHERE topic_id=? AND seq=?",
@@ -627,19 +627,21 @@ def _log(conn: sqlite3.Connection, tid: int, text: str) -> None:
 def task_add(conn: sqlite3.Connection, tid: int, title: str, body: str, requester: str, peer: bool,
              assignee: str = "any", mode: str = "ask", workdir: str | None = None, priority: int = 0,
              request_seq: int | None = None) -> int:
-    _task_checks(conn, tid, peer, mode, workdir)
+    _task_checks(conn, tid, peer, mode, workdir, requester)
     with tx(conn):
         return _task_insert(conn, tid, title, body, requester, peer, assignee, mode, workdir, priority, request_seq)
 
 
-def _task_checks(conn: sqlite3.Connection, tid: int, peer: bool, mode: str, workdir: str | None) -> None:
+def _task_checks(conn: sqlite3.Connection, tid: int, peer: bool, mode: str, workdir: str | None, requester: str) -> None:
     if mode not in TASK_MODES:
         raise BoardError(f"mode must be one of {TASK_MODES}")
     if workdir and not Path(workdir).is_dir():
         raise BoardError(f"dir does not exist: {workdir}")
     if peer:
-        n = conn.execute("SELECT COUNT(*) FROM tasks WHERE topic_id=? AND origin='peer' AND status IN ('queued','claimed')",
-                         (tid,)).fetchone()[0]
+        # the topic's peer-origin tasks plus the requester's own open turns: a peer leader's or an A2A client's turn
+        # is origin=user (dispatch runs it without --include-peer-tasks) but still one of its five
+        n = conn.execute("SELECT COUNT(*) FROM tasks WHERE topic_id=? AND (origin='peer' OR requested_by=?) "
+                         "AND status IN ('queued','claimed')", (tid, requester)).fetchone()[0]
         if n >= PEER_OPEN_TASKS:
             raise BoardError(f"peer task limit reached for this topic ({PEER_OPEN_TASKS} open)")
 
