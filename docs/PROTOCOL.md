@@ -334,6 +334,7 @@ listens on loopback unless told otherwise, and is needed for nothing local.
 | `tasks/get` | the request, its board task and its replies, read as the client only (another client's task is `TaskNotFound`) |
 | `configuration.blocking` | the server polls the board up to `--max-block` seconds before answering |
 | not offered: `message/stream`, push notifications (`capabilities` says so; `UnsupportedOperation` / `PushNotificationNotSupported`) | the board has no push channel either; polling is the model |
+| a JSON-RPC batch | 1..32 requests, answered in order; `[]` or more is one `InvalidRequest`. A body is at most 1 MiB with a plain-decimal `Content-Length`; an error response closes the connection |
 
 What the server enforces, on every request: the token (the card is the only unauthenticated resource); one topic
 per client, so a client never reads or closes another's requests; the operator's family list as the egress gate;

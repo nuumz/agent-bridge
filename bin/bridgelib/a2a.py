@@ -41,6 +41,9 @@ LAST_CONTEXT = A2A_DIR / "last-context.json"  # {url: contextId} — what `send 
 WELL_KNOWN = ("/.well-known/agent-card.json", "/.well-known/agent.json")   # A2A 0.3 name, then the older one
 TERMINAL = ("completed", "canceled", "failed", "rejected")
 MAX_BODY = 1 << 20
+BATCH_MAX = 32                                   # JSON-RPC requests per batch: one 1 MiB batch is not ten thousand sends
+CONN_TIMEOUT = 30                                # seconds a connection may stay silent (a half-sent request, an idle keep-alive)
+CONTENT_LENGTH = re.compile(r"[0-9]{1,7}")       # a plain decimal: int() would also take "1_0", "+1", " 1"
 URL_VAR, TOKEN_VAR = "AGENT_BRIDGE_A2A_URL", "AGENT_BRIDGE_A2A_TOKEN"
 # JSON-RPC 2.0 and A2A error codes
 PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL = -32700, -32600, -32601, -32602, -32603
@@ -373,18 +376,29 @@ class Handler(BaseHTTPRequestHandler):
     def cfg(self) -> Config:
         return self.server.cfg  # type: ignore[attr-defined]
 
+    def setup(self) -> None:
+        # one silent connection must not hold a thread and a file descriptor forever: the socket times out, and
+        # BaseHTTPRequestHandler turns a timeout on the request line into a close
+        self.timeout = getattr(self.server, "conn_timeout", CONN_TIMEOUT)
+        super().setup()
+
     def log_message(self, fmt: str, *args: Any) -> None:
         if getattr(self.server, "quiet", False):
             return
         super().log_message(fmt, *args)
 
-    def _send(self, status: int, obj: Any, headers: dict[str, str] | None = None) -> None:
+    def _send(self, status: int, obj: Any, headers: dict[str, str] | None = None, close: bool = False) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         for k, v in (headers or {}).items():
             self.send_header(k, v)
+        if status >= 400 or close:
+            # an error leaves the body unread (401, 413) or half-trusted (a parse error): on a persistent connection
+            # those bytes would be parsed as the next request, so the connection ends here
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.end_headers()
         self.wfile.write(data)
 
@@ -400,28 +414,44 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, {"error": "unauthorized: Authorization: Bearer <token> (bridge-a2a client add <name>)"},
                        {"WWW-Authenticate": "Bearer"})
             return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = -1
-        if length < 0 or length > MAX_BODY:
-            self._send(413, {"error": f"body must be 0..{MAX_BODY} bytes with Content-Length"})
+        raw_len = self.headers.get("Content-Length")
+        if self.headers.get("Transfer-Encoding") or raw_len is None:
+            self._send(411, {"error": "a body needs Content-Length; chunked transfer is not accepted"})
+            return
+        if not CONTENT_LENGTH.fullmatch(raw_len):
+            self._send(400, {"error": "Content-Length must be a plain decimal"})
+            return
+        length = int(raw_len)
+        if length > MAX_BODY:
+            self._send(413, {"error": f"body must be 0..{MAX_BODY} bytes"})
             return
         try:
-            req = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = self.rfile.read(length)
+        except TimeoutError:
+            self._send(408, {"error": "the body did not arrive in time"})
+            return
+        try:
+            req = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            self._send(200, {"jsonrpc": "2.0", "id": None, "error": RpcError(PARSE_ERROR, "parse error").as_dict()})
+            self._send(200, {"jsonrpc": "2.0", "id": None, "error": RpcError(PARSE_ERROR, "parse error").as_dict()},
+                       close=True)
             return
         if isinstance(req, list):
+            if not 1 <= len(req) <= BATCH_MAX:
+                self._send(200, {"jsonrpc": "2.0", "id": None, "error": RpcError(
+                    INVALID_REQUEST, f"a batch holds 1..{BATCH_MAX} requests").as_dict()})
+                return
             self._send(200, [handle(self.cfg, client, r) for r in req])
             return
         self._send(200, handle(self.cfg, client, req))
 
 
-def make_server(cfg: Config, bind: str, port: int, quiet: bool = False) -> ThreadingHTTPServer:
+def make_server(cfg: Config, bind: str, port: int, quiet: bool = False,
+                conn_timeout: float = CONN_TIMEOUT) -> ThreadingHTTPServer:
     srv = ThreadingHTTPServer((bind, port), Handler)
     srv.cfg = cfg  # type: ignore[attr-defined]
     srv.quiet = quiet  # type: ignore[attr-defined]
+    srv.conn_timeout = conn_timeout  # type: ignore[attr-defined]
     srv.daemon_threads = True
     return srv
 

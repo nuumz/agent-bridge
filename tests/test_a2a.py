@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -139,6 +140,113 @@ class Server(unittest.TestCase):
             self.assertIsNone(a2a.authenticate(header, clients), header)
             self.assertIsNone(a2a.authenticate(header, {"bob": ""}), header)   # a table that slipped past the loader
         self.assertEqual(a2a.authenticate(f"Bearer {self.token}", clients), "alice")
+
+    # -- the HTTP layer, byte by byte
+    def sock(self, srv=None) -> socket.socket:
+        port = (srv or self.srv).server_port
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(s.close)
+        return s
+
+    @staticmethod
+    def http(s: socket.socket, request: bytes) -> tuple[int, dict[str, str], bytes]:
+        """Send one request, read exactly one response (status, headers, body) — what a keep-alive client does."""
+        s.sendall(request)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                raise ConnectionError(f"closed before a response: {buf!r}")
+            buf += chunk
+        head, body = buf.split(b"\r\n\r\n", 1)
+        lines = head.decode().split("\r\n")
+        status = int(lines[0].split()[1])
+        headers = {k.strip().lower(): v.strip() for k, v in (ln.split(":", 1) for ln in lines[1:])}
+        want = int(headers.get("content-length", "0"))
+        while len(body) < want:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            body += chunk
+        return status, headers, body
+
+    @staticmethod
+    def closed(s: socket.socket) -> bool:
+        try:
+            return s.recv(1) == b""
+        except ConnectionResetError:
+            return True
+        except TimeoutError:
+            return False
+
+    def post_bytes(self, body: bytes, token: str | None, extra: str = "", length: str | None = None) -> bytes:
+        auth = f"Authorization: Bearer {token}\r\n" if token else ""
+        cl = f"Content-Length: {len(body) if length is None else length}\r\n"
+        return (f"POST / HTTP/1.1\r\nHost: x\r\n{auth}Content-Type: application/json\r\n{cl}{extra}\r\n"
+                .encode() + body)
+
+    def test_an_error_response_closes_the_connection_so_the_body_is_never_the_next_request(self):
+        smuggled = b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: x\r\n\r\n"
+        s = self.sock()
+        status, headers, _ = self.http(s, self.post_bytes(smuggled, token=None))
+        self.assertEqual(status, 401)
+        self.assertEqual(headers.get("connection"), "close")
+        self.assertTrue(self.closed(s), "the unread body must not be answered as a request of its own")
+        s = self.sock()                                                        # the same with a real token: 413
+        status, headers, _ = self.http(s, self.post_bytes(b"", self.token, length=str(a2a.MAX_BODY + 1)))
+        self.assertEqual((status, headers.get("connection")), (413, "close"))
+        self.assertTrue(self.closed(s))
+        s = self.sock()                                                        # and after a parse error
+        status, _, body = self.http(s, self.post_bytes(b"{not json", self.token))
+        self.assertEqual((status, json.loads(body)["error"]["code"]), (200, a2a.PARSE_ERROR))
+        self.assertTrue(self.closed(s))
+        s = self.sock()                                                        # a good request keeps the connection
+        req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "a2a:alice/1"}}).encode()
+        status, headers, body = self.http(s, self.post_bytes(req, self.token))
+        self.assertEqual((status, json.loads(body)["error"]["code"]), (200, a2a.TASK_NOT_FOUND))
+        self.assertNotEqual(headers.get("connection"), "close")
+        status, _, body = self.http(s, self.post_bytes(req, self.token))
+        self.assertEqual(status, 200)
+
+    def test_the_body_length_is_a_plain_decimal_and_chunked_is_refused(self):
+        req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "a2a:alice/1"}}).encode()
+        for bad in ("1_0", "-1", "+10", "0x10", "10 ", "99999999", ""):
+            with self.subTest(length=bad):
+                s = self.sock()
+                status, headers, _ = self.http(s, self.post_bytes(req, self.token, length=bad))
+                self.assertIn(status, (400, 411, 413), bad)
+                self.assertEqual(headers.get("connection"), "close")
+        s = self.sock()
+        status, _, _ = self.http(s, self.post_bytes(b"", self.token, extra="Transfer-Encoding: chunked\r\n"))
+        self.assertEqual(status, 411)
+        self.assertTrue(self.closed(s))
+
+    def test_a_connection_that_sends_nothing_is_closed_after_the_timeout(self):
+        srv = a2a.make_server(self.cfg, "127.0.0.1", 0, quiet=True, conn_timeout=1)
+        self.addCleanup(srv.server_close)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        half = self.sock(srv)
+        half.sendall(b"POST / HTTP/1.1\r\nHost: x\r\n")                       # headers never finish
+        t0 = time.time()
+        self.assertTrue(self.closed(half), "a half-sent request must not hold its thread forever")
+        self.assertLess(time.time() - t0, 4)
+        no_body = self.sock(srv)
+        status, _, _ = self.http(no_body, self.post_bytes(b"", self.token, length="10"))   # body never comes
+        self.assertEqual(status, 408)
+        self.assertTrue(self.closed(no_body))
+        # the server is still fine for the next client
+        self.assertEqual(a2a.Client(f"http://127.0.0.1:{srv.server_port}", self.token, timeout=5).card()["name"],
+                         "test-bridge")
+
+    def test_a_batch_holds_one_to_thirty_two_requests(self):
+        one = {"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": {"id": "a2a:alice/1"}}
+        status, resp = self.raw(json.dumps([]).encode(), self.token)
+        self.assertEqual((status, resp["error"]["code"]), (200, a2a.INVALID_REQUEST))
+        status, resp = self.raw(json.dumps([one] * (a2a.BATCH_MAX + 1)).encode(), self.token)
+        self.assertEqual((status, resp["error"]["code"]), (200, a2a.INVALID_REQUEST))
+        status, resp = self.raw(json.dumps([one] * a2a.BATCH_MAX).encode(), self.token)
+        self.assertEqual((status, len(resp)), (200, a2a.BATCH_MAX))
 
     # -- the mapping onto the board
     def test_send_becomes_a_turn_on_the_clients_own_topic(self):
