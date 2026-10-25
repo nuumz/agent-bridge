@@ -243,7 +243,7 @@ class Server(unittest.TestCase):
             srv.server_close()
 
     def test_add_client_rejects_bad_names_and_keeps_the_token_file_private(self):
-        for bad in ("a b", "x/y", "", "+"):
+        for bad in ("a b", "x/y", "", "+", "task7"):                      # task7 would be the turn run a2a:task7
             with self.subTest(bad=bad), self.assertRaises((ValueError, boardlib.BoardError)):
                 a2a.add_client(bad)
         self.assertEqual(oct(a2a.CLIENTS.stat().st_mode & 0o777), "0o600")

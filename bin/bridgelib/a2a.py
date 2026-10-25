@@ -155,6 +155,7 @@ def agent_card(name: str, url: str, families: list[str], description: str | None
 
 # ----------------------------------------------------------------------------- clients (tokens)
 CLIENT_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")   # a2a:<name> stays a board identity; no '/' (task ids)
+TURN_NAME = re.compile(r"task\d+")                        # a2a:task<N> is the dispatched run of a turn, never a client
 
 
 def load_clients(path: Path | None = None) -> dict[str, str]:
@@ -177,9 +178,12 @@ def save_clients(clients: dict[str, str], path: Path | None = None) -> None:
 
 def add_client(name: str, path: Path | None = None) -> str:
     """A new bearer token for `name` — a lowercase slug (letters, digits, `.`, `_`, `-`), so that a2a:<name> is a
-    valid board identity and `<topic>/<seq>` task ids stay unambiguous."""
+    valid board identity and `<topic>/<seq>` task ids stay unambiguous — and never `task<N>`, the identity of a
+    dispatched turn run (`a2a:task<N>`), which would let a client answer as the bridge's own run."""
     if not CLIENT_NAME.fullmatch(name or ""):
         raise ValueError(f"a client name is a lowercase slug like laptop or bob.example (got {name!r})")
+    if TURN_NAME.fullmatch(name):
+        raise ValueError(f"{name!r} is the name of a dispatched turn run (a2a:{name}); pick another")
     boardlib.identity(topic_for(name), "client name")
     clients = load_clients(path)
     token = secrets.token_urlsafe(32)

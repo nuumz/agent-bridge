@@ -115,6 +115,17 @@ class Turns(unittest.TestCase):
         self.assertIn("cancelled: request seq", self.conn.execute(
             "SELECT body FROM messages WHERE kind='task' ORDER BY seq DESC LIMIT 1").fetchone()[0])
 
+    def test_a_family_whose_name_carries_a_digit_is_still_a_turn(self):
+        seq = boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="a2a")
+        (t,) = self.tasks()
+        self.assertEqual((t["assignee"], t["status"]), ("a2a", "queued"))
+        self.conn.execute("UPDATE tasks SET status='claimed', claimed_by=? WHERE id=?", ("a2a:task1", t["id"]))
+        self.assertTrue(boardlib.is_turn_run("a2a:task1"))
+        self.assertEqual(boardlib.open_requests_to(self.conn, self.tid, "a2a:task1"), 1)   # the run sees its turn
+        boardlib.post(self.conn, self.tid, "a2a:task1", TABLE, "done", reply_to=seq, to=USER)
+        self.assertEqual(boardlib.open_requests_to(self.conn, self.tid, "a2a:task1"), 0)
+        self.assertEqual((self.tasks()[0]["status"], self.tasks()[0]["result"]), ("done", TABLE))  # not cancelled
+
     def test_a_family_turn_reaches_the_dispatched_run_only(self):
         seq = boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="claude")
         top = self.conn.execute("SELECT MAX(seq) FROM messages").fetchone()[0]

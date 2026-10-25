@@ -347,8 +347,8 @@ whatever its env says.
   live run per family, `mode=write` only inside `--allow-write` dirs, peer-queued tasks only on request. `ask-agent`
   registers every run in `workers` (also hand-started ones) so the cap counts all of them; a dead worker fails its task,
   an expired lease (1500 s) re-queues a claimed task that has no live worker.
-- **Turns — a peer that is not running joins a room by the request.** A `request` with `to=claude|cursor|copilot`
-  (a family, not a running identity) is queued as a task in that topic for that family (`request_seq` links them;
+- **Turns — a peer that is not running joins a room by the request.** A `request` with
+  `to=claude|cursor|copilot|codex|a2a` (a family, not a running identity) is queued as a task in that topic for that family (`request_seq` links them;
   optional header lines `dir:` for the workspace and `mode: ask|plan|write`), and starts when a human runs
   `bridge-board dispatch` — one run, identity `<family>:task<N>`, told it is answering request seq N from whom, in
   which shape. Only the user, the primary or the topic's leader may call a turn (each is a full run; a member's
@@ -360,8 +360,8 @@ whatever its env says.
   hand-started `<family>#<pid>` run) reads it with `board_read mine=true` (`board_status` shows the room while a turn
   is owed) and answers with `reply_to=<seq>`; that reply closes the request and the task in one step (`blocked` →
   task `failed`), `board_task_done` is not needed; a reply by anyone else that closes the request (the requester
-  withdrawing) cancels the task. The user sees one room; Claude stays in it (`bridge-live`), the other two come in by
-  the turn.
+  withdrawing) cancels the task. The user sees one room; Claude stays in it (`bridge-live`), the other families come
+  in by the turn.
 - A bridged peer may not open topics (a `dm:` it is one side of excepted), may hold ≤5 open tasks per topic, and must stop after its wait budget: post the
   final answer, then `board_task_done` when it was dispatched (ask-agent closes the task from the parsed answer otherwise).
 - Claude needs `--allowed-tools mcp__bridge_board` and cannot use MCP tools in plan mode → with the board on, `-m ask|plan`

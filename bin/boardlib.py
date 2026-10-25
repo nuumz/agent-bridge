@@ -317,8 +317,9 @@ def may_call_turn(conn: sqlite3.Connection, tid: int, me: str) -> bool:
 
 
 def is_turn_run(me: str) -> bool:
-    """`<family>:task<N>` — the run dispatch started for a turn; the one identity a family-addressed request reaches."""
-    return re.fullmatch(r"[a-z]+:task\d+", me) is not None
+    """`<family>:task<N>` — the run dispatch started for a turn; the one identity a family-addressed request reaches.
+    A family name may carry digits after its first letter (`a2a`)."""
+    return re.fullmatch(r"[a-z][a-z0-9]*:task\d+", me) is not None
 
 
 def body_title(body: str) -> str:
