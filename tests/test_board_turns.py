@@ -202,6 +202,13 @@ class Turns(unittest.TestCase):
                 mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             board.dispatch_once(self.conn, o, ["claude"], [], "/bin/ask-agent")
         self.assertIn("task #1 (cursor): cursor is not in --agents claude", err.getvalue())
+        boardlib.post(self.conn, self.tid, USER, f"dir: {self.tmp.name}\nmode: write\n{REQUEST}", "request", to="cursor")
+        with mock.patch.object(board.subprocess, "Popen") as popen, \
+                mock.patch.object(board.B, "live_workers", return_value=[]), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:     # write turn, no --allow-write: said why
+            board.dispatch_once(self.conn, o, ["claude"], [], "/bin/ask-agent")
+        self.assertIn(f"task #2: mode=write in {Path(self.tmp.name).resolve()} — pass --allow-write", err.getvalue())
+        popen.assert_not_called()
 
     def test_live_send_gives_a_family_turn_the_rooms_dir(self):
         loader = importlib.machinery.SourceFileLoader("bridge_live_mod", str(BIN / "bridge-live"))
@@ -218,6 +225,11 @@ class Turns(unittest.TestCase):
         with mock.patch.object(live, "room_peers", return_value=peers), mock.patch("sys.stdout", new_callable=io.StringIO):
             self.assertEqual(live.send(o), 0)
         self.assertEqual(self.tasks()[-1]["dir"], str(Path(self.tmp.name).resolve()))
+        o.message, o.to = REQUEST, "a2a"                                   # an a2a turn leaves the machine: no local path
+        with mock.patch.object(live, "room_peers", return_value=peers), mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(live.send(o), 0)
+        last = self.conn.execute("SELECT body FROM messages WHERE kind='request' ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertNotIn(str(repo), last["body"])
 
     def test_the_cli_and_the_mcp_server_take_the_same_path(self):
         p = subprocess.run([sys.executable, str(BIN / "bridge-board"), "post", "room:r", REQUEST, "-k", "request",

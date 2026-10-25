@@ -427,10 +427,13 @@ def send(o) -> int:
               f"{' — ' + st['reason'] if st.get('reason') else ''}; `bridge-live start <peer> --room {o.room} -d DIR`",
               file=sys.stderr)
         return 2
-    body = o.message
-    if o.to in boardlib.FAMILIES and "dir" not in boardlib.header(body):
+    body, room_dir = o.message, None
+    # a dispatched turn works in the room's repo, not in dispatch's cwd — but an a2a turn's body leaves the machine,
+    # so a local path is never added there, and only a request becomes a turn
+    if (o.kind == "request" and o.to in boardlib.FAMILIES and o.to != "a2a"
+            and "dir" not in boardlib.header(body)):
         room_dir = next((st["dir"] for st in peers.values() if st.get("dir")), None)
-        if room_dir:                        # a dispatched turn works in the room's repo, not in dispatch's cwd
+        if room_dir:
             body = f"dir: {room_dir}\n{body}"
     conn = boardlib.connect()
     tid = boardlib.topic_id(conn, topic(o.room), USER_AUTHOR)
@@ -443,8 +446,8 @@ def send(o) -> int:
         print(f"[live] posted seq={seq} on {topic(o.room)} ({', '.join(peers)})")
         return 0
     if o.to in boardlib.FAMILIES:          # a turn: queued as that family's task, answered by a dispatched run
-        print(f"[live] posted seq={seq} on {topic(o.room)} as a {o.to} turn — start it with "
-              f"`bridge-board dispatch --agents {o.to}`; the answer lands on the board as reply_to={seq}")
+        print(f"[live] posted seq={seq} on {topic(o.room)} as a {o.to} turn{f' in {room_dir}' if room_dir else ''} — "
+              f"start it with `bridge-board dispatch --agents {o.to}`; the answer lands on the board as reply_to={seq}")
         return 0
     want = send_targets(conn, tid, o.to, {identity(p) for p in peers})   # only who the post reaches is awaited
     if not want:

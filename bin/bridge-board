@@ -375,8 +375,10 @@ def dispatch_once(conn, o, families: list[str], write_dirs: list[str], ask_agent
             waiting.append(f"task #{t['id']} and later: --max-agents {o.max_agents} reached ({', '.join(running)})")
             break
         if t["origin"] == "peer" and not o.include_peer_tasks:
+            waiting.append(f"task #{t['id']}: queued by a peer — pass --include-peer-tasks to run it")
             continue
         if t["mode"] == "write" and not (t["dir"] and str(Path(t["dir"]).resolve()) in write_dirs):
+            waiting.append(f"task #{t['id']}: mode=write in {t['dir'] or '(no dir)'} — pass --allow-write with that dir")
             continue
         fam = t["assignee"] if t["assignee"] != "any" else next((f for f in families if f not in busy_families), None)
         if fam is None or fam not in families or fam in busy_families:
