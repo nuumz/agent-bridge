@@ -23,6 +23,7 @@ sys.path.insert(0, str(BIN))
 sys.path.insert(0, str(FAKEBIN))
 
 import _fakebin  # noqa: E402
+import boardlib  # noqa: E402
 from bridgelib import core  # noqa: E402
 from bridgelib.adapters import ADAPTERS  # noqa: E402
 
@@ -182,6 +183,9 @@ class Conformance(unittest.TestCase):
     # -- the table itself
     def test_every_adapter_has_a_stub_a_fixture_and_a_row_in_expect(self):
         self.assertEqual(set(EXPECT), set(ADAPTERS), "one EXPECT row per registered family, no stale rows")
+        self.assertEqual(set(boardlib.FAMILIES), set(ADAPTERS),
+                         "a family the board can address is an adapter, and every adapter is addressable (a turn "
+                         "to it is a task dispatch can run)")
         for name, agent in ADAPTERS.items():
             with self.subTest(family=name):
                 self.assertTrue((FAKEBIN / agent.binary).is_file(), f"tests/fakebin/{agent.binary} is missing")
