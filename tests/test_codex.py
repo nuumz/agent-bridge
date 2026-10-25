@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -109,7 +110,10 @@ class CodexArgv(unittest.TestCase):
         self.assertTrue(any(o.startswith("mcp_servers.bridge_board.command=\"") and o.endswith("bridge-board\"")
                             for o in overrides), overrides)
         self.assertIn('mcp_servers.bridge_board.args=["serve"]', overrides)
-        self.assertIn('mcp_servers.bridge_board.env={AGENT_BRIDGE_AGENT="codex"}', overrides)
+        env_override = next(o for o in overrides if o.startswith("mcp_servers.bridge_board.env="))
+        table = tomllib.loads("env=" + env_override.split("=", 1)[1])["env"]       # what Codex parses it as
+        self.assertEqual(table, {"AGENT_BRIDGE_AGENT": "codex", "AGENT_BRIDGE_HOP": "1"},
+                         "the server knows its family and that it is one hop in — never the primary")
         self.assertNotIn("-c", ask)
 
     def test_preambles_name_the_sandbox_and_keep_git_history_the_users(self):

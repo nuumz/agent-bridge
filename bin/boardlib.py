@@ -142,8 +142,8 @@ def resolve_identity(conn: sqlite3.Connection, env: dict[str, str]) -> tuple[str
         return found[0], True, found[1]
     if env.get("AGENT_BRIDGE_IDENTITY"):
         return hop_identity(env["AGENT_BRIDGE_IDENTITY"], env), hop_active(env), None
-    if env.get("AGENT_BRIDGE_AGENT"):
-        return f"{env['AGENT_BRIDGE_AGENT']}@primary", hop_active(env), None
+    if env.get("AGENT_BRIDGE_AGENT"):           # under the hop marker the claim to be the primary is downgraded
+        return hop_identity(f"{env['AGENT_BRIDGE_AGENT']}@primary", env), hop_active(env), None
     raise BoardError("no identity: set AGENT_BRIDGE_AGENT in the MCP server env (bridge-sync does this)")
 
 

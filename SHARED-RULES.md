@@ -76,7 +76,7 @@ How the common options map onto each CLI:
 | `--session id` / `-c` | `--resume id --fork-session` / `--continue --fork-session` (the peer never writes into the session it resumes — with `-c` in your own directory that is yours) | `--resume id` / `--continue` | `--resume=id` / `--continue` | `exec … resume <thread_id>` / `exec … resume --last` (the exec-level flags stay before `resume`: `--sandbox`, `--cd`, `--add-dir` are not global there) |
 | `-w [name]` | `--worktree [name]` → `<repo>/.claude/worktrees/<name>` (locked) | `--worktree [name]` → `~/.cursor/worktrees/<repo>/<name>` | not supported (use `git worktree add` + `-d`) | not supported (use `git worktree add` + `-d`) |
 | `--add-dir` | `--add-dir` | `--add-dir` | `--add-dir=` | not passed: an extra root would be *writable* in `workspace-write`, and the read-only sandbox reads the disk without a grant |
-| board MCP | `--allowed-tools mcp__bridge_board` (registered user-scope by `bridge-sync`) | `--approve-mcps` (`~/.cursor/mcp.json` by `bridge-sync`) | `~/.copilot/mcp-config.json` (not written yet) | `-c mcp_servers.bridge_board.command=… -c …args=["serve"] -c …env={AGENT_BRIDGE_AGENT="codex"}` on the run itself — nothing is written to `~/.codex/config.toml` |
+| board MCP | `--allowed-tools mcp__bridge_board` (registered user-scope by `bridge-sync`) | `--approve-mcps` (`~/.cursor/mcp.json` by `bridge-sync`) | `~/.copilot/mcp-config.json` (not written yet) | `-c mcp_servers.bridge_board.command=… -c …args=["serve"] -c …env={AGENT_BRIDGE_AGENT="codex", AGENT_BRIDGE_HOP="1"}` on the run itself — nothing is written to `~/.codex/config.toml`; the marker makes a server that cannot find the run's pid `codex@hop`, never `codex@primary` |
 | output parsed from | `--output-format stream-json --verbose` (last line = `result`: `result`, `session_id`, `usage`; earlier lines feed `bridge-watch`) | `--output-format stream-json` (`assistant` chunks, `result`) | `--output-format json` JSONL (`assistant.message` content, `result.sessionId` + `usage.premiumRequests`/`totalApiDurationMs`; `EDITED=` in the bridge line when `codeChanges.filesModified` is non-empty) | `exec --json` JSONL (`thread.started.thread_id` = the session; `item.completed` items: `agent_message.text` is the answer, `command_execution` / `mcp_tool_call` the tool calls, `file_change.changes` → `EDITED=`; `turn.completed.usage` the tokens; a `turn.failed` / `error` message is the error line; no `turn.completed` = incomplete, not a success) |
 
 **Codex.** Every Codex run is `codex exec --json --skip-git-repo-check --cd <dir> --sandbox <mode>` (the bridge decides
@@ -302,7 +302,9 @@ token table on every request, so `bridge-a2a client add|remove` takes effect wit
   `board_task_done`. Identity is resolved by the server — `<agent>@primary`, `<agent>#<pid>` for an
   `ask-agent` run (pid = the peer CLI process, so every run — each dialog round included — is distinct),
   `<agent>:task<N>` for a dispatched task — by finding the run's CLI pid among its ancestors in the
-  `workers` table (cursor-agent does not forward env to MCP children), so an agent cannot impersonate another. The
+  `workers` table (cursor-agent does not forward env to MCP children), so an agent cannot impersonate another; a
+  server that finds no registered ancestor and knows only its family (`AGENT_BRIDGE_AGENT`) is `<agent>@primary`
+  without the hop marker and `<agent>@hop` with it — an env variable never grants the primary's rights. The
 `bridge-board` CLI resolves identity the same way: a shell inside a bridged run posts as that run, may not post
 `kind=decision`, open topics (a `dm:` it is one side of excepted), close a topic it does not lead, or dispatch —
 whatever its env says.
