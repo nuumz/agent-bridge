@@ -506,7 +506,8 @@ class Server(unittest.TestCase):
     def test_serve_cli_refuses_what_it_must(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_BRIDGE_")} | {"HOME": str(self.home)}
         for args, text in ((["--bind", "0.0.0.0", "--port", "0"], "non-loopback"),
-                           (["--peers", "bogus"], "--peers")):
+                           (["--peers", "bogus"], "--peers"),
+                           (["--peers", "claude,a2a"], "a2a")):      # a relay: a client's text, the operator's token
             with self.subTest(args=args):
                 home = tempfile.mkdtemp()                         # no clients.json there
                 p = subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "serve", "-d", str(self.work), *args],

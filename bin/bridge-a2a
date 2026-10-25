@@ -13,8 +13,9 @@
     bridge-a2a --version
 
 Inbound: a client you gave a token to owns one board topic `a2a:<name>` and leads it. Its message/send becomes a
-`request` there, addressed to a family from --peers (your egress gate): a turn, queued as a task that only your
-`bridge-board dispatch` starts. tasks/get reads submitted · working · completed · failed · canceled off the board;
+`request` there, addressed to a family from --peers (your egress gate; local families only — `a2a` is refused, it
+would relay the client's text onward with your token): a turn, queued as a task that only your `bridge-board dispatch`
+starts. tasks/get reads submitted · working · completed · failed · canceled off the board;
 tasks/cancel withdraws. A client never chooses the directory (-d is yours), sees only its own topic, and may ask for
 `write` only under --allow-write. Loopback by default; a non-loopback bind needs at least one client token; without
 --cert/--key the traffic is plain HTTP, so reach a remote machine through an SSH tunnel or put TLS in front.
@@ -66,10 +67,12 @@ def alive(pid: int | None) -> bool:
 # ----------------------------------------------------------------------------- serve / stop / status
 def serve(o) -> int:
     families = [f for f in o.peers.split(",") if f]
-    bad = [f for f in families if f not in ADAPTERS or f in DISABLED]
+    local = [n for n, a in ADAPTERS.items() if n not in DISABLED and not a.remote]
+    bad = [f for f in families if f not in local]
     if not families or bad:
-        print(f"bridge-a2a: --peers must name enabled adapters out of "
-              f"{', '.join(n for n in ADAPTERS if n not in DISABLED)} (got {o.peers!r})", file=sys.stderr)
+        print(f"bridge-a2a: --peers must name enabled local adapters out of {', '.join(local)} (got {o.peers!r})"
+              + (" — a2a would relay a client's text to another remote with your own token, and pointed at this "
+                 "server it would queue a turn for every turn" if "a2a" in bad else ""), file=sys.stderr)
         return 2
     workdir = Path(o.dir).resolve()
     if not workdir.is_dir():
