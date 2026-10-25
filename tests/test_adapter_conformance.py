@@ -206,6 +206,8 @@ class Conformance(unittest.TestCase):
                     self.assertTrue(present(argv, x["git_deny"](cmd)), (cmd, argv))
                 for cmd in core.GIT_DISCARD:            # the caller's checkout: their uncommitted work stays
                     self.assertTrue(present(argv, x["git_deny"](cmd)), (cmd, argv))
+                for cmd in core.BRIDGE_CMDS:            # one hop: no bridge command, local or over the network
+                    self.assertTrue(present(argv, x["git_deny"](cmd)), (cmd, argv))
             if not agent.supports_deny:
                 self.assertIsNone(x["git_deny"], "a family without a deny flag declares a hold or a sandbox instead")
                 self.assertTrue(x["hold"] or x.get("no_commit"),
@@ -250,7 +252,7 @@ class Conformance(unittest.TestCase):
     def test_run_answers_with_the_bridge_line_and_the_dry_run_argv(self, name, agent, x):
         expected = self.dry(name)
         before = len(self.calls())
-        p = self.ask(name, "-d", str(self.work), PROMPT)
+        p = self.ask(name, "-d", str(self.work), PROMPT, AGENT_BRIDGE_A2A_TOKEN="s3cret-token")
         self.assertEqual(p.returncode, 0, p.stderr)
         parsed = agent.parse(_fakebin.fixture(agent.binary))
         self.assertIn(parsed.result, p.stdout)
@@ -264,6 +266,9 @@ class Conformance(unittest.TestCase):
         self.assertRegex(call["env"].get(core.IDENTITY_VAR, ""), rf"^{name}#\d+$")
         self.assertFalse([k for k in call["env"] if k.startswith(core.PRIVATE_ENV_PREFIXES)],
                          "the caller's session identity never reaches the peer")
+        self.assertEqual("AGENT_BRIDGE_A2A_TOKEN" in call["env"], name == "a2a",
+                         "the A2A token reaches the a2a run and no other peer (a prompt-injected peer could print it)")
+        self.assertNotIn("s3cret-token", p.stdout + p.stderr)
 
     @per_family
     def test_config_hold_during_the_run_and_released_after(self, name, agent, x):

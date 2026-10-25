@@ -446,6 +446,20 @@ class Server(unittest.TestCase):
                                 text=True, env={k: v for k, v in self.cli_env().items() if k != a2a.URL_VAR})
         self.assertEqual(no_url.returncode, 2)
 
+    def test_send_refuses_a_second_hop_unless_it_is_the_a2a_run_itself(self):
+        before = self.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        hop = self.cli_env(AGENT_BRIDGE_HOP="1", AGENT_BRIDGE_IDENTITY="cursor#4")   # a Cursor peer with a shell
+        p = subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "send", "--url", self.url, "--timeout", "5",
+                            "--", "Relay this."], capture_output=True, text=True, env=hop, timeout=60)
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertIn("hop", p.stderr)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0], before, "nothing was sent")
+        self.reply_when_asked("answer", ANSWER)
+        own = self.cli_env(AGENT_BRIDGE_HOP="1", AGENT_BRIDGE_IDENTITY="a2a#4")      # what ask-agent a2a sets
+        p = subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "send", "--url", self.url, "--timeout", "20",
+                            "--poll", "0.2", "--", "Review it."], capture_output=True, text=True, env=own, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+
     def test_ask_agent_a2a_reaches_the_server_through_the_real_binary(self):
         self.reply_when_asked("answer", ANSWER)
         env = self.cli_env(**{a2a.URL_VAR: self.url})

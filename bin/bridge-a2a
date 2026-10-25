@@ -21,8 +21,9 @@ tasks/cancel withdraws. A client never chooses the directory (-d is yours), sees
 --cert/--key the traffic is plain HTTP, so reach a remote machine through an SSH tunnel or put TLS in front.
 
 Outbound: `send` is what `ask-agent a2a` runs (the `a2a` adapter). URL from --url or AGENT_BRIDGE_A2A_URL; the token
-only from AGENT_BRIDGE_A2A_TOKEN — never on a command line. Exit 0 completed · 1 failed / canceled / rejected / timed
-out (the state and the peer's message go to stderr as `[a2a] <state>: …`) · 2 usage.
+only from AGENT_BRIDGE_A2A_TOKEN — never on a command line, and never in any other peer's environment. Exit 0 completed
+· 1 failed / canceled / rejected / timed out (the state and the peer's message go to stderr as `[a2a] <state>: …`) ·
+2 usage · 3 hop guard (inside a bridged run that is not the a2a run itself).
 Spec of the mapping: docs/PROTOCOL.md §10.4. State: ~/.agent-bridge/state/a2a/.
 """
 from __future__ import annotations
@@ -36,9 +37,10 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import boardlib  # noqa: E402
 from bridgelib import a2a, protocol  # noqa: E402
 from bridgelib.adapters import ADAPTERS  # noqa: E402
-from bridgelib.core import DISABLED, detach  # noqa: E402
+from bridgelib.core import DISABLED, IDENTITY_VAR, detach, hop_active  # noqa: E402
 
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
 
@@ -195,6 +197,12 @@ def card(o) -> int:
 
 
 def send(o) -> int:
+    # one hop: inside a bridged run only the a2a run itself (what `ask-agent a2a` spawns) may talk to the remote —
+    # a local peer with a shell must not make a second hop over the network with the operator's token
+    if hop_active() and boardlib.family(os.environ.get(IDENTITY_VAR, "")) != "a2a":
+        print(f"bridge-a2a: refusing — inside a bridged run (one hop only; this is not the a2a run). "
+              f"Do the work here.", file=sys.stderr)
+        return 3
     url = o.url or os.environ.get(a2a.URL_VAR)
     if not url:
         print(f"bridge-a2a: no URL — pass --url or set {a2a.URL_VAR}", file=sys.stderr)

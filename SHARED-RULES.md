@@ -95,8 +95,9 @@ sends one `message/send` and polls `tasks/get` until a terminal state, printing 
 `result`) that the adapter parses — `result.text` is the answer, `result.context_id` the session (`--session` /
 `--conv` continue that context; `-c` continues the last one used for that URL), a state other than `completed` is
 the error line (`[a2a] <state>: <the peer's message>` on stderr, so a usage-limit message there marks the quota like
-the others). The token is read from `AGENT_BRIDGE_A2A_TOKEN` only, never passed on a command line, and never appears in
-`--dry-run` or a run log. No deny flag and no hold: the bridge sends text, a mode and a shape — the remote's own rails
+the others). The token is read from `AGENT_BRIDGE_A2A_TOKEN` only, never passed on a command line, never appears in
+`--dry-run` or a run log, and is dropped from every other peer's environment (`core.PRIVATE_ENV_VARS`; the adapter's
+`env_keep` names what its run alone may see). No deny flag and no hold: the bridge sends text, a mode and a shape — the remote's own rails
 apply. `-w` is not supported; `--add-dir` is not sent (a local path grant means nothing to the remote). A turn
 `to=a2a` that `dispatch` runs gets the request body alone and the bridge posts the remote's reply (§6). The server
 side (`bridge-a2a serve`) is in §6 and `docs/PROTOCOL.md` §10.4; verified end to end in `tests/test_a2a.py` against
@@ -180,7 +181,9 @@ it in the current turn** — never on the agent's own judgement.
 never call a bridge command back. Enforced: `ask-agent` exports `AGENT_BRIDGE_HOP=1` to the peer and exits 3
 when the variable is present (any value — `AGENT_BRIDGE_HOP=` is still a hop) **or** when a registered bridged run is
 among its ancestor processes (a peer that scrubs its env is still inside the run); `bridge-board dispatch` refuses on
-the same two signals; `ask-claude` additionally denies `Bash(ask-*:*)`.
+the same two signals; `bridge-a2a send` exits 3 under the marker unless it is the `a2a` run itself (no second hop
+over the network with the operator's token); Claude and Copilot write runs additionally deny the bridge commands
+(`ask-*`, `bridge-a2a`) by name.
 
 **Run it detached from an agent shell.** Claude Code's Bash tool caps a foreground call at
 120 s (600 s max) — a foreground bridge call is

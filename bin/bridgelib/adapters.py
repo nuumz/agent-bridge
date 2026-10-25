@@ -497,8 +497,8 @@ class Copilot(Adapter):
         # session to resume and no duration/cost in the run logs
         a = ["--no-ask-user", "--output-format", "json"]
         if o.mode == "write":
-            a += ["--allow-all-tools"]
-            for c in GIT_DENY + (() if getattr(o, "discard_ok", False) else GIT_DISCARD):
+            a += ["--allow-all-tools"]            # …minus history, the caller's checkout, and a second hop
+            for c in GIT_DENY + (() if getattr(o, "discard_ok", False) else GIT_DISCARD) + BRIDGE_CMDS:
                 a += [f"--deny-tool=shell({c})", f"--deny-tool=shell({c}:*)"]
         else:
             a += ["--deny-tool=write", "--deny-tool=shell"]

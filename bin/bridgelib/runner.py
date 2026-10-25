@@ -43,9 +43,9 @@ def protocol(conv: Conv | None) -> str:
 
 
 def run(binary: str, argv: list[str], cwd: str, timeout: int, log: Path, env_extra: dict[str, str] | None = None,
-        on_start: Callable[[int], None] | None = None) -> int:
+        on_start: Callable[[int], None] | None = None, keep: tuple[str, ...] = ()) -> int:
     err = log.with_suffix(".err")
-    env = peer_env(env_extra)
+    env = peer_env(env_extra, keep)
     with open(log, "w") as out, open(err, "w") as e:
         # own process group: a timeout or a signal to ask-agent must take the peer AND its children down,
         # otherwise a killed run leaves node/rg/MCP processes burning CPU (and tokens) in the background
@@ -300,7 +300,7 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
         conv.record(frm, agent.name, prompt, author=USER_AUTHOR if frm == "caller" else None)
 
     board = BoardRun(agent, o.board, log, o.timeout)
-    status = run(binary, agent.argv(o, full_prompt), o.dir, o.timeout, log, board.env, board.on_start)
+    status = run(binary, agent.argv(o, full_prompt), o.dir, o.timeout, log, board.env, board.on_start, agent.env_keep)
     if status != 0:
         err_txt = log.with_suffix(".err").read_text(errors="replace")
         out_txt = log.read_text(errors="replace")
@@ -349,7 +349,8 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
                    "Do not narrate, do not call tools.")
         rlog = RUNS / f"{stamp}-{agent.name}.recover.json"
         (RUNS / f"{stamp}-{agent.name}.recover.prompt.txt").write_text(rprompt + "\n")
-        if run(binary, agent.resume_argv(o, parsed.session, rprompt), o.dir, o.timeout, rlog, board.env) != 0:
+        if run(binary, agent.resume_argv(o, parsed.session, rprompt), o.dir, o.timeout, rlog, board.env,
+               keep=agent.env_keep) != 0:
             print(f"ask-agent: recovery run failed (see {rlog.with_suffix('.err')}); resume by hand with --session "
                   f"{parsed.session}", file=sys.stderr)
             board.finish(1, parsed)
