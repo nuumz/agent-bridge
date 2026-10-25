@@ -300,6 +300,49 @@ class Server(unittest.TestCase):
                              capture_output=True, text=True, env=env)
         self.assertNotIn(self.token, dry.stdout)
         self.assertEqual(json.loads(dry.stdout)["binary"], str(BIN / "bridge-a2a"))
+        with_dir = subprocess.run([sys.executable, str(BIN / "ask-agent"), "a2a", "--dry-run", "-d", str(self.work),
+                                   "--add-dir", str(self.home), "q"], capture_output=True, text=True, env=env)
+        self.assertNotIn("--add-dir", json.loads(with_dir.stdout)["argv"], "a local path grant never leaves the machine")
+
+    def turn_to_a2a(self, shape: str = "one line") -> tuple[int, int, int]:
+        """A local room with a turn for the remote, claimed the way dispatch claims it: (topic id, request seq, task id)."""
+        tid, _ = boardlib.open_topic(self.conn, "room:r", "user:tester", False)
+        seq = boardlib.post(self.conn, tid, "user:tester", f"shape: {shape}\n\nReview it.", "request", to="a2a")
+        task = self.conn.execute("SELECT id FROM tasks WHERE request_seq=? AND topic_id=?", (seq, tid)).fetchone()["id"]
+        self.conn.execute("UPDATE tasks SET status='claimed', claimed_by=? WHERE id=?", (f"a2a:task{task}", task))
+        self.conn.commit()
+        return tid, seq, task
+
+    def dispatched(self, task: int, *args: str) -> subprocess.CompletedProcess:
+        env = self.cli_env(**{a2a.URL_VAR: self.url, "AGENT_BRIDGE_TASK": str(task),
+                              "AGENT_BRIDGE_IDENTITY": f"a2a:task{task}"})
+        return subprocess.run([sys.executable, str(BIN / "ask-agent"), "a2a", "-d", str(self.work), "-t", "30", *args,
+                               "Review it."], capture_output=True, text=True, env=env, timeout=90)
+
+    def test_a_dispatched_turn_to_a2a_closes_its_request_through_the_bridge(self):
+        tid, seq, task = self.turn_to_a2a()
+        self.reply_when_asked("answer", ANSWER)
+        p = self.dispatched(task)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        (reply,) = self.conn.execute("SELECT author, kind, body, addressee FROM messages WHERE topic_id=? AND reply_to=?",
+                                     (tid, seq)).fetchall()
+        self.assertEqual(tuple(reply), (f"a2a:task{task}", "answer", ANSWER, "user:tester"))
+        self.assertEqual(boardlib.open_requests_to(self.conn, tid, f"a2a:task{task}"), 0)
+        row = self.conn.execute("SELECT status, result FROM tasks WHERE id=?", (task,)).fetchone()
+        self.assertEqual((row["status"], row["result"]), ("done", ANSWER))
+        self.assertNotIn(self.token, p.stdout + p.stderr)
+
+    def test_a_remote_blocked_fails_the_turn_with_a_missing_line(self):
+        tid, seq, task = self.turn_to_a2a()
+        self.reply_when_asked("blocked", "missing: the build log; default: none")
+        p = self.dispatched(task)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        (reply,) = self.conn.execute("SELECT author, kind, body FROM messages WHERE topic_id=? AND reply_to=?",
+                                     (tid, seq)).fetchall()
+        self.assertEqual((reply["author"], reply["kind"]), (f"a2a:task{task}", "blocked"))
+        self.assertTrue(reply["body"].startswith("missing: "), reply["body"])
+        self.assertIn("the build log", reply["body"])
+        self.assertEqual(self.conn.execute("SELECT status FROM tasks WHERE id=?", (task,)).fetchone()["status"], "failed")
 
     def test_serve_cli_refuses_what_it_must(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_BRIDGE_")} | {"HOME": str(self.home)}

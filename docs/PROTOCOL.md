@@ -205,7 +205,10 @@ the message or not at all. Only the user, the primary or the topic's leader may 
 peer's request to a family is refused. Nothing runs until a human runs `bridge-board dispatch`; the run gets the
 identity `<family>:task<N>`, is told which request it answers and in which shape, and its closing reply closes the
 request and the task together (`blocked` → task failed). A closing reply by anyone else (the requester withdrawing,
-the user) cancels the task.
+the user) cancels the task. When the run ends without having posted that reply — a remote family (§10.4) has no board
+tools; a run crashed or answered off the board — the transport posts it from the run's result as `<family>:task<N>`:
+`answer` with the text, or `blocked` with a `missing:` line when the run failed or the text misses the request's
+shape (§6.3). A turn therefore always closes its request; nothing else is ever posted on a run's behalf.
 
 ## 7. Topics
 
@@ -340,8 +343,11 @@ Outbound, `bridge-a2a send` (what `ask-agent a2a` runs through the `a2a` adapter
 `message/send` and polls `tasks/get` until a terminal state, printing JSON Lines — `card`, `task` per state change,
 `result` — so the adapter's `parse()` and a human read one stream. The remote URL comes from `AGENT_BRIDGE_A2A_URL`
 and the token from `AGENT_BRIDGE_A2A_TOKEN`, environment only, never a command line. The bridge sends text, a mode
-and a shape; no credential, no path grant, no command — the remote agent's own rails are the rails, and a request
-`to=a2a` on the board is a turn to that remote like any other family.
+and a shape; no credential, no path grant (`--add-dir` is not forwarded), no command — the remote agent's own rails
+are the rails. A request `to=a2a` on the board is a turn to that remote like any other family, with two differences
+on this side: `dispatch` sends it the request body alone (no topic, identity, requester or other messages — the
+remote has no board tools and should learn nothing local), and the bridge posts the remote's reply as `a2a:task<N>`
+from the run's result (§6.5) — `answer`, or `blocked` with a `missing:` line when the remote task failed.
 
 ## 11. Conformance
 

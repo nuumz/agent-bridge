@@ -33,6 +33,8 @@ class Adapter:
     supports_deny = False
     recovery = False          # narration-only detection + auto --resume (Cursor)
     rules_mirror = ""         # where bridge-sync mirrors ~/.claude/CLAUDE.md for this peer
+    remote = False            # the run leaves the machine: no board tools, no local paths or messages in its prompt
+    env_keep: tuple[str, ...] = ()   # private variables (core.PRIVATE_ENV_VARS) this peer alone may see
 
     def resolve(self) -> str | None:
         return find_bin(self.binary, self.skip_bin_substr)
@@ -679,6 +681,8 @@ class A2A(Adapter):
     name, binary = "a2a", "bridge-a2a"
     rules_mirror = "none — the remote agent keeps its own rules"
     URL_VAR, TOKEN_VAR = "AGENT_BRIDGE_A2A_URL", "AGENT_BRIDGE_A2A_TOKEN"
+    remote = True
+    env_keep = (TOKEN_VAR,)
 
     def resolve(self):
         own = ROOT / "bin" / self.binary
@@ -693,9 +697,7 @@ class A2A(Adapter):
              "--timeout", str(max(int(getattr(o, "timeout", 900)) - 5, 5))]   # the client gives up before the kill
         if o.model:
             a += ["--model", o.model]
-        for d in o.add_dir:
-            a += ["--add-dir", d]
-        return a
+        return a                                 # no --add-dir: a local path grant means nothing to the remote (SECURITY.md)
 
     def argv(self, o, prompt):
         a = self._base(o)

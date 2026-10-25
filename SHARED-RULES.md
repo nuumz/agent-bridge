@@ -90,15 +90,17 @@ flags, the `-c mcp_servers.*` overrides (documented TOML parsing, undocumented f
 `--json` output is the stream above, then update this paragraph.
 
 **A2A (remote).** `ask-agent a2a` runs `bridge-a2a send --url $AGENT_BRIDGE_A2A_URL --mode <mode> --timeout <t-5>
-[--model M] [--add-dir D] [--context <id>|last] -- <prompt>`: the bridge's own client fetches the remote agent card,
+[--model M] [--context <id>|last] -- <prompt>`: the bridge's own client fetches the remote agent card,
 sends one `message/send` and polls `tasks/get` until a terminal state, printing JSON Lines (`card`, `task` per state,
 `result`) that the adapter parses — `result.text` is the answer, `result.context_id` the session (`--session` /
 `--conv` continue that context; `-c` continues the last one used for that URL), a state other than `completed` is
 the error line (`[a2a] <state>: <the peer's message>` on stderr, so a usage-limit message there marks the quota like
 the others). The token is read from `AGENT_BRIDGE_A2A_TOKEN` only, never passed on a command line, and never appears in
 `--dry-run` or a run log. No deny flag and no hold: the bridge sends text, a mode and a shape — the remote's own rails
-apply. `-w` is not supported; `--add-dir` is a hint the remote may ignore. The server side (`bridge-a2a serve`) is in
-§6 and `docs/PROTOCOL.md` §10.4; verified end to end in `tests/test_a2a.py` against the real binary on loopback.
+apply. `-w` is not supported; `--add-dir` is not sent (a local path grant means nothing to the remote). A turn
+`to=a2a` that `dispatch` runs gets the request body alone and the bridge posts the remote's reply (§6). The server
+side (`bridge-a2a serve`) is in §6 and `docs/PROTOCOL.md` §10.4; verified end to end in `tests/test_a2a.py` against
+the real binary on loopback.
 
 **Copilot workspace bootstrap.** Each prompt names its resolved cwd, nearest git root (including a worktree's
 `.git` file), existing `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` / `.github/copilot-instructions.md` files from root
@@ -360,8 +362,11 @@ whatever its env says.
   hand-started `<family>#<pid>` run) reads it with `board_read mine=true` (`board_status` shows the room while a turn
   is owed) and answers with `reply_to=<seq>`; that reply closes the request and the task in one step (`blocked` →
   task `failed`), `board_task_done` is not needed; a reply by anyone else that closes the request (the requester
-  withdrawing) cancels the task. The user sees one room; Claude stays in it (`bridge-live`), the other families come
-  in by the turn.
+  withdrawing) cancels the task. When the run ends without that reply (a remote family has no board tools; a run
+  crashed or answered off the board), `ask-agent` posts it from the run's result as `<family>:task<N>` — `answer`, or
+  `blocked` with a `missing:` line when the run failed or the text misses the shape — so a turn always closes its
+  request. A remote family's run (`a2a`) is given the request body alone: no topic, identity, requester or recent
+  messages. The user sees one room; Claude stays in it (`bridge-live`), the other families come in by the turn.
 - A bridged peer may not open topics (a `dm:` it is one side of excepted), may hold ≤5 open tasks per topic, and must stop after its wait budget: post the
   final answer, then `board_task_done` when it was dispatched (ask-agent closes the task from the parsed answer otherwise).
 - Claude needs `--allowed-tools mcp__bridge_board` and cannot use MCP tools in plan mode → with the board on, `-m ask|plan`

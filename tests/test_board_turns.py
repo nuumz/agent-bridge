@@ -19,6 +19,8 @@ sys.path.insert(0, str(BIN))
 
 import boardlib  # noqa: E402
 from bridgelib import ledger  # noqa: E402
+from bridgelib.adapters import ADAPTERS, Parsed  # noqa: E402
+from bridgelib.runner import BoardRun  # noqa: E402
 
 USER, PRIMARY, CURSOR_RUN, LIVE = "user:tester", "claude@primary", "cursor:task1", "claude@live:p"
 REQUEST = "shape: table file:line · claim · evidence\n\nList every caller of post()."
@@ -126,6 +128,55 @@ class Turns(unittest.TestCase):
         self.assertEqual(boardlib.open_requests_to(self.conn, self.tid, "a2a:task1"), 0)
         self.assertEqual((self.tasks()[0]["status"], self.tasks()[0]["result"]), ("done", TABLE))  # not cancelled
 
+    def run_of(self, identity: str, task_id: int) -> BoardRun:
+        """What ask-agent builds under dispatch: the identity and task id come from the environment."""
+        self.conn.execute("UPDATE tasks SET status='claimed', claimed_by=? WHERE id=?", (identity, task_id))
+        with mock.patch.dict(os.environ, {"AGENT_BRIDGE_IDENTITY": identity, "AGENT_BRIDGE_TASK": str(task_id)}):
+            return BoardRun(ADAPTERS[boardlib.family(identity)], True, Path(self.tmp.name) / "run.json", 60)
+
+    def replies(self, seq: int) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT author, kind, body, addressee FROM messages WHERE "
+                                                   "reply_to=? ORDER BY seq", (seq,))]
+
+    def test_the_bridge_answers_a_turn_whose_run_did_not(self):
+        seq = boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="cursor")     # the run answered: as is
+        self.run_of(CURSOR_RUN, 1).finish(0, Parsed(TABLE))
+        self.assertEqual(self.replies(seq), [{"author": CURSOR_RUN, "kind": "answer", "body": TABLE, "addressee": USER}])
+        self.assertEqual(boardlib.open_requests_to(self.conn, self.tid, CURSOR_RUN), 0)
+        self.assertEqual((self.tasks()[0]["status"], self.tasks()[0]["result"]), ("done", TABLE))
+        seq = boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="cursor")     # off shape: blocked
+        self.run_of("cursor:task2", 2).finish(0, Parsed("three callers, trust me"))
+        (r,) = self.replies(seq)
+        self.assertEqual((r["author"], r["kind"]), ("cursor:task2", "blocked"))
+        self.assertIn("missing: an answer in the request's shape", r["body"])
+        self.assertIn("three callers, trust me", r["body"])
+        self.assertEqual(self.tasks()[1]["status"], "failed")
+        seq = boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="a2a")        # the run failed: blocked
+        self.run_of("a2a:task3", 3).finish(1, Parsed("A2A task failed: missing: the build log", is_error=True))
+        (r,) = self.replies(seq)
+        self.assertEqual((r["author"], r["kind"]), ("a2a:task3", "blocked"))
+        self.assertIn("missing: an answer — the run ended with exit 1", r["body"])
+        self.assertIn("A2A task failed: missing: the build log", r["body"])
+        self.assertEqual(self.tasks()[2]["status"], "failed")
+        self.assertEqual(boardlib.open_requests_to(self.conn, self.tid, "a2a:task3"), 0)
+        seq = boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="a2a")        # no text at all
+        self.run_of("a2a:task4", 4).finish(143, None)
+        (r,) = self.replies(seq)
+        self.assertEqual(r["kind"], "blocked")
+        self.assertIn("exit 143", r["body"])
+        seq = boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="a2a")        # withdrawn: nothing to say
+        run = self.run_of("a2a:task5", 5)
+        boardlib.post(self.conn, self.tid, USER, "never mind", "done", reply_to=seq)
+        run.finish(0, Parsed(TABLE))
+        self.assertEqual([r["author"] for r in self.replies(seq)], [USER])
+        self.assertEqual(self.tasks()[4]["status"], "cancelled")
+        seq = boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="cursor")     # the run posted itself
+        run = self.run_of("cursor:task6", 6)
+        boardlib.post(self.conn, self.tid, "cursor:task6", TABLE, "done", reply_to=seq, to=USER)
+        run.finish(0, Parsed(TABLE))
+        self.assertEqual(len(self.replies(seq)), 1)
+        self.assertEqual(self.tasks()[5]["status"], "done")
+
     def test_a_family_turn_reaches_the_dispatched_run_only(self):
         seq = boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="claude")
         top = self.conn.execute("SELECT MAX(seq) FROM messages").fetchone()[0]
@@ -191,8 +242,20 @@ class Turns(unittest.TestCase):
         self.assertIn("board_read(topic, mine=true)", prompt)
         self.assertEqual(popen.call_args.kwargs["env"]["AGENT_BRIDGE_IDENTITY"], "cursor:task1")
         self.assertEqual(self.tasks()[0]["claimed_by"], "cursor:task1")
+        self.assertIn("Recent messages on the topic", prompt)
         plain = board.task_prompt({"id": 2, "topic": "tasks", "title": "t", "body": "b", "request_seq": None}, "x")
         self.assertIn("board_task_done(2, <result>)", plain)
+        # a remote family has no board tools and should learn nothing local: the request, its shape, nothing else
+        boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="a2a")
+        with mock.patch.object(board.subprocess, "Popen") as popen, mock.patch.object(board.B, "live_workers",
+                                                                                        return_value=[]):
+            self.assertEqual(board.dispatch_once(self.conn, o, ["a2a"], [], "/bin/ask-agent"), ["#2→a2a"])
+        remote = popen.call_args.args[0][-1]
+        self.assertIn(REQUEST, remote)
+        self.assertIn("shape", remote)
+        for local in ("board_", "room:r", "task #", USER, "Recent messages"):
+            self.assertNotIn(local, remote)
+        self.assertEqual(popen.call_args.kwargs["env"]["AGENT_BRIDGE_IDENTITY"], "a2a:task2")
 
     def test_the_cli_and_the_mcp_server_take_the_same_path(self):
         p = subprocess.run([sys.executable, str(BIN / "bridge-board"), "post", "room:r", REQUEST, "-k", "request",

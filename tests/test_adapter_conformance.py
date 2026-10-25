@@ -109,7 +109,7 @@ EXPECT = {
         git_deny=None, hold=None,
         no_commit="the remote agent's own rails: the bridge sends text, a mode and a shape, never a credential, a "
                   "path grant or a command",
-        add_dir=lambda d: ("--add-dir", d), model=lambda m: ("--model", m),
+        add_dir=None, model=lambda m: ("--model", m),
         resume=lambda s: ("--context", s), cont=("--context", "last"),
         quota="[a2a] failed: You've hit your usage limit. Try again in 3 hours.",
     ),
@@ -223,14 +223,17 @@ class Conformance(unittest.TestCase):
     @per_family
     def test_add_dir_model_and_session_pass_through(self, name, agent, x):
         argv = self.dry(name, "--no-board", "--add-dir", str(self.extra), "-M", "model-x", "--session", "sess-1")
-        self.assertTrue(present(argv, x["add_dir"](str(self.extra))), argv)
+        if x["add_dir"] is None:                             # no path grant for this peer, asked for or not
+            self.assertNotIn(str(self.extra), " ".join(argv), argv)
+        else:
+            self.assertTrue(present(argv, x["add_dir"](str(self.extra))), argv)
         self.assertTrue(present(argv, x["model"]("model-x")), argv)
         self.assertTrue(present(argv, x["resume"]("sess-1")), argv)
         self.assertFalse(present(argv, x["cont"]), argv)
         latest = self.dry(name, "--no-board", "-c")
         self.assertTrue(present(latest, x["cont"]), latest)
         self.assertFalse(present(latest, x["resume"]("sess-1")), latest)
-        self.assertFalse(present(latest, x["add_dir"](str(self.extra))), "no grant that was not asked for")
+        self.assertNotIn(str(self.extra), " ".join(latest), "no grant that was not asked for")
 
     # -- parse
     @per_family
