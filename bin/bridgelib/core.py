@@ -173,10 +173,10 @@ def _signal(procs, sig: int) -> None:
             pass
 
 
-def _end_group(proc: subprocess.Popen, grace: int) -> None:
-    """SIGTERM the group, SIGKILL the direct child after `grace` s, then SIGKILL what the child left behind in the
-    group (a verify command's children that ignore SIGTERM and still hold the pipes)."""
-    kill_tree(proc, grace=grace)
+def end_group(proc: subprocess.Popen, grace: int, sig: int = signal.SIGTERM) -> None:
+    """`sig` (SIGTERM) to the group, SIGKILL the direct child after `grace` s, then SIGKILL what the child left behind
+    in the group (a peer's MCP server or a verify command's build that ignores SIGTERM and still holds the pipes)."""
+    kill_tree(proc, sig, grace=grace)
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except OSError:                     # ESRCH: gone; EPERM: macOS, when what is left of the group is a zombie
@@ -201,13 +201,25 @@ def run_tool(argv, *, input: str | None = None, cwd: str | Path | None = None, t
             _CHILDREN.add(proc)
         out, err = proc.communicate(input, timeout=timeout)
     except subprocess.TimeoutExpired:
-        _end_group(proc, grace=10)
-        out, err = proc.communicate()
+        end_group(proc, grace=10)
+        try:
+            out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            # a descendant that left the group (setsid: a build daemon) still holds the pipes — let go of our ends
+            # rather than wait for it forever; what it printed so far is lost, the timeout itself is the result
+            for f in (proc.stdout, proc.stderr):
+                if f is not None:
+                    f.close()
+            out, err = "", ""
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err)
     except BaseException:
         # grace 5: ask-agent's own forward SIGKILLs its peer at 3 s, so it has exited (or is past that) by then
         if proc is not None:
-            _end_group(proc, grace=5)
+            end_group(proc, grace=5)
         raise
     finally:
         if proc is not None:

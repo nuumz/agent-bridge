@@ -12,8 +12,8 @@ against). `FAKEBIN_*` variables script a failure path; nothing here ever reaches
     FAKEBIN_STDERR    print this on stderr first (a quota message, a crash line)
     FAKEBIN_STDOUT    print exactly this instead of the fixture (a partial stream, garbage, nothing at all)
     FAKEBIN_RESULT    replace the fixture's canned answer (ANSWER) with this text, e.g. one that ends with [[ASK]]
-    FAKEBIN_SLEEP     seconds to sleep before answering, after spawning a `sleep` child whose pid is logged — a
-                      timeout must take the whole process group down, child included
+    FAKEBIN_SLEEP     seconds to sleep before answering, after spawning a `sleep` child (deaf to SIGTERM) whose pid
+                      is logged — a timeout must take the whole process group down, SIGKILL included
     FAKEBIN_VERSION   what `--version` prints (default: a realistic string per CLI; `none` prints nothing)
 
 `tests/test_adapter_conformance.py` drives every adapter through these; other tests may use them the same way.
@@ -46,7 +46,9 @@ def main(binary: str) -> int:
             print(version)
         return 0
     sleep = float(os.environ.get("FAKEBIN_SLEEP") or 0)
-    child = subprocess.Popen(["sleep", str(int(sleep) + 60)]) if sleep else None   # same process group as the stub
+    # same process group as the stub, and deaf to SIGTERM (an MCP server or a build that ignores it): the bridge's
+    # timeout must SIGKILL the group, not just signal it
+    child = subprocess.Popen(["sh", "-c", f'trap "" TERM; exec sleep {int(sleep) + 60}']) if sleep else None
     record = {"binary": binary, "argv": argv, "cwd": os.getcwd(), "pid": os.getpid(),
               "child_pid": child.pid if child else None,
               "env": {k: v for k, v in os.environ.items() if k.startswith(ENV_PREFIXES)}}

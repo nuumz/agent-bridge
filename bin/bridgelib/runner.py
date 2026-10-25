@@ -18,9 +18,8 @@ import boardlib
 
 from . import evidence
 from .adapters import Adapter, Parsed
-from .core import (BOARD_PROTOCOL, STATE, HOP_VAR, IDENTITY_VAR, QUOTA_TTL, RUNS, TASK_VAR, err_summary, kill_tree,
-                   peer_env,
-                   quota_block, quota_clear, quota_hit, quota_mark)
+from .core import (BOARD_PROTOCOL, STATE, HOP_VAR, IDENTITY_VAR, QUOTA_TTL, RUNS, TASK_VAR, end_group, err_summary,
+                   kill_tree, peer_env, quota_block, quota_clear, quota_hit, quota_mark)   # kill_tree: bridge-live's
 
 CONV_DIR = STATE / "conv"
 ASK_RE = re.compile(r"^\s*\[\[ASK\]\]\s*(.+?)\s*$", re.M)
@@ -55,14 +54,14 @@ def run(binary: str, argv: list[str], cwd: str, timeout: int, log: Path, env_ext
             on_start(proc.pid)
 
         def forward(signum: int, _frame: Any) -> None:
-            kill_tree(proc, signum, grace=3)
+            end_group(proc, 3, signum)         # the peer gets the signal; what ignores it goes with the group
             raise SystemExit(128 + signum)
 
         previous = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
         try:
             return proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            kill_tree(proc)
+            end_group(proc, 10)                # SIGTERM, then SIGKILL the leader and whatever it left in the group
             return 143
         finally:
             for s, h in previous.items():

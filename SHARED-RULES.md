@@ -32,7 +32,8 @@ ask-agent --list
 ```
 
 Exit codes: 0 ok · 1 peer error · 2 usage · 3 hop guard · 4 disabled · 5 peer asked back · 6 cursor/codex write refused ·
-**7 peer out of quota** · 127 not installed · 143 killed at `-t`. Every failure prints one `[bridge] error: <the peer's
+**7 peer out of quota** · 127 not installed · 143 killed at `-t` (SIGTERM to the run's process group, then SIGKILL for
+whatever in it ignored that). Every failure prints one `[bridge] error: <the peer's
 own first stderr line>` before the raw dump — scripts (`bridge-panel`) read that line, never the dump.
 
 - **Default mode is `ask` — read-only.** `plan` is read-only too. Only `-m write` may touch files.
@@ -209,8 +210,11 @@ orphan loop firing "interim" notifications at the caller, and a bare `sleep` is 
 killed run does not leave waiters polling forever — launch with `--detach` (see `peer-*` agents). The same handler
 covers SIGHUP (`rc=129`) and SIGINT (`rc=130`), and the kill reaches the peers: every `ask-agent` (and `--verify`
 command) the run has alive — a panel's parallel workers included — sits in its own process group and gets SIGTERM
-at once, so `ask-agent` forwards it to the peer; whatever is still there 10 s later is SIGKILLed. The rc file is
-written once they have exited (normally within a few seconds), so `rc=143` means nothing is still editing.
+at once, so `ask-agent` forwards it to the peer; whatever is still there 10 s later is SIGKILLed — the children alive
+at the signal, never a run that started afterwards, and nothing starts afterwards. A `--verify` command that times
+out has its group SIGKILLed too, and a descendant that left the group (a `setsid` daemon holding the pipes) costs the
+run ten more seconds, not forever. The rc file is written once they have exited (normally within a few seconds), so
+`rc=143` means nothing is still editing.
 
 **Lost answers.** Cursor `-m plan` can spend its whole turn on tools and return one narration line.
 `ask-agent cursor` detects that (short result + large output tokens) and resumes the session once to fetch
