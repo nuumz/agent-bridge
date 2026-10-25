@@ -6,15 +6,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
+ROOT = Path(__file__).resolve().parents[1]
+BIN, FAKEBIN = ROOT / "bin", ROOT / "tests" / "fakebin"
+sys.path.insert(0, str(BIN))
 from bridgelib import core  # noqa: E402
 from bridgelib.adapters import ADAPTERS, Codex  # noqa: E402
 
-FIXTURE = Path(__file__).resolve().parent / "fakebin" / "fixtures" / "codex.jsonl"
+FIXTURE = FAKEBIN / "fixtures" / "codex.jsonl"
 
 
 def stream(*events: dict) -> str:
@@ -115,6 +121,75 @@ class CodexArgv(unittest.TestCase):
         self.assertIn("never git commit/push/tag", rw)
         self.assertIn("caller's checkout", rw)
         self.assertNotIn("caller's checkout", codex.preamble(opts(mode="write", discard_ok=True)))
+
+    def test_no_add_dir_an_extra_root_would_be_writable(self):
+        codex = ADAPTERS["codex"]
+        argv = codex.argv(opts(mode="write", add_dir=["/home/me/specs"]), "q")
+        self.assertNotIn("--add-dir", argv)
+        self.assertNotIn("/home/me/specs", " ".join(argv))
+        self.assertNotIn("extra roots", codex.preamble(opts(mode="write", add_dir=["/home/me/specs"])))
+
+
+def git(cwd: str, *args: str) -> None:
+    subprocess.run(["git", "-C", cwd, "-c", "user.email=t@t", "-c", "user.name=t", *args], check=True,
+                   capture_output=True, text=True)
+
+
+class CodexWriteGuard(unittest.TestCase):
+    """Codex has no deny list: git restore/checkout/switch/stash/reset/clean are prompt-only in its workspace-write
+    sandbox, so a write run in a dirty checkout the bridge does not own is refused (exit 6) — by prepare(), hence on
+    a dry run too — while a clean checkout and a bridge-owned branch run."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.home, self.repo = root / "home", root / "repo"
+        self.home.mkdir()
+        self.repo.mkdir()
+        self.bindir = root / "fakebin"
+        shutil.copytree(FAKEBIN, self.bindir, ignore=shutil.ignore_patterns("__pycache__"))
+        (self.bindir / "codex").chmod(0o755)
+        self.log = root / "calls.jsonl"
+        git(str(self.repo), "init", "-q", "-b", "main")
+        (self.repo / "a.txt").write_text("1")
+        git(str(self.repo), "add", "a.txt")
+        git(str(self.repo), "commit", "-q", "-m", "a")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def ask(self, *args: str) -> subprocess.CompletedProcess:
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENT_BRIDGE_", "FAKEBIN_"))}
+        env.update({"PATH": f"{self.bindir}{os.pathsep}{env.get('PATH', '')}", "HOME": str(self.home),
+                    "USER": "tester", "FAKEBIN_LOG": str(self.log)})
+        return subprocess.run([sys.executable, str(BIN / "ask-agent"), "codex", "-m", "write", "-d", str(self.repo),
+                               *args, "q"], capture_output=True, text=True, env=env, timeout=60)
+
+    def test_a_dirty_checkout_the_bridge_does_not_own_is_refused(self):
+        clean = self.ask("--dry-run", "--add-dir", str(self.home))
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        argv = json.loads(clean.stdout)["argv"]
+        self.assertIn("workspace-write", argv)
+        self.assertNotIn("--add-dir", argv, "an extra root is writable under workspace-write")
+        (self.repo / "a.txt").write_text("2")                                   # the caller's uncommitted work
+        dry = self.ask("--dry-run")
+        self.assertEqual(dry.returncode, 6, dry.stderr)
+        self.assertIn("codex -m write refused", dry.stderr)
+        self.assertIn("a.txt", dry.stderr)
+        self.assertIn("git worktree add", dry.stderr)
+        real = self.ask()
+        self.assertEqual(real.returncode, 6, real.stderr)
+        self.assertFalse(self.log.exists(), "nothing was spawned")
+        read_only = subprocess.run([sys.executable, str(BIN / "ask-agent"), "codex", "--dry-run", "-d", str(self.repo),
+                                    "q"], capture_output=True, text=True, timeout=60,
+                                   env={k: v for k, v in os.environ.items() if not k.startswith("AGENT_BRIDGE_")}
+                                   | {"PATH": f"{self.bindir}{os.pathsep}{os.environ.get('PATH', '')}",
+                                      "HOME": str(self.home), "USER": "tester"})
+        self.assertEqual(read_only.returncode, 0, read_only.stderr)             # ask mode never touches the tree
+        git(str(self.repo), "checkout", "-q", "-b", "bridge/x")                 # a worktree the bridge owns
+        owned = self.ask("--dry-run")
+        self.assertEqual(owned.returncode, 0, owned.stderr)
+        self.assertNotIn("caller's checkout", json.loads(owned.stdout)["argv"][-1])
 
 
 if __name__ == "__main__":

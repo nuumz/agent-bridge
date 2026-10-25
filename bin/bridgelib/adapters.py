@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from .core import (BOARD_TOOLS, CURSOR_PULL, STATE, BRIDGE_CMDS, CLAUDE_READ_ONLY_BASH, CLAUDE_WORKTREE_BASH,
-                   CLAUDE_WRITE_BASH, DISABLED, GIT_DENY, GIT_DISCARD, HOME, ROOT, find_bin, last_json, sum_keys)
+                   CLAUDE_WRITE_BASH, DISABLED, GIT_DENY, GIT_DISCARD, HOME, ROOT, dirty_paths, find_bin, last_json,
+                   sum_keys)
 
 class Parsed:
     def __init__(self, result: str, session: str | None = None, tok_in: Any = "?", tok_out: Any = "?",
@@ -592,10 +593,25 @@ class Codex(Adapter):
             model = "default"
         return f"login={login} model={model}"
 
+    def prepare(self, o, dry):
+        # no deny list: git restore/checkout/switch/stash/reset/clean are prompt-only in the workspace-write sandbox,
+        # so the caller's uncommitted work has no rail there but this refusal (Cursor's exit-6 pattern); it runs on a
+        # dry run too, so `--dry-run` tells the truth about what a run would do
+        if o.mode == "write" and not getattr(o, "discard_ok", False):
+            dirty = dirty_paths(o.dir)
+            if dirty:
+                print(f"ask-agent: codex -m write refused — {len(dirty)} uncommitted path{'s' if len(dirty) > 1 else ''}"
+                      f" in your checkout ({', '.join(dirty[:5])}{', …' if len(dirty) > 5 else ''}) and Codex has no "
+                      f"deny list to keep git restore/checkout/switch/stash/reset/clean off them. Commit or stash first, "
+                      f"or give it a worktree: git worktree add <dir> && ask-agent codex -m write -d <dir>",
+                      file=sys.stderr)
+                raise SystemExit(6)
+        return []
+
     def preamble(self, o):
         if o.mode == "write":
-            return ("(Headless write run in Codex's workspace-write sandbox: edits inside the workspace"
-                    + (" and the granted extra roots" if o.add_dir else "") + " are allowed, there is no network, and "
+            return ("(Headless write run in Codex's workspace-write sandbox: edits inside the workspace are allowed, "
+                    "there is no network, and "
                     ".git/ stays read-only — never git commit/push/tag, and do not work around a denied path. Touch only "
                     "the files the task names; run the task's verification command and report its actual output; leave "
                     "everything uncommitted."
@@ -609,13 +625,13 @@ class Codex(Adapter):
 
     def _base(self, o):
         # every exec-level flag goes before a `resume` subcommand: `--json` and `--model` are global in clap terms,
-        # `--sandbox` / `--cd` / `--add-dir` / `-c` are not, so this order is the one that works for both forms
+        # `--sandbox` / `--cd` / `-c` are not, so this order is the one that works for both forms
         a = ["exec", "--json", "--skip-git-repo-check", "--cd", o.dir,
              "--sandbox", "workspace-write" if o.mode == "write" else "read-only"]
         if o.model:
             a += ["--model", o.model]
-        for d in o.add_dir:
-            a += ["--add-dir", d]
+        # no --add-dir: under workspace-write an extra root is a *writable* root (bridge-work's "may read" spec dir
+        # would become editable), and the read-only sandbox reads the whole disk without a grant
         if o.board:
             # the board MCP rides on the run as `-c` overrides (values parse as TOML), so nothing is written to
             # ~/.codex/config.toml; identity is still resolved by the server from the run's pid, never from this env

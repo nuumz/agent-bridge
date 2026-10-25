@@ -31,7 +31,7 @@ ask-agent <claude|cursor|copilot|codex|a2a> [-d dir] [-m ask|plan|write] [-M mod
 ask-agent --list
 ```
 
-Exit codes: 0 ok · 1 peer error · 2 usage · 3 hop guard · 4 disabled · 5 peer asked back · 6 cursor write refused ·
+Exit codes: 0 ok · 1 peer error · 2 usage · 3 hop guard · 4 disabled · 5 peer asked back · 6 cursor/codex write refused ·
 **7 peer out of quota** · 127 not installed · 143 killed at `-t`. Every failure prints one `[bridge] error: <the peer's
 own first stderr line>` before the raw dump — scripts (`bridge-panel`) read that line, never the dump.
 
@@ -74,14 +74,16 @@ How the common options map onto each CLI:
 | `-M model` | `--model` | `--model` (always passed: `auto` unless `-M`, so the app's last pick in cli-config.json never leaks in) | `--model=` | `--model` |
 | `--session id` / `-c` | `--resume id --fork-session` / `--continue --fork-session` (the peer never writes into the session it resumes — with `-c` in your own directory that is yours) | `--resume id` / `--continue` | `--resume=id` / `--continue` | `exec … resume <thread_id>` / `exec … resume --last` (the exec-level flags stay before `resume`: `--sandbox`, `--cd`, `--add-dir` are not global there) |
 | `-w [name]` | `--worktree [name]` → `<repo>/.claude/worktrees/<name>` (locked) | `--worktree [name]` → `~/.cursor/worktrees/<repo>/<name>` | not supported (use `git worktree add` + `-d`) | not supported (use `git worktree add` + `-d`) |
-| `--add-dir` | `--add-dir` | `--add-dir` | `--add-dir=` | `--add-dir` (an extra *writable* root in `workspace-write`; reads need no grant) |
+| `--add-dir` | `--add-dir` | `--add-dir` | `--add-dir=` | not passed: an extra root would be *writable* in `workspace-write`, and the read-only sandbox reads the disk without a grant |
 | board MCP | `--allowed-tools mcp__bridge_board` (registered user-scope by `bridge-sync`) | `--approve-mcps` (`~/.cursor/mcp.json` by `bridge-sync`) | `~/.copilot/mcp-config.json` (not written yet) | `-c mcp_servers.bridge_board.command=… -c …args=["serve"] -c …env={AGENT_BRIDGE_AGENT="codex"}` on the run itself — nothing is written to `~/.codex/config.toml` |
 | output parsed from | `--output-format stream-json --verbose` (last line = `result`: `result`, `session_id`, `usage`; earlier lines feed `bridge-watch`) | `--output-format stream-json` (`assistant` chunks, `result`) | `--output-format json` JSONL (`assistant.message` content, `result.sessionId` + `usage.premiumRequests`/`totalApiDurationMs`; `EDITED=` in the bridge line when `codeChanges.filesModified` is non-empty) | `exec --json` JSONL (`thread.started.thread_id` = the session; `item.completed` items: `agent_message.text` is the answer, `command_execution` / `mcp_tool_call` the tool calls, `file_change.changes` → `EDITED=`; `turn.completed.usage` the tokens; a `turn.failed` / `error` message is the error line; no `turn.completed` = incomplete, not a success) |
 
 **Codex.** Every Codex run is `codex exec --json --skip-git-repo-check --cd <dir> --sandbox <mode>` (the bridge decides
 the directory, so the git-repo check is off). There is no per-command deny flag: the read-only sandbox is the read-only
-line, the workspace-write sandbox the write line, and `GIT_DISCARD` is prompt-only there (SECURITY.md). Codex reads the
-repo's `AGENTS.md` itself; `bridge-sync` does not yet mirror the machine-wide rules into `~/.codex/`. Quota: a
+line, the workspace-write sandbox the write line, and `GIT_DISCARD` is prompt-only there (SECURITY.md) — so `-m write`
+is refused with exit 6 in a checkout with uncommitted tracked changes that the bridge does not own (no `-w`: use
+`git worktree add` + `-d`, or a `bridge/<name>` branch), and `--add-dir` is not passed (an extra root would be
+writable). Codex reads the repo's `AGENTS.md` itself; `bridge-sync` does not yet mirror the machine-wide rules into `~/.codex/`. Quota: a
 `turn.failed` / `error` event or a stderr line saying "hit your usage limit" marks the peer (exit 7) like the others.
 Flags and event shapes were taken from codex-rs `exec/src/cli.rs`, `utils/cli/src/shared_options.rs`,
 `exec/src/exec_events.rs` and `protocol/src/permissions.rs` on 2026-10-24 and pass the adapter conformance kit; **no

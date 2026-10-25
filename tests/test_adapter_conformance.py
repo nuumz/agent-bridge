@@ -95,8 +95,9 @@ EXPECT = {
         board_ask=dict(has=[("--sandbox", "read-only"), ("-c", 'mcp_servers.bridge_board.args=["serve"]')],
                        not_=[("--sandbox", "workspace-write")]),
         git_deny=None, hold=None,
-        no_commit="no deny flag: the workspace-write sandbox keeps .git/ read-only, so a commit cannot land",
-        add_dir=lambda d: ("--add-dir", d), model=lambda m: ("--model", m),
+        no_commit="no deny flag: the workspace-write sandbox keeps .git/ read-only, so a commit cannot land; a dirty "
+                  "checkout the bridge does not own is refused (exit 6, tests/test_codex.py)",
+        add_dir=None, model=lambda m: ("--model", m),     # an extra root would be writable under workspace-write
         resume=lambda s: ("resume", s), cont=("resume", "--last"),
         quota="You've hit your usage limit. Try again in 3 hours.",
     ),
