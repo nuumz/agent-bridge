@@ -148,16 +148,17 @@ class Conformance(unittest.TestCase):
         for d in (self.home, self.work, self.extra):
             d.mkdir()
         self.bindir = root / "fakebin"
-        shutil.copytree(FAKEBIN, self.bindir)              # a copy: pycache and chmod stay out of the checkout
-        for name in _fakebin.VERSIONS:
-            (self.bindir / name).chmod(0o755)
+        shutil.copytree(FAKEBIN, self.bindir, ignore=shutil.ignore_patterns("__pycache__"))   # a copy: pycache and
+        for name in _fakebin.VERSIONS:                                                          # chmod stay out of
+            (self.bindir / name).chmod(0o755)                                                   # the checkout
         self.log = root / "calls.jsonl"
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def env(self, **extra: str) -> dict[str, str]:
-        env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_BRIDGE_")}
+        # the outer shell's bridge, stub and Codex-home variables would script the run from outside the test
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("AGENT_BRIDGE_", "FAKEBIN_", "CODEX_HOME"))}
         env.update({"PATH": f"{self.bindir}{os.pathsep}{env.get('PATH', '')}", "HOME": str(self.home),
                     "USER": "tester", "FAKEBIN_LOG": str(self.log)})
         env.update(extra)
@@ -316,9 +317,9 @@ class Conformance(unittest.TestCase):
     @per_family
     def test_timeout_kills_the_peer_and_its_children(self, name, agent, x):
         before = len(self.calls())
-        p = self.ask(name, "--no-board", "-t", "1", "-d", str(self.work), PROMPT, FAKEBIN_SLEEP="20", timeout=30)
-        self.assertEqual(p.returncode, 143, p.stderr)
-        self.assertIn("killed after 1s", p.stderr)
+        p = self.ask(name, "--no-board", "-t", "2", "-d", str(self.work), PROMPT, FAKEBIN_SLEEP="20", timeout=30)
+        self.assertEqual(p.returncode, 143, p.stderr)                 # -t 2: the stub must have started by then
+        self.assertIn("killed after 2s", p.stderr)
         call = self.calls()[before]
         self.assertFalse(alive(call["pid"]), "the peer must be gone")
         self.assertFalse(alive(call["child_pid"]), "the peer's child must die with it (process group)")
