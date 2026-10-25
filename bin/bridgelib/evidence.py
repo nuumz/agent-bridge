@@ -51,7 +51,7 @@ def verify_citations(workspace: str, texts: dict[str, str]) -> list[dict]:
     seen: dict[str, tuple[Path | None, str]] = {}
     for role, text in texts.items():
         for m in CITE_RE.finditer(text or ""):
-            rel, start = m.group(1).lstrip("./"), int(m.group(2))
+            rel, start = re.sub(r"^(\./)+", "", m.group(1)), int(m.group(2))   # not lstrip: `.github/…` keeps its dot
             if rel not in seen:
                 seen[rel] = resolve_cited(root, rel)
             f, resolved = seen[rel]

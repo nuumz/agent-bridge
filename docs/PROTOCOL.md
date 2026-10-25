@@ -368,6 +368,13 @@ from the run's result (§6.5) — `answer`, or `blocked` with a `missing:` line 
    `bridge-board read --json` prints exactly those;
 4. this file names every kind and every header key.
 
+The validator compares as JSON Schema does: `const` and `enum` by JSON equality (`true` is not `1`), `integer`
+accepting a number with a zero fractional part (`1.0`), and `$` in a pattern as the end of the string (Python's `$`
+would also match before a trailing newline; the board uses a full match). It is deliberately stricter than the board in
+one place: the `headers` subschema applies to every kind, so a `note` whose first line reads `mode: fast` fails
+`check()` although the board stores it — a writer keeps `key: value` first lines for real headers. `bridge-board post`
+accepts every kind but `task` and `system`, which only the transport writes.
+
 Another implementation (a new transport, a script in another language) is conformant when it passes the vectors and
 the requirements of §10.1. To add a vendor: an adapter class (CONTRIBUTING.md), its family name in `boardlib.FAMILIES`
 so turns can address it, its stub and fixture under `tests/fakebin/` with a row in the `EXPECT` table of

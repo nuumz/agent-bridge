@@ -448,7 +448,8 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("serve")
     sub.add_parser("status")
-    p = sub.add_parser("post"); p.add_argument("topic"); p.add_argument("text"); p.add_argument("-k", "--kind", default="note", choices=B.KINDS)
+    p = sub.add_parser("post"); p.add_argument("topic"); p.add_argument("text")
+    p.add_argument("-k", "--kind", default="note", choices=[k for k in B.KINDS if k not in ("task", "system")])   # the board's own
     p.add_argument("--to", help="agent identity | @<role> | * (default: everyone)")
     p.add_argument("--reply-to", type=int, help="seq of the message you answer (closes a request or a card)")
     p.add_argument("--as", dest="as_", metavar="NAME", help="author name for a script posting on the user's behalf "
