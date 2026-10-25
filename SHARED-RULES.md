@@ -31,7 +31,7 @@ ask-agent <claude|cursor|copilot|codex|a2a> [-d dir] [-m ask|plan|write] [-M mod
 ask-agent --list
 ```
 
-Exit codes: 0 ok · 1 peer error · 2 usage · 3 hop guard · 4 disabled · 5 peer asked back · 6 cursor write refused ·
+Exit codes: 0 ok · 1 peer error · 2 usage · 3 hop guard · 4 disabled · 5 peer asked back · 6 cursor/codex write refused ·
 **7 peer out of quota** · 127 not installed · 143 killed at `-t`. Every failure prints one `[bridge] error: <the peer's
 own first stderr line>` before the raw dump — scripts (`bridge-panel`) read that line, never the dump.
 
@@ -74,14 +74,16 @@ How the common options map onto each CLI:
 | `-M model` | `--model` | `--model` (always passed: `auto` unless `-M`, so the app's last pick in cli-config.json never leaks in) | `--model=` | `--model` |
 | `--session id` / `-c` | `--resume id --fork-session` / `--continue --fork-session` (the peer never writes into the session it resumes — with `-c` in your own directory that is yours) | `--resume id` / `--continue` | `--resume=id` / `--continue` | `exec … resume <thread_id>` / `exec … resume --last` (the exec-level flags stay before `resume`: `--sandbox`, `--cd`, `--add-dir` are not global there) |
 | `-w [name]` | `--worktree [name]` → `<repo>/.claude/worktrees/<name>` (locked) | `--worktree [name]` → `~/.cursor/worktrees/<repo>/<name>` | not supported (use `git worktree add` + `-d`) | not supported (use `git worktree add` + `-d`) |
-| `--add-dir` | `--add-dir` | `--add-dir` | `--add-dir=` | `--add-dir` (an extra *writable* root in `workspace-write`; reads need no grant) |
+| `--add-dir` | `--add-dir` | `--add-dir` | `--add-dir=` | not passed: an extra root would be *writable* in `workspace-write`, and the read-only sandbox reads the disk without a grant |
 | board MCP | `--allowed-tools mcp__bridge_board` (registered user-scope by `bridge-sync`) | `--approve-mcps` (`~/.cursor/mcp.json` by `bridge-sync`) | `~/.copilot/mcp-config.json` (not written yet) | `-c mcp_servers.bridge_board.command=… -c …args=["serve"] -c …env={AGENT_BRIDGE_AGENT="codex"}` on the run itself — nothing is written to `~/.codex/config.toml` |
 | output parsed from | `--output-format stream-json --verbose` (last line = `result`: `result`, `session_id`, `usage`; earlier lines feed `bridge-watch`) | `--output-format stream-json` (`assistant` chunks, `result`) | `--output-format json` JSONL (`assistant.message` content, `result.sessionId` + `usage.premiumRequests`/`totalApiDurationMs`; `EDITED=` in the bridge line when `codeChanges.filesModified` is non-empty) | `exec --json` JSONL (`thread.started.thread_id` = the session; `item.completed` items: `agent_message.text` is the answer, `command_execution` / `mcp_tool_call` the tool calls, `file_change.changes` → `EDITED=`; `turn.completed.usage` the tokens; a `turn.failed` / `error` message is the error line; no `turn.completed` = incomplete, not a success) |
 
 **Codex.** Every Codex run is `codex exec --json --skip-git-repo-check --cd <dir> --sandbox <mode>` (the bridge decides
 the directory, so the git-repo check is off). There is no per-command deny flag: the read-only sandbox is the read-only
-line, the workspace-write sandbox the write line, and `GIT_DISCARD` is prompt-only there (SECURITY.md). Codex reads the
-repo's `AGENTS.md` itself; `bridge-sync` does not yet mirror the machine-wide rules into `~/.codex/`. Quota: a
+line, the workspace-write sandbox the write line, and `GIT_DISCARD` is prompt-only there (SECURITY.md) — so `-m write`
+is refused with exit 6 in a checkout with uncommitted tracked changes that the bridge does not own (no `-w`: use
+`git worktree add` + `-d`, or a `bridge/<name>` branch), and `--add-dir` is not passed (an extra root would be
+writable). Codex reads the repo's `AGENTS.md` itself; `bridge-sync` does not yet mirror the machine-wide rules into `~/.codex/`. Quota: a
 `turn.failed` / `error` event or a stderr line saying "hit your usage limit" marks the peer (exit 7) like the others.
 Flags and event shapes were taken from codex-rs `exec/src/cli.rs`, `utils/cli/src/shared_options.rs`,
 `exec/src/exec_events.rs` and `protocol/src/permissions.rs` on 2026-10-24 and pass the adapter conformance kit; **no
@@ -90,18 +92,20 @@ flags, the `-c mcp_servers.*` overrides (documented TOML parsing, undocumented f
 `--json` output is the stream above, then update this paragraph.
 
 **A2A (remote).** `ask-agent a2a` runs `bridge-a2a send --url $AGENT_BRIDGE_A2A_URL --mode <mode> --timeout <t-5>
-[--model M] [--add-dir D] [--context <id>|last] -- <prompt>`: the bridge's own client fetches the remote agent card,
+[--model M] [--context <id>|last] -- <prompt>`: the bridge's own client fetches the remote agent card,
 sends one `message/send` and polls `tasks/get` until a terminal state, printing JSON Lines (`card`, `task` per state,
 `result`) that the adapter parses — `result.text` is the answer, `result.context_id` the session (`--session` /
 `--conv` continue that context; `-c` continues the last one used for that URL), a state other than `completed` is
 the error line (`[a2a] <state>: <the peer's message>` on stderr, so a usage-limit message there marks the quota like
-the others). The token is read from `AGENT_BRIDGE_A2A_TOKEN` only, never passed on a command line, and never appears in
-`--dry-run` or a run log. No deny flag and no hold: the bridge sends text, a mode and a shape — the remote's own rails
-apply. `-w` is not supported; `--add-dir` is a hint the remote may ignore. A send that reaches its `--timeout` withdraws
-its task (`tasks/cancel`, best-effort: a network failure leaves it queued) before exiting 1, so a request nobody waits
-for is not left for the remote's human to dispatch. The server side
-(`bridge-a2a serve`) is in §6 and `docs/PROTOCOL.md` §10.4; verified end to end in `tests/test_a2a.py` against the real
-binary on loopback.
+the others). The token is read from `AGENT_BRIDGE_A2A_TOKEN` only, never passed on a command line, never appears in
+`--dry-run` or a run log, and is dropped from every other peer's environment (`core.PRIVATE_ENV_VARS`; the adapter's
+`env_keep` names what its run alone may see). No deny flag and no hold: the bridge sends text, a mode and a shape — the remote's own rails
+apply. `-w` is not supported; `--add-dir` is not sent (a local path grant means nothing to the remote). A send
+that reaches its `--timeout` withdraws its task (`tasks/cancel`, best-effort: a network failure leaves it queued)
+before exiting 1, so a request nobody waits for is not left for the remote's human to dispatch. A turn `to=a2a`
+that `dispatch` runs gets the request body alone and the bridge posts the remote's reply (§6). The server side
+(`bridge-a2a serve`) is in §6 and `docs/PROTOCOL.md` §10.4; verified end to end in `tests/test_a2a.py` against
+the real binary on loopback.
 
 **Copilot workspace bootstrap.** Each prompt names its resolved cwd, nearest git root (including a worktree's
 `.git` file), existing `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` / `.github/copilot-instructions.md` files from root
@@ -181,7 +185,9 @@ it in the current turn** — never on the agent's own judgement.
 never call a bridge command back. Enforced: `ask-agent` exports `AGENT_BRIDGE_HOP=1` to the peer and exits 3
 when the variable is present (any value — `AGENT_BRIDGE_HOP=` is still a hop) **or** when a registered bridged run is
 among its ancestor processes (a peer that scrubs its env is still inside the run); `bridge-board dispatch` refuses on
-the same two signals; `ask-claude` additionally denies `Bash(ask-*:*)`.
+the same two signals; `bridge-a2a send` exits 3 under the marker unless it is the `a2a` run itself (no second hop
+over the network with the operator's token); Claude and Copilot write runs additionally deny the bridge commands
+(`ask-*`, `bridge-a2a`) by name.
 
 **Run it detached from an agent shell.** Claude Code's Bash tool caps a foreground call at
 120 s (600 s max) — a foreground bridge call is
@@ -352,8 +358,8 @@ whatever its env says.
   registers every run in `workers` (also hand-started ones, live room peers included) so the cap counts all of them,
   and a one-shot dispatch names on stderr each queued task it did not start and why; a dead worker fails its task,
   an expired lease (1500 s) re-queues a claimed task that has no live worker.
-- **Turns — a peer that is not running joins a room by the request.** A `request` with `to=claude|cursor|copilot`
-  (a family, not a running identity) is queued as a task in that topic for that family (`request_seq` links them;
+- **Turns — a peer that is not running joins a room by the request.** A `request` with
+  `to=claude|cursor|copilot|codex|a2a` (a family, not a running identity) is queued as a task in that topic for that family (`request_seq` links them;
   optional header lines `dir:` for the workspace and `mode: ask|plan|write`), and starts when a human runs
   `bridge-board dispatch` — one run, identity `<family>:task<N>`, told it is answering request seq N from whom, in
   which shape. Only the user, the primary or the topic's leader may call a turn (each is a full run; a member's
@@ -365,8 +371,11 @@ whatever its env says.
   hand-started `<family>#<pid>` run) reads it with `board_read mine=true` (`board_status` shows the room while a turn
   is owed) and answers with `reply_to=<seq>`; that reply closes the request and the task in one step (`blocked` →
   task `failed`), `board_task_done` is not needed; a reply by anyone else that closes the request (the requester
-  withdrawing) cancels the task. The user sees one room; Claude stays in it (`bridge-live`), the other two come in by
-  the turn.
+  withdrawing) cancels the task. When the run ends without that reply (a remote family has no board tools; a run
+  crashed or answered off the board), `ask-agent` posts it from the run's result as `<family>:task<N>` — `answer`, or
+  `blocked` with a `missing:` line when the run failed or the text misses the shape — so a turn always closes its
+  request. A remote family's run (`a2a`) is given the request body alone: no topic, identity, requester or recent
+  messages. The user sees one room; Claude stays in it (`bridge-live`), the other families come in by the turn.
 - A bridged peer may not open topics (a `dm:` it is one side of excepted), may hold ≤5 open tasks per topic, and must stop after its wait budget: post the
   final answer, then `board_task_done` when it was dispatched (ask-agent closes the task from the parsed answer otherwise).
 - Claude needs `--allowed-tools mcp__bridge_board` and cannot use MCP tools in plan mode → with the board on, `-m ask|plan`

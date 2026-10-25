@@ -30,11 +30,16 @@ HOP_VAR = "AGENT_BRIDGE_HOP"
 # The caller's own session identity must not reach a peer: a nested `claude` that inherits CLAUDE_CODE_SESSION_ID
 # reports the parent's session as its own (seen 2026-10-15), and the parent's messaging token is nobody else's.
 PRIVATE_ENV_PREFIXES = ("CLAUDE_CODE_", "CLAUDE_SESSION_", "CLAUDECODE")
+# credentials of the bridge's own that no peer needs: dropped from every peer's environment unless the adapter names
+# them in `env_keep` (the a2a run is the one that speaks to the remote; a prompt-injected local peer could print them)
+PRIVATE_ENV_VARS = ("AGENT_BRIDGE_A2A_TOKEN",)
 
 
-def peer_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """The environment a bridged peer runs with: ours minus our session identity, plus the hop marker and `extra`."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith(PRIVATE_ENV_PREFIXES)}
+def peer_env(extra: dict[str, str] | None = None, keep: tuple[str, ...] = ()) -> dict[str, str]:
+    """The environment a bridged peer runs with: ours minus our session identity and the bridge's own credentials
+    (except those in `keep`), plus the hop marker and `extra`."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(PRIVATE_ENV_PREFIXES) and (k not in PRIVATE_ENV_VARS or k in keep)}
     return {**env, HOP_VAR: "1", **(extra or {})}
 
 
@@ -225,7 +230,7 @@ GIT_DENY = ("git commit", "git push", "git tag")
 GIT_DISCARD = ("git restore", "git checkout", "git switch", "git stash", "git reset", "git clean",
                # every deny below is a command prefix, and these option forms put the verb after the prefix
                "git -C", "git -c", "git --git-dir", "git --work-tree")
-BRIDGE_CMDS = ("ask-agent", "ask-claude", "ask-cursor", "ask-copilot", "ask-codex")
+BRIDGE_CMDS = ("ask-agent", "ask-claude", "ask-cursor", "ask-copilot", "ask-codex", "bridge-a2a")
 # peers switched off on this machine (reason shown by --list and on any attempt); delete the entry to re-enable
 DISABLED: dict[str, str] = {}
 # A peer that reports an exhausted plan/quota is marked here for QUOTA_TTL seconds; every later run of that peer fails

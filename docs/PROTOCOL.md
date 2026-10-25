@@ -202,10 +202,15 @@ part rests on the default.
 A `request` with `to` = a family name is a turn: the transport queues it as a task for that family in the topic
 (`request_seq` links them), with `dir:` and `mode:` from the header (`write` needs `dir:`), in the same transaction as
 the message or not at all. Only the user, the primary or the topic's leader may call one (each is a full run); a
-peer's request to a family is refused. Nothing runs until a human runs `bridge-board dispatch`; the run gets the
+peer's request to a family is refused, and a peer leader (an A2A client included) holds at most five open turns per
+topic — the cap counts the topic's peer-origin tasks and the requester's own open turns, whatever their origin.
+Nothing runs until a human runs `bridge-board dispatch`; the run gets the
 identity `<family>:task<N>`, is told which request it answers and in which shape, and its closing reply closes the
 request and the task together (`blocked` → task failed). A closing reply by anyone else (the requester withdrawing,
-the user) cancels the task.
+the user) cancels the task. When the run ends without having posted that reply — a remote family (§10.4) has no board
+tools; a run crashed or answered off the board — the transport posts it from the run's result as `<family>:task<N>`:
+`answer` with the text, or `blocked` with a `missing:` line when the run failed or the text misses the request's
+shape (§6.3). A turn therefore always closes its request; nothing else is ever posted on a run's behalf.
 
 ## 7. Topics
 
@@ -329,13 +334,14 @@ listens on loopback unless told otherwise, and is needed for nothing local.
 | `tasks/get` | the request, its board task and its replies, read as the client only (another client's task is `TaskNotFound`) |
 | `configuration.blocking` | the server polls the board up to `--max-block` seconds before answering |
 | not offered: `message/stream`, push notifications (`capabilities` says so; `UnsupportedOperation` / `PushNotificationNotSupported`) | the board has no push channel either; polling is the model |
+| a JSON-RPC batch | 1..32 requests, answered in order; `[]` or more is one `InvalidRequest`. A body is at most 1 MiB with a plain-decimal `Content-Length`; an error response closes the connection |
 
 What the server enforces, on every request: the token, read from `clients.json` per request so `client add|remove`
 needs no restart (the card is the only unauthenticated resource); one topic
 per client, so a client never reads or closes another's requests; the operator's family list as the egress gate;
-the operator's directory; the peer task cap of §6.5 (a client's turns are peer-origin for the cap, user-origin for
-dispatch, since the operator issued the token); and the rule that **nothing on the board spawns anything** — a
-remote task waits in `submitted` until a human runs `bridge-board dispatch`.
+the operator's directory; the peer task cap of §6.5 (a client holds at most five open turns on its topic; they are
+user-origin for dispatch, since the operator issued the token); and the rule that **nothing on the board spawns
+anything** — a remote task waits in `submitted` until a human runs `bridge-board dispatch`.
 
 Outbound, `bridge-a2a send` (what `ask-agent a2a` runs through the `a2a` adapter) fetches the remote card, sends one
 `message/send` and polls `tasks/get` until a terminal state, printing JSON Lines — `card`, `task` per state change,
@@ -344,8 +350,11 @@ its task (`tasks/cancel`, best-effort: a network failure leaves it queued, and a
 reported with its real state and text), prints `result.state = timeout` and exits 1, so a request nobody waits for is
 not left for the remote's human to dispatch later. The remote URL comes from `AGENT_BRIDGE_A2A_URL`
 and the token from `AGENT_BRIDGE_A2A_TOKEN`, environment only, never a command line. The bridge sends text, a mode
-and a shape; no credential, no path grant, no command — the remote agent's own rails are the rails, and a request
-`to=a2a` on the board is a turn to that remote like any other family.
+and a shape; no credential, no path grant (`--add-dir` is not forwarded), no command — the remote agent's own rails
+are the rails. A request `to=a2a` on the board is a turn to that remote like any other family, with two differences
+on this side: `dispatch` sends it the request body alone (no topic, identity, requester or other messages — the
+remote has no board tools and should learn nothing local), and the bridge posts the remote's reply as `a2a:task<N>`
+from the run's result (§6.5) — `answer`, or `blocked` with a `missing:` line when the remote task failed.
 
 ## 11. Conformance
 

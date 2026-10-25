@@ -13,16 +13,18 @@
     bridge-a2a --version
 
 Inbound: a client you gave a token to owns one board topic `a2a:<name>` and leads it. Its message/send becomes a
-`request` there, addressed to a family from --peers (your egress gate): a turn, queued as a task that only your
-`bridge-board dispatch` starts. tasks/get reads submitted · working · completed · failed · canceled off the board;
+`request` there, addressed to a family from --peers (your egress gate; local families only — `a2a` is refused, it
+would relay the client's text onward with your token): a turn, queued as a task that only your `bridge-board dispatch`
+starts. tasks/get reads submitted · working · completed · failed · canceled off the board;
 tasks/cancel withdraws. A client never chooses the directory (-d is yours), sees only its own topic, and may ask for
 `write` only under --allow-write. Loopback by default; a non-loopback bind needs at least one client token; without
 --cert/--key the traffic is plain HTTP, so reach a remote machine through an SSH tunnel or put TLS in front.
 
 Outbound: `send` is what `ask-agent a2a` runs (the `a2a` adapter). URL from --url or AGENT_BRIDGE_A2A_URL; the token
-only from AGENT_BRIDGE_A2A_TOKEN — never on a command line. Exit 0 completed · 1 failed / canceled / rejected / timed
-out (the state and the peer's message go to stderr as `[a2a] <state>: …`; a timed-out send withdraws its task with
-tasks/cancel so the remote never dispatches what nobody waits for) · 2 usage.
+only from AGENT_BRIDGE_A2A_TOKEN — never on a command line, and never in any other peer's environment. Exit 0 completed
+· 1 failed / canceled / rejected / timed out (the state and the peer's message go to stderr as `[a2a] <state>: …`; a
+timed-out send withdraws its task with tasks/cancel so the remote never dispatches what nobody waits for) · 2 usage
+· 3 hop guard (inside a bridged run that is not the a2a run itself).
 Spec of the mapping: docs/PROTOCOL.md §10.4. State: ~/.agent-bridge/state/a2a/.
 """
 from __future__ import annotations
@@ -31,15 +33,15 @@ import argparse
 import json
 import os
 import signal
-import ssl
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import boardlib  # noqa: E402
 from bridgelib import a2a, protocol  # noqa: E402
 from bridgelib.adapters import ADAPTERS  # noqa: E402
-from bridgelib.core import DISABLED, detach  # noqa: E402
+from bridgelib.core import DISABLED, IDENTITY_VAR, detach, hop_active  # noqa: E402
 
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
 
@@ -68,10 +70,12 @@ def alive(pid: int | None) -> bool:
 # ----------------------------------------------------------------------------- serve / stop / status
 def serve(o) -> int:
     families = [f for f in o.peers.split(",") if f]
-    bad = [f for f in families if f not in ADAPTERS or f in DISABLED]
+    local = [n for n, a in ADAPTERS.items() if n not in DISABLED and not a.remote]
+    bad = [f for f in families if f not in local]
     if not families or bad:
-        print(f"bridge-a2a: --peers must name enabled adapters out of "
-              f"{', '.join(n for n in ADAPTERS if n not in DISABLED)} (got {o.peers!r})", file=sys.stderr)
+        print(f"bridge-a2a: --peers must name enabled local adapters out of {', '.join(local)} (got {o.peers!r})"
+              + (" — a2a would relay a client's text to another remote with your own token, and pointed at this "
+                 "server it would queue a turn for every turn" if "a2a" in bad else ""), file=sys.stderr)
         return 2
     workdir = Path(o.dir).resolve()
     if not workdir.is_dir():
@@ -88,14 +92,10 @@ def serve(o) -> int:
     scheme = "https" if o.cert else "http"
     cfg = a2a.Config(o.name, o.url or "", families, str(workdir), clients, o.allow_write, o.max_block)
     try:
-        srv = a2a.make_server(cfg, o.bind, o.port, o.quiet)
-    except OSError as exc:
+        srv = a2a.make_server(cfg, o.bind, o.port, o.quiet, cert=o.cert, key=o.key)
+    except OSError as exc:                       # the port is taken, or (ssl.SSLError) the cert/key do not load
         print(f"bridge-a2a: cannot listen on {o.bind}:{o.port}: {exc}", file=sys.stderr)
         return 1
-    if o.cert:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(o.cert, o.key)
-        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     host = o.bind if ":" not in o.bind else f"[{o.bind}]"
     cfg.url = o.url or f"{scheme}://{host}:{srv.server_port}"
     if not clients:
@@ -199,6 +199,12 @@ def card(o) -> int:
 
 
 def send(o) -> int:
+    # one hop: inside a bridged run only the a2a run itself (what `ask-agent a2a` spawns) may talk to the remote —
+    # a local peer with a shell must not make a second hop over the network with the operator's token
+    if hop_active() and boardlib.family(os.environ.get(IDENTITY_VAR, "")) != "a2a":
+        print(f"bridge-a2a: refusing — inside a bridged run (one hop only; this is not the a2a run). "
+              f"Do the work here.", file=sys.stderr)
+        return 3
     url = o.url or os.environ.get(a2a.URL_VAR)
     if not url:
         print(f"bridge-a2a: no URL — pass --url or set {a2a.URL_VAR}", file=sys.stderr)

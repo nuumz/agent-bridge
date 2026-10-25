@@ -43,9 +43,9 @@ def protocol(conv: Conv | None) -> str:
 
 
 def run(binary: str, argv: list[str], cwd: str, timeout: int, log: Path, env_extra: dict[str, str] | None = None,
-        on_start: Callable[[int], None] | None = None) -> int:
+        on_start: Callable[[int], None] | None = None, keep: tuple[str, ...] = ()) -> int:
     err = log.with_suffix(".err")
-    env = peer_env(env_extra)
+    env = peer_env(env_extra, keep)
     with open(log, "w") as out, open(err, "w") as e:
         # own process group: a timeout or a signal to ask-agent must take the peer AND its children down,
         # otherwise a killed run leaves node/rg/MCP processes burning CPU (and tokens) in the background
@@ -101,15 +101,42 @@ class BoardRun:
             boardlib.worker_unregister(self.board, self.pid)
         if self.task_id is None:
             return
-        try:                                 # dispatched task: close it unless the peer already did via board_task_done
-            if status != 0 or parsed is None:
-                boardlib.task_done(self.board, self.identity, self.task_id,
-                                   f"peer exited {status} (see {self.log.with_suffix('.err')})", "failed")
-            else:
-                boardlib.task_done(self.board, self.identity, self.task_id, parsed.result[:4000],
-                                   "failed" if parsed.is_error else "done")
+        text = (parsed.result or "").strip() if parsed is not None else ""
+        ok = status == 0 and parsed is not None and not parsed.is_error
+        self._reply(ok, status, text)
+        try:                                 # dispatched task: close it unless the reply above or the peer already did
+            boardlib.task_done(self.board, self.identity, self.task_id,
+                               text[:4000] or f"peer exited {status} (see {self.log.with_suffix('.err')})",
+                               "done" if ok else "failed")
         except boardlib.BoardError:
             pass
+
+    def _reply(self, ok: bool, status: int, text: str) -> None:
+        """A dispatched task that is a turn owes its request a closing reply. The run usually posts it itself
+        (board_post reply_to=<seq>); when it did not — a remote family has no board tools, a run crashed or
+        answered off the board — the bridge posts the run's result as the run: `answer` with the text, or `blocked`
+        with a `missing:` line when the run failed or the text misses the request's shape. That reply closes the
+        request and the task together (boardlib._settle_turn), exactly as the run's own reply would."""
+        row = self.board.execute("SELECT topic_id, request_seq, requested_by FROM tasks WHERE id=?",
+                                 (self.task_id,)).fetchone()
+        if row is None or not row["request_seq"]:
+            return
+        tid, seq, to = row["topic_id"], row["request_seq"], row["requested_by"]
+        if self.board.execute(f"SELECT 1 FROM messages m WHERE m.topic_id=? AND m.seq=? AND {boardlib.OPEN_REQUEST}",
+                              (tid, seq)).fetchone() is None:
+            return                           # answered by the run, or withdrawn by the requester: nothing to add
+        text = text or "(the run returned no text)"
+        why = f"an answer — the run ended with exit {status}" if status else "an answer — the run reported an error"
+        if ok:
+            try:
+                boardlib.post(self.board, tid, self.identity, text, "answer", reply_to=seq, to=to)
+                return
+            except boardlib.BoardError as exc:   # the shape check refused it: say so, in the request's own terms
+                why = f"an answer in the request's shape ({exc})"
+        try:
+            boardlib.post(self.board, tid, self.identity, f"missing: {why}\n\n{text}", "blocked", reply_to=seq, to=to)
+        except boardlib.BoardError as exc:
+            print(f"[bridge] warning: could not close request seq {seq}: {exc}", file=sys.stderr)
 
 
 def looks_like_narration(p: Parsed) -> bool:
@@ -273,17 +300,18 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
         conv.record(frm, agent.name, prompt, author=USER_AUTHOR if frm == "caller" else None)
 
     board = BoardRun(agent, o.board, log, o.timeout)
-    status = run(binary, agent.argv(o, full_prompt), o.dir, o.timeout, log, board.env, board.on_start)
+    status = run(binary, agent.argv(o, full_prompt), o.dir, o.timeout, log, board.env, board.on_start, agent.env_keep)
     if status != 0:
-        board.finish(status, None)
+        err_txt = log.with_suffix(".err").read_text(errors="replace")
+        out_txt = log.read_text(errors="replace")
+        failed = agent.parse(out_txt) if out_txt.strip() else None   # what the peer said before it died, if anything
+        board.finish(status, failed)
         if status == 143:
             print(f"ask-agent: killed after {o.timeout}s. From an agent shell run this in the background "
                   "(Claude Code's Bash tool caps foreground calls at 120 s / 600 s max).",
                   file=sys.stderr)
         else:
             print(f"ask-agent: {agent.binary} exited {status}. stderr:", file=sys.stderr)
-        err_txt = log.with_suffix(".err").read_text(errors="replace")
-        out_txt = log.read_text(errors="replace")
         quota = quota_hit(err_txt, out_txt[-4000:])
         if quota:
             quota_mark(agent.name, quota)
@@ -295,7 +323,7 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
         print("\n".join(err_txt.splitlines()[-20:]), file=sys.stderr)
         if out_txt:
             print(out_txt[-2000:], file=sys.stderr)
-        return status, agent.parse(out_txt) if out_txt.strip() else None, log
+        return status, failed, log
 
     parsed = agent.parse(log.read_text(encoding="utf-8", errors="replace"))
     if parsed.metrics.get("tool_failures"):
@@ -303,7 +331,7 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
               f"({parsed.metrics.get('permission_denials', 0)} permission denials); "
               f"rc=0 alone does not prove the task was verified — inspect {log}", file=sys.stderr)
     if parsed.is_error:
-        board.finish(1, parsed)
+        board.finish(0, parsed)                  # exit 0, but the peer reported an error: the task fails on the text
         quota = quota_hit(parsed.result, log.with_suffix(".err").read_text(errors="replace"))
         if quota:
             quota_mark(agent.name, quota)
@@ -321,7 +349,8 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
                    "Do not narrate, do not call tools.")
         rlog = RUNS / f"{stamp}-{agent.name}.recover.json"
         (RUNS / f"{stamp}-{agent.name}.recover.prompt.txt").write_text(rprompt + "\n")
-        if run(binary, agent.resume_argv(o, parsed.session, rprompt), o.dir, o.timeout, rlog, board.env) != 0:
+        if run(binary, agent.resume_argv(o, parsed.session, rprompt), o.dir, o.timeout, rlog, board.env,
+               keep=agent.env_keep) != 0:
             print(f"ask-agent: recovery run failed (see {rlog.with_suffix('.err')}); resume by hand with --session "
                   f"{parsed.session}", file=sys.stderr)
             board.finish(1, parsed)

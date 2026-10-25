@@ -21,7 +21,9 @@ import json
 import os
 import re
 import secrets
+import ssl
 import stat
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -42,6 +44,9 @@ LAST_CONTEXT = A2A_DIR / "last-context.json"  # {url: contextId} — what `send 
 WELL_KNOWN = ("/.well-known/agent-card.json", "/.well-known/agent.json")   # A2A 0.3 name, then the older one
 TERMINAL = ("completed", "canceled", "failed", "rejected")
 MAX_BODY = 1 << 20
+BATCH_MAX = 32                                   # JSON-RPC requests per batch: one 1 MiB batch is not ten thousand sends
+CONN_TIMEOUT = 30                                # seconds a connection may stay silent (a half-sent request, an idle keep-alive)
+CONTENT_LENGTH = re.compile(r"[0-9]{1,7}")       # a plain decimal: int() would also take "1_0", "+1", " 1"
 URL_VAR, TOKEN_VAR = "AGENT_BRIDGE_A2A_URL", "AGENT_BRIDGE_A2A_TOKEN"
 # JSON-RPC 2.0 and A2A error codes
 PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL = -32700, -32600, -32601, -32602, -32603
@@ -156,6 +161,7 @@ def agent_card(name: str, url: str, families: list[str], description: str | None
 
 # ----------------------------------------------------------------------------- clients (tokens)
 CLIENT_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")   # a2a:<name> stays a board identity; no '/' (task ids)
+TURN_NAME = re.compile(r"task\d+")                        # a2a:task<N> is the dispatched run of a turn, never a client
 
 
 def load_clients(path: Path | None = None) -> dict[str, str]:
@@ -164,7 +170,10 @@ def load_clients(path: Path | None = None) -> dict[str, str]:
         data = json.loads((path or CLIENTS).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    # only a non-empty string is a token: an empty or null value (a hand-edited file) must authenticate nobody
+    return {str(k): v for k, v in data.items() if isinstance(v, str) and v.strip()}
 
 
 def save_clients(clients: dict[str, str], path: Path | None = None) -> None:
@@ -178,9 +187,12 @@ def save_clients(clients: dict[str, str], path: Path | None = None) -> None:
 
 def add_client(name: str, path: Path | None = None) -> str:
     """A new bearer token for `name` — a lowercase slug (letters, digits, `.`, `_`, `-`), so that a2a:<name> is a
-    valid board identity and `<topic>/<seq>` task ids stay unambiguous."""
+    valid board identity and `<topic>/<seq>` task ids stay unambiguous — and never `task<N>`, the identity of a
+    dispatched turn run (`a2a:task<N>`), which would let a client answer as the bridge's own run."""
     if not CLIENT_NAME.fullmatch(name or ""):
         raise ValueError(f"a client name is a lowercase slug like laptop or bob.example (got {name!r})")
+    if TURN_NAME.fullmatch(name):
+        raise ValueError(f"{name!r} is the name of a dispatched turn run (a2a:{name}); pick another")
     boardlib.identity(topic_for(name), "client name")
     clients = load_clients(path)
     token = secrets.token_urlsafe(32)
@@ -194,8 +206,10 @@ def authenticate(header: str | None, clients: dict[str, str]) -> str | None:
     if not header or not header.lower().startswith("bearer "):
         return None
     given = header[7:].strip()
+    if not given:
+        return None
     for name, token in clients.items():
-        if hmac.compare_digest(given.encode(), token.encode()):
+        if token and hmac.compare_digest(given.encode(), token.encode()):
             return name
     return None
 
@@ -365,18 +379,33 @@ class Handler(BaseHTTPRequestHandler):
     def cfg(self) -> Config:
         return self.server.cfg  # type: ignore[attr-defined]
 
+    def setup(self) -> None:
+        # one silent connection must not hold a thread and a file descriptor forever: the socket times out, and
+        # BaseHTTPRequestHandler turns a timeout on the request line into a close
+        self.timeout = getattr(self.server, "conn_timeout", CONN_TIMEOUT)
+        super().setup()
+        if isinstance(self.connection, ssl.SSLSocket):
+            # the TLS handshake runs here, on this connection's thread and under its timeout — never on the accept
+            # loop, where one client that never sends a ClientHello would stall every other connection
+            self.connection.do_handshake()
+
     def log_message(self, fmt: str, *args: Any) -> None:
         if getattr(self.server, "quiet", False):
             return
         super().log_message(fmt, *args)
 
-    def _send(self, status: int, obj: Any, headers: dict[str, str] | None = None) -> None:
+    def _send(self, status: int, obj: Any, headers: dict[str, str] | None = None, close: bool = False) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         for k, v in (headers or {}).items():
             self.send_header(k, v)
+        if status >= 400 or close:
+            # an error leaves the body unread (401, 413) or half-trusted (a parse error): on a persistent connection
+            # those bytes would be parsed as the next request, so the connection ends here
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.end_headers()
         self.wfile.write(data)
 
@@ -393,29 +422,62 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, {"error": "unauthorized: Authorization: Bearer <token> (bridge-a2a client add <name>)"},
                        {"WWW-Authenticate": "Bearer"})
             return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = -1
-        if length < 0 or length > MAX_BODY:
-            self._send(413, {"error": f"body must be 0..{MAX_BODY} bytes with Content-Length"})
+        raw_len = self.headers.get("Content-Length")
+        if self.headers.get("Transfer-Encoding") or raw_len is None:
+            self._send(411, {"error": "a body needs Content-Length; chunked transfer is not accepted"})
+            return
+        if not CONTENT_LENGTH.fullmatch(raw_len):
+            self._send(400, {"error": "Content-Length must be a plain decimal"})
+            return
+        length = int(raw_len)
+        if length > MAX_BODY:
+            self._send(413, {"error": f"body must be 0..{MAX_BODY} bytes"})
             return
         try:
-            req = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = self.rfile.read(length)
+        except TimeoutError:
+            self._send(408, {"error": "the body did not arrive in time"})
+            return
+        try:
+            req = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            self._send(200, {"jsonrpc": "2.0", "id": None, "error": RpcError(PARSE_ERROR, "parse error").as_dict()})
+            self._send(200, {"jsonrpc": "2.0", "id": None, "error": RpcError(PARSE_ERROR, "parse error").as_dict()},
+                       close=True)
             return
         if isinstance(req, list):
+            if not 1 <= len(req) <= BATCH_MAX:
+                self._send(200, {"jsonrpc": "2.0", "id": None, "error": RpcError(
+                    INVALID_REQUEST, f"a batch holds 1..{BATCH_MAX} requests").as_dict()})
+                return
             self._send(200, [handle(self.cfg, client, r) for r in req])
             return
         self._send(200, handle(self.cfg, client, req))
 
 
-def make_server(cfg: Config, bind: str, port: int, quiet: bool = False) -> ThreadingHTTPServer:
-    srv = ThreadingHTTPServer((bind, port), Handler)
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:
+        """A failed TLS handshake, a timed-out silent connection, a client gone mid-response: one line, no
+        traceback (socketserver's default). Anything that is not an OSError is a bug and keeps its traceback."""
+        exc = sys.exc_info()[1]
+        if not isinstance(exc, OSError):
+            super().handle_error(request, client_address)
+        elif not getattr(self, "quiet", False):
+            print(f"[a2a] {client_address[0]}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+
+def make_server(cfg: Config, bind: str, port: int, quiet: bool = False, conn_timeout: float = CONN_TIMEOUT,
+                cert: str | None = None, key: str | None = None) -> ThreadingHTTPServer:
+    srv = _Server((bind, port), Handler)
     srv.cfg = cfg  # type: ignore[attr-defined]
     srv.quiet = quiet  # type: ignore[attr-defined]
-    srv.daemon_threads = True
+    srv.conn_timeout = conn_timeout  # type: ignore[attr-defined]
+    if cert:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        # do_handshake_on_connect=False: accept() hands back an un-handshaken socket and Handler.setup finishes it
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
     return srv
 
 

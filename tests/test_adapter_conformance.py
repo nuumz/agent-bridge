@@ -23,6 +23,7 @@ sys.path.insert(0, str(BIN))
 sys.path.insert(0, str(FAKEBIN))
 
 import _fakebin  # noqa: E402
+import boardlib  # noqa: E402
 from bridgelib import core  # noqa: E402
 from bridgelib.adapters import ADAPTERS  # noqa: E402
 
@@ -95,8 +96,9 @@ EXPECT = {
         board_ask=dict(has=[("--sandbox", "read-only"), ("-c", 'mcp_servers.bridge_board.args=["serve"]')],
                        not_=[("--sandbox", "workspace-write")]),
         git_deny=None, hold=None,
-        no_commit="no deny flag: the workspace-write sandbox keeps .git/ read-only, so a commit cannot land",
-        add_dir=lambda d: ("--add-dir", d), model=lambda m: ("--model", m),
+        no_commit="no deny flag: the workspace-write sandbox keeps .git/ read-only, so a commit cannot land; a dirty "
+                  "checkout the bridge does not own is refused (exit 6, tests/test_codex.py)",
+        add_dir=None, model=lambda m: ("--model", m),     # an extra root would be writable under workspace-write
         resume=lambda s: ("resume", s), cont=("resume", "--last"),
         quota="You've hit your usage limit. Try again in 3 hours.",
     ),
@@ -109,7 +111,7 @@ EXPECT = {
         git_deny=None, hold=None,
         no_commit="the remote agent's own rails: the bridge sends text, a mode and a shape, never a credential, a "
                   "path grant or a command",
-        add_dir=lambda d: ("--add-dir", d), model=lambda m: ("--model", m),
+        add_dir=None, model=lambda m: ("--model", m),
         resume=lambda s: ("--context", s), cont=("--context", "last"),
         quota="[a2a] failed: You've hit your usage limit. Try again in 3 hours.",
     ),
@@ -181,6 +183,9 @@ class Conformance(unittest.TestCase):
     # -- the table itself
     def test_every_adapter_has_a_stub_a_fixture_and_a_row_in_expect(self):
         self.assertEqual(set(EXPECT), set(ADAPTERS), "one EXPECT row per registered family, no stale rows")
+        self.assertEqual(set(boardlib.FAMILIES), set(ADAPTERS),
+                         "a family the board can address is an adapter, and every adapter is addressable (a turn "
+                         "to it is a task dispatch can run)")
         for name, agent in ADAPTERS.items():
             with self.subTest(family=name):
                 self.assertTrue((FAKEBIN / agent.binary).is_file(), f"tests/fakebin/{agent.binary} is missing")
@@ -206,6 +211,8 @@ class Conformance(unittest.TestCase):
                     self.assertTrue(present(argv, x["git_deny"](cmd)), (cmd, argv))
                 for cmd in core.GIT_DISCARD:            # the caller's checkout: their uncommitted work stays
                     self.assertTrue(present(argv, x["git_deny"](cmd)), (cmd, argv))
+                for cmd in core.BRIDGE_CMDS:            # one hop: no bridge command, local or over the network
+                    self.assertTrue(present(argv, x["git_deny"](cmd)), (cmd, argv))
             if not agent.supports_deny:
                 self.assertIsNone(x["git_deny"], "a family without a deny flag declares a hold or a sandbox instead")
                 self.assertTrue(x["hold"] or x.get("no_commit"),
@@ -223,14 +230,17 @@ class Conformance(unittest.TestCase):
     @per_family
     def test_add_dir_model_and_session_pass_through(self, name, agent, x):
         argv = self.dry(name, "--no-board", "--add-dir", str(self.extra), "-M", "model-x", "--session", "sess-1")
-        self.assertTrue(present(argv, x["add_dir"](str(self.extra))), argv)
+        if x["add_dir"] is None:                             # no path grant for this peer, asked for or not
+            self.assertNotIn(str(self.extra), " ".join(argv), argv)
+        else:
+            self.assertTrue(present(argv, x["add_dir"](str(self.extra))), argv)
         self.assertTrue(present(argv, x["model"]("model-x")), argv)
         self.assertTrue(present(argv, x["resume"]("sess-1")), argv)
         self.assertFalse(present(argv, x["cont"]), argv)
         latest = self.dry(name, "--no-board", "-c")
         self.assertTrue(present(latest, x["cont"]), latest)
         self.assertFalse(present(latest, x["resume"]("sess-1")), latest)
-        self.assertFalse(present(latest, x["add_dir"](str(self.extra))), "no grant that was not asked for")
+        self.assertNotIn(str(self.extra), " ".join(latest), "no grant that was not asked for")
 
     # -- parse
     @per_family
@@ -247,7 +257,7 @@ class Conformance(unittest.TestCase):
     def test_run_answers_with_the_bridge_line_and_the_dry_run_argv(self, name, agent, x):
         expected = self.dry(name)
         before = len(self.calls())
-        p = self.ask(name, "-d", str(self.work), PROMPT)
+        p = self.ask(name, "-d", str(self.work), PROMPT, AGENT_BRIDGE_A2A_TOKEN="s3cret-token")
         self.assertEqual(p.returncode, 0, p.stderr)
         parsed = agent.parse(_fakebin.fixture(agent.binary))
         self.assertIn(parsed.result, p.stdout)
@@ -261,6 +271,9 @@ class Conformance(unittest.TestCase):
         self.assertRegex(call["env"].get(core.IDENTITY_VAR, ""), rf"^{name}#\d+$")
         self.assertFalse([k for k in call["env"] if k.startswith(core.PRIVATE_ENV_PREFIXES)],
                          "the caller's session identity never reaches the peer")
+        self.assertEqual("AGENT_BRIDGE_A2A_TOKEN" in call["env"], name == "a2a",
+                         "the A2A token reaches the a2a run and no other peer (a prompt-injected peer could print it)")
+        self.assertNotIn("s3cret-token", p.stdout + p.stderr)
 
     @per_family
     def test_config_hold_during_the_run_and_released_after(self, name, agent, x):

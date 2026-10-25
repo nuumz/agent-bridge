@@ -11,7 +11,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from bridgelib.adapters import ADAPTERS  # noqa: E402
-from bridgelib.core import HOP_VAR, peer_env  # noqa: E402
+from bridgelib.core import BRIDGE_CMDS, HOP_VAR, PRIVATE_ENV_VARS, peer_env  # noqa: E402
 
 
 class PeerEnv(unittest.TestCase):
@@ -23,6 +23,19 @@ class PeerEnv(unittest.TestCase):
             env = peer_env({"AGENT_BRIDGE_IDENTITY": "cursor#1"})
         self.assertEqual(env, {"PATH": "/bin", "HOME": "/h", "ANTHROPIC_BASE_URL": "https://proxy", "GH_TOKEN": "t",
                                HOP_VAR: "1", "AGENT_BRIDGE_IDENTITY": "cursor#1"})
+
+    def test_the_a2a_token_reaches_only_the_peer_that_keeps_it(self):
+        ours = {"PATH": "/bin", "AGENT_BRIDGE_A2A_URL": "http://127.0.0.1:1", "AGENT_BRIDGE_A2A_TOKEN": "s3cret"}
+        self.assertIn("AGENT_BRIDGE_A2A_TOKEN", PRIVATE_ENV_VARS)
+        with mock.patch.dict(os.environ, ours, clear=True):
+            plain = peer_env({"AGENT_BRIDGE_IDENTITY": "cursor#1"})
+            kept = peer_env({"AGENT_BRIDGE_IDENTITY": "a2a#1"}, keep=ADAPTERS["a2a"].env_keep)
+        self.assertNotIn("AGENT_BRIDGE_A2A_TOKEN", plain, "a prompt-injected local peer could print it")
+        self.assertEqual(plain["AGENT_BRIDGE_A2A_URL"], "http://127.0.0.1:1")
+        self.assertEqual(kept["AGENT_BRIDGE_A2A_TOKEN"], "s3cret")
+        for name, agent in ADAPTERS.items():
+            self.assertEqual(bool(agent.env_keep), name == "a2a", f"{name} has no business with the token")
+        self.assertIn("bridge-a2a", BRIDGE_CMDS, "a second hop over the network is a bridge command too")
 
 
 class ClaudeResume(unittest.TestCase):
