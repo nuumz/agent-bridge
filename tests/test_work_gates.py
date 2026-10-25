@@ -166,6 +166,11 @@ class ReviewVerdict(unittest.TestCase):
         self.assertTrue(self.bw.review_valid(0, "NONE\n`BRIDGE_VERDICT=APPROVE`\n"))   # dressed up — still not a shape failure
         self.assertEqual(self.bw.review_verdict("NONE\n**bridge_verdict: revise**"), "REVISE")
         self.assertFalse(self.bw.review_valid(0, "BRIDGE_VERDICT=APPROVE\n"))          # a verdict alone is not a review
+        # Cursor narrates its board check before answering; with a verdict line that is still a review in shape
+        chatty = "Checking the board, then the diff.\n\nNo open request — posting done.\n\nNONE\nBRIDGE_VERDICT=APPROVE"
+        self.assertTrue(self.bw.review_valid(0, chatty))
+        self.assertFalse(self.bw.review_valid(0, "Checking the diff.\n\nNONE"))             # no verdict: free text, no review
+        self.assertFalse(self.bw.review_valid(0, "Looks fine to me.\nBRIDGE_VERDICT=APPROVE"))   # verdict without NONE/table
 
     def test_revise_without_a_must_fix_row_still_sends_the_implementer_back(self):
         fixes = self.bw.review_fixes(self.TABLE + "\nBRIDGE_VERDICT=REVISE", [], ["a.py"])

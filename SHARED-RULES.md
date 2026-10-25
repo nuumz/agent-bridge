@@ -100,9 +100,11 @@ the error line (`[a2a] <state>: <the peer's message>` on stderr, so a usage-limi
 the others). The token is read from `AGENT_BRIDGE_A2A_TOKEN` only, never passed on a command line, never appears in
 `--dry-run` or a run log, and is dropped from every other peer's environment (`core.PRIVATE_ENV_VARS`; the adapter's
 `env_keep` names what its run alone may see). No deny flag and no hold: the bridge sends text, a mode and a shape — the remote's own rails
-apply. `-w` is not supported; `--add-dir` is not sent (a local path grant means nothing to the remote). A turn
-`to=a2a` that `dispatch` runs gets the request body alone and the bridge posts the remote's reply (§6). The server
-side (`bridge-a2a serve`) is in §6 and `docs/PROTOCOL.md` §10.4; verified end to end in `tests/test_a2a.py` against
+apply. `-w` is not supported; `--add-dir` is not sent (a local path grant means nothing to the remote). A send
+that reaches its `--timeout` withdraws its task (`tasks/cancel`, best-effort: a network failure leaves it queued)
+before exiting 1, so a request nobody waits for is not left for the remote's human to dispatch. A turn `to=a2a`
+that `dispatch` runs gets the request body alone and the bridge posts the remote's reply (§6). The server side
+(`bridge-a2a serve`) is in §6 and `docs/PROTOCOL.md` §10.4; verified end to end in `tests/test_a2a.py` against
 the real binary on loopback.
 
 **Copilot workspace bootstrap.** Each prompt names its resolved cwd, nearest git root (including a worktree's
@@ -287,7 +289,8 @@ Schema and test vectors under `docs/protocol/` (`tests/test_protocol.py` holds s
 **Across machines:** `bridge-a2a serve` (off by default; loopback unless `--bind`; one bearer token per client,
 `bridge-a2a client add <name>`) lets a remote A2A agent post on the board as `a2a:<name>`, leader of its own topic
 `a2a:<name>` only: its `message/send` is a `request` there addressed to a family from the operator's `--peers`, i.e. a
-turn that waits for a human's `dispatch`; it reads and withdraws its own requests and nothing else. The mapping is
+turn that waits for a human's `dispatch`; it reads and withdraws its own requests and nothing else. The server reads the
+token table on every request, so `bridge-a2a client add|remove` takes effect without a restart. The mapping is
 `docs/PROTOCOL.md` §10.4; `to=a2a` on this board is a turn to the remote agent of `AGENT_BRIDGE_A2A_URL`.
 
 - Tools: `board_status`, `board_post`, `board_read`, `board_wait` (long-poll ≤120 s, 8 waits per session — a refused call
@@ -352,7 +355,8 @@ whatever its env says.
 - **Nothing on the board spawns an agent.** `bridge-board dispatch --max-agents N --agents a,b [--allow-write DIRS]
   [--include-peer-tasks] [--watch S]` is the only spawner (flock-serialised, refuses inside a bridged run): one
   live run per family, `mode=write` only inside `--allow-write` dirs, peer-queued tasks only on request. `ask-agent`
-  registers every run in `workers` (also hand-started ones) so the cap counts all of them; a dead worker fails its task,
+  registers every run in `workers` (also hand-started ones, live room peers included) so the cap counts all of them,
+  and a one-shot dispatch names on stderr each queued task it did not start and why; a dead worker fails its task,
   an expired lease (1500 s) re-queues a claimed task that has no live worker.
 - **Turns — a peer that is not running joins a room by the request.** A `request` with
   `to=claude|cursor|copilot|codex|a2a` (a family, not a running identity) is queued as a task in that topic for that family (`request_seq` links them;
@@ -449,7 +453,7 @@ With the board on (default) every thread is also a board topic `conv:<name>`; wi
 | Two peers argue a topic while a script relays | `ask-agent dialog -p claude,cursor -r 3 [--conv name] "topic"` | Posts the topic once as `user:<USER>` kind=note, then round 1: A opens, B responds; afterwards each answers the other's last message; stops after `-r` rounds or when both end with `[[AGREE]]`. Read-only (`ask`/`plan` only, no `-w`). Transcript labels are `moderator → A` / `A → moderator`; relays are not re-posted |
 | Steer or stop a running dialog | `bridge-board post conv:<name> "…" -k decision` | Read between turns (never mid-turn) and prepended as *Moderator:* to the next prompt; a decision containing `[[STOP]]` ends the dialog before the next turn. Only `user:*` kind=decision steers — bridged peers cannot post that kind |
 | Live, both agents running at once, outside a thread | §6 shared board (`bridge_board` MCP) | post / read / wait on any topic; identity is server-derived |
-| Bring Cursor or Copilot into a live room for one turn | `bridge-live send <room> "shape: …\n<ask>" -k request --to cursor` (returns at once, exit 0; or `board_post` the same), then `bridge-board dispatch --agents cursor` | The request is queued as that family's task in the room (§6 turns); `dispatch` starts one `ask-agent cursor` run that reads the room as its family, answers `reply_to` the request in its shape — closing request and task together — and ends. The live Claude peers see the answer like any post addressed to the requester |
+| Bring Cursor or Copilot into a live room for one turn | `bridge-live send <room> "shape: …\n<ask>" -k request --to cursor` (returns at once, exit 0; or `board_post` the same), then `bridge-board dispatch --agents cursor` | The request is queued as that family's task in the room (§6 turns), with the room's `dir:` added when the message has none; `dispatch` starts one `ask-agent cursor` run that reads the room as its family, answers `reply_to` the request in its shape — closing request and task together — and ends. The live Claude peers see the answer like any post addressed to the requester |
 | One peer talks to one other agent (or the user) in private, while both run | `board_open dm:<me>+<them>` then post with `to=<them>` / `board_wait` (mention) | A 1:1 topic with exactly those two as members; a peer may open it only with the user or an agent it already shares a topic with (§6). A `request` there carries `shape:` and stays open until the other side replies `answer`/`done`/`blocked` to its seq |
 | Talk to **persistent** Claude peers over time — with you, and with each other in a room (Claude only) | `bridge-live start <peer> [--room R] [--role ROLE] -d DIR` · `bridge-live send <room> "…" [--to X] [-k note\|question\|request\|decision] [--until-quiet]` · `stop <peer\|room>` · `ls` | A detached broker per peer holds one `claude -p --input-format stream-json` process, so turn 2+ reads the rules from a warm cache. Room `live:<R>` (default R = peer name) has the caller as leader and each peer as a member under its `--role`, so `--to @design-critic` reaches it. A peer is fed what reaches it (§6 addressing: to it, its role, everyone, or a reply to its post) — your notes, `user:*` decisions as *Moderator*, the other peers' answers labelled `[author · kind · seq N → to]` — batched into one turn when several queued; replies go back as kind=answer `reply_to=<last seq fed>`, addressed to that post's author unless it is the user. An answer to posts from several authors (or from the user) goes to everyone, and a `request` in the batch is what the answer replies to. Two peers in one room therefore argue between themselves without waking a third; a `send --to` waits only for the peers it reaches (`@<role>` = the holders of that role); `--role leader` loads the persona but never the board role; a `[[STOP]]` decision ends the peers it reaches (`send -k decision "[[STOP]]"` to all, `--to X` for one); a peer that ended on `[[AGREE]]` is not woken by agreement echoes, which is how a room goes quiet. `--role` loads a `roles/*.md` persona. `start` again resumes the peer's session (`--fresh` opts out) and delivers what the room said while it was away; a backlog `[[STOP]]` is ignored. Guards per peer: `--max-turns 20` · `--budget 5` (USD this start) · `--idle 1800` · `--turn-timeout 600` (kills the stuck turn, resumes the session once, stops on a second timeout) · a `user:*` `[[STOP]]` decision ends the room. One ledger row per turn (conv `live:<R>`; an abandoned turn is rc 143, cost null). Cursor/Copilot have no streaming-stdin mode — use `--conv` |
 
@@ -624,7 +628,8 @@ bridge-work show <name>       # ~/.agent-bridge/state/work/<name>/report.md
    + verify output and returns `file:line | finding | severity | must-fix | why` or NONE. The allowed file set bounds
    the task: a finding that needs a file outside it is `out-of-agreement`, never must-fix (the script drops such rows
    too). **No review = NOT DONE** — a green verify alone never yields READY. A review counts only when it exits 0 and
-   returns a markdown table or `NONE`; `[[ASK]]` (exit 5) or free text is no review. When the reviewer is the
+   returns a markdown table or `NONE`; `[[ASK]]` (exit 5) or free text is no review (with a `BRIDGE_VERDICT` line, text
+   around the table/`NONE` is tolerated — the verdict says the reviewer finished). When the reviewer is the
    implementer (single peer in `-p`), the report labels it `self-review` and the ledger row sets `self_review: true`.
    A role whose peer is unavailable (out of quota · binary missing · disabled) **falls back to claude once**, only
    when `claude` is in `-p` (the egress gate); the report header shows `cursor→claude` and the ledger row keeps `used`.

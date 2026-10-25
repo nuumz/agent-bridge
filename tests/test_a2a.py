@@ -25,9 +25,9 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
 sys.path.insert(0, str(BIN))
 
-import boardlib  # noqa: E402
-from bridgelib import a2a, ledger  # noqa: E402
-from bridgelib.adapters import ADAPTERS  # noqa: E402
+import boardlib
+from bridgelib import a2a, ledger
+from bridgelib.adapters import ADAPTERS
 
 ANSWER = "The retry loop in src/retry.py:12 never backs off."
 
@@ -280,6 +280,18 @@ class Server(unittest.TestCase):
         status, resp = self.raw(json.dumps([one] * a2a.BATCH_MAX).encode(), self.token)
         self.assertEqual((status, len(resp)), (200, a2a.BATCH_MAX))
 
+    def test_removing_a_client_revokes_its_token_without_a_restart(self):
+        clients = a2a.load_clients()
+        del clients["bob"]
+        a2a.save_clients(clients)
+        with self.assertRaises(a2a.A2AError) as cm:
+            self.client(self.bob).get("a2a:bob/1")
+        self.assertEqual(cm.exception.code, 401)
+        bob_again = a2a.add_client("bob")                 # and a new token works on the next request, no restart
+        with self.assertRaises(a2a.A2AError) as cm:
+            self.client(bob_again).get("a2a:bob/1")
+        self.assertEqual(cm.exception.code, a2a.TASK_NOT_FOUND)   # past the token check: there is simply no task 1
+
     # -- the mapping onto the board
     def test_send_becomes_a_turn_on_the_clients_own_topic(self):
         task = self.client().send("Review src/retry.py for retry bugs.", to="cursor", shape="file:line findings")
@@ -380,14 +392,14 @@ class Server(unittest.TestCase):
         hits: list[str] = []
 
         class Redirector(BaseHTTPRequestHandler):
-            def do_GET(self):  # noqa: N802
+            def do_GET(self):
                 hits.append(self.path)
                 self.send_response(302)
                 self.send_header("Location", "http://127.0.0.1:9/elsewhere")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
-            def log_message(self, *a):  # noqa: D102
+            def log_message(self, *a):
                 pass
 
         srv = HTTPServer(("127.0.0.1", 0), Redirector)
@@ -400,6 +412,16 @@ class Server(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_a_stalled_or_dropped_connection_is_an_a2a_error_not_a_traceback(self):
+        import socket
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)                                      # accepts, never answers: the client's socket timeout fires
+        self.addCleanup(srv.close)
+        with self.assertRaises(a2a.A2AError) as cm:
+            a2a.Client(f"http://127.0.0.1:{srv.getsockname()[1]}", "t", timeout=0.3).card()
+        self.assertIn("cannot reach", str(cm.exception))
 
     def test_add_client_rejects_bad_names_and_keeps_the_token_file_private(self):
         for bad in ("a b", "x/y", "", "+", "task7"):                      # task7 would be the turn run a2a:task7
@@ -419,12 +441,12 @@ class Server(unittest.TestCase):
         self.reply_when_asked("answer", ANSWER)
         p = subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "send", "--url", self.url, "--to", "claude",
                             "--timeout", "20", "--poll", "0.2", "--", "Review it."],
-                           capture_output=True, text=True, env=self.cli_env(), timeout=60)
+                           capture_output=True, text=True, env=self.cli_env(), timeout=60, check=False)
         self.assertEqual(p.returncode, 0, p.stderr)
         events = [json.loads(ln) for ln in p.stdout.splitlines()]
         self.assertEqual(events[0]["type"], "card")
         self.assertEqual(events[0]["agent"], "test-bridge")
-        self.assertEqual([e["state"] for e in events if e["type"] == "task"][0], "submitted")
+        self.assertEqual(next(e["state"] for e in events if e["type"] == "task"), "submitted")
         self.assertEqual(events[-1]["type"], "result")
         self.assertEqual((events[-1]["state"], events[-1]["text"]), ("completed", ANSWER))
         parsed = ADAPTERS["a2a"].parse(p.stdout)
@@ -435,7 +457,7 @@ class Server(unittest.TestCase):
         self.reply_when_asked("blocked", "missing: the build log; default: none", after=1)
         p2 = subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "send", "--url", self.url, "--context", "last",
                              "--timeout", "20", "--poll", "0.2", "--", "And the build?"],
-                            capture_output=True, text=True, env=self.cli_env(), timeout=60)
+                            capture_output=True, text=True, env=self.cli_env(), timeout=60, check=False)
         self.assertEqual(p2.returncode, 1, p2.stderr)
         self.assertIn("[a2a] failed: missing: the build log", p2.stderr)
         bad = ADAPTERS["a2a"].parse(p2.stdout)
@@ -443,7 +465,7 @@ class Server(unittest.TestCase):
         self.assertIn("A2A task failed: missing: the build log", bad.result)
         self.assertEqual(ADAPTERS["a2a"].parse("").is_error, True)
         no_url = subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "send", "--", "x"], capture_output=True,
-                                text=True, env={k: v for k, v in self.cli_env().items() if k != a2a.URL_VAR})
+                                text=True, env={k: v for k, v in self.cli_env().items() if k != a2a.URL_VAR}, check=False)
         self.assertEqual(no_url.returncode, 2)
 
     def test_send_refuses_a_second_hop_unless_it_is_the_a2a_run_itself(self):
@@ -460,17 +482,32 @@ class Server(unittest.TestCase):
                             "--poll", "0.2", "--", "Review it."], capture_output=True, text=True, env=own, timeout=60)
         self.assertEqual(p.returncode, 0, p.stderr)
 
+    def test_send_cli_withdraws_the_task_when_its_timeout_passes(self):
+        # nobody dispatches: the client gives up, and the request must not stay queued for a human to run later
+        p = subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "send", "--url", self.url, "--to", "claude",
+                            "--timeout", "1", "--poll", "0.2", "--", "Nobody answers this."],
+                           capture_output=True, text=True, env=self.cli_env(), timeout=60, check=False)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("[a2a] timeout", p.stderr)
+        events = [json.loads(ln) for ln in p.stdout.splitlines()]
+        self.assertEqual(events[-1]["state"], "timeout")
+        self.assertIn("canceled", [e.get("state") for e in events if e["type"] == "task"])
+        tid = events[-1]["task_id"]
+        self.assertEqual(self.client().get(tid)["status"]["state"], "canceled")
+        row = self.conn.execute("SELECT status FROM tasks WHERE request_seq=?", (self.seq_of({"id": tid}),)).fetchone()
+        self.assertEqual(row["status"], "cancelled")
+
     def test_ask_agent_a2a_reaches_the_server_through_the_real_binary(self):
         self.reply_when_asked("answer", ANSWER)
         env = self.cli_env(**{a2a.URL_VAR: self.url})
         p = subprocess.run([sys.executable, str(BIN / "ask-agent"), "a2a", "--no-board", "-d", str(self.work),
-                            "-t", "30", "Review it."], capture_output=True, text=True, env=env, timeout=90)
+                            "-t", "30", "Review it."], capture_output=True, text=True, env=env, timeout=90, check=False)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn(ANSWER, p.stdout)
         self.assertIn("[bridge] agent=a2a session=a2a:alice", p.stdout)
         self.assertNotIn(self.token, p.stdout + p.stderr, "the token never appears in output or argv")
         dry = subprocess.run([sys.executable, str(BIN / "ask-agent"), "a2a", "--dry-run", "-d", str(self.work), "q"],
-                             capture_output=True, text=True, env=env)
+                             capture_output=True, text=True, env=env, check=False)
         self.assertNotIn(self.token, dry.stdout)
         self.assertEqual(json.loads(dry.stdout)["binary"], str(BIN / "bridge-a2a"))
         with_dir = subprocess.run([sys.executable, str(BIN / "ask-agent"), "a2a", "--dry-run", "-d", str(self.work),
@@ -525,7 +562,7 @@ class Server(unittest.TestCase):
             with self.subTest(args=args):
                 home = tempfile.mkdtemp()                         # no clients.json there
                 p = subprocess.run([sys.executable, str(BIN / "bridge-a2a"), "serve", "-d", str(self.work), *args],
-                                   capture_output=True, text=True, env=env | {"HOME": home}, timeout=30)
+                                   capture_output=True, text=True, env=env | {"HOME": home}, timeout=30, check=False)
                 self.assertEqual(p.returncode, 2, p.stderr)
                 self.assertIn(text, p.stderr)
 

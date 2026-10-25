@@ -376,17 +376,25 @@ def dispatch_once(conn, o, families: list[str], write_dirs: list[str], ask_agent
     B.sweep(conn)
     live = B.live_workers(conn)
     busy_families = {r["family"] for r in live}
-    started = []
+    started, waiting = [], []
     for t in conn.execute("SELECT t.*, p.name AS topic FROM tasks t JOIN topics p ON p.id=t.topic_id "
                           "WHERE t.status='queued' ORDER BY t.priority DESC, t.id").fetchall():
         if len(live) + len(started) >= o.max_agents:
+            running = [r["identity"] for r in live] + started
+            waiting.append(f"task #{t['id']} and later: --max-agents {o.max_agents} reached ({', '.join(running)})")
             break
         if t["origin"] == "peer" and not o.include_peer_tasks:
+            waiting.append(f"task #{t['id']}: queued by a peer — pass --include-peer-tasks to run it")
             continue
         if t["mode"] == "write" and not (t["dir"] and str(Path(t["dir"]).resolve()) in write_dirs):
+            waiting.append(f"task #{t['id']}: mode=write in {t['dir'] or '(no dir)'} — pass --allow-write with that dir")
             continue
         fam = t["assignee"] if t["assignee"] != "any" else next((f for f in families if f not in busy_families), None)
         if fam is None or fam not in families or fam in busy_families:
+            waiting.append(f"task #{t['id']} ({t['assignee']}): " + (
+                "every family in --agents has a live run" if fam is None else
+                f"{fam} is not in --agents {','.join(families)}" if fam not in families else
+                f"a {fam} run is already live (one per family)"))
             continue
         workdir = t["dir"] or os.getcwd()
         identity = f"{fam}:task{t['id']}"
@@ -407,6 +415,9 @@ def dispatch_once(conn, o, families: list[str], write_dirs: list[str], ask_agent
                              stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
         busy_families.add(fam)
         started.append(f"#{t['id']}→{fam}")
+    if waiting and not getattr(o, "watch", None):        # a one-shot dispatch that left work queued says why
+        for w in waiting:
+            print(f"[dispatch] not started — {w}", file=sys.stderr)
     return started
 
 

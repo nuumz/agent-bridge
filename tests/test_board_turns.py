@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib.machinery
 import importlib.util
+import io
 import os
 import subprocess
 import sys
@@ -17,10 +18,10 @@ from unittest import mock
 BIN = Path(__file__).resolve().parents[1] / "bin"
 sys.path.insert(0, str(BIN))
 
-import boardlib  # noqa: E402
-from bridgelib import ledger  # noqa: E402
-from bridgelib.adapters import ADAPTERS, Parsed  # noqa: E402
-from bridgelib.runner import BoardRun  # noqa: E402
+import boardlib
+from bridgelib import ledger
+from bridgelib.adapters import ADAPTERS, Parsed
+from bridgelib.runner import BoardRun
 
 USER, PRIMARY, CURSOR_RUN, LIVE = "user:tester", "claude@primary", "cursor:task1", "claude@live:p"
 REQUEST = "shape: table file:line · claim · evidence\n\nList every caller of post()."
@@ -221,14 +222,14 @@ class Turns(unittest.TestCase):
         with self.assertRaisesRegex(boardlib.BoardError, "mode: write needs"):
             boardlib.post(self.conn, self.tid, USER, f"mode: write\n{REQUEST}", "request", to="cursor")
         boardlib.post(self.conn, self.tid, USER, f"dir: .\nmode: write\n{REQUEST}", "request", to="cursor")
-        self.assertEqual(self.tasks()[-1]["dir"], str(Path(".").resolve()))                  # stored resolved
+        self.assertEqual(self.tasks()[-1]["dir"], str(Path.cwd().resolve()))                  # stored resolved
         self.assertEqual(boardlib.body_title("shape: list\n\nbin/x.py:241 — reentrant?\nmore"), "bin/x.py:241 — reentrant?")
         self.assertEqual(boardlib.body_title("shape: list"), "shape: list")
 
     def test_an_env_identity_never_claims_the_primary(self):
         env = {**os.environ, "AGENT_BRIDGE_HOP": "1", "AGENT_BRIDGE_IDENTITY": "claude@primary"}
         p = subprocess.run([sys.executable, str(BIN / "bridge-board"), "post", "room:r", REQUEST, "-k", "request",
-                            "--to", "copilot"], capture_output=True, text=True, env=env)
+                            "--to", "copilot"], capture_output=True, text=True, env=env, check=False)
         self.assertEqual(p.returncode, 1)
         self.assertIn("leader may call", p.stderr)
         self.assertEqual(boardlib.resolve_identity(self.conn, {"AGENT_BRIDGE_IDENTITY": "user:tester",
@@ -268,9 +269,56 @@ class Turns(unittest.TestCase):
             self.assertNotIn(local, remote)
         self.assertEqual(popen.call_args.kwargs["env"]["AGENT_BRIDGE_IDENTITY"], "a2a:task2")
 
+    def test_dispatch_names_why_a_queued_turn_did_not_start(self):
+        board = _load()
+        boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="cursor")
+        live = [{"identity": LIVE, "family": "claude", "task_id": None}]   # a live room peer counts against the cap
+        o = argparse.Namespace(max_agents=1, include_peer_tasks=False)
+        with mock.patch.object(board.subprocess, "Popen") as popen, \
+                mock.patch.object(board.B, "live_workers", return_value=live), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            started = board.dispatch_once(self.conn, o, ["cursor"], [], "/bin/ask-agent")
+        self.assertEqual(started, [])
+        popen.assert_not_called()
+        self.assertIn(f"task #1 and later: --max-agents 1 reached ({LIVE})", err.getvalue())
+        self.assertEqual(self.tasks()[0]["status"], "queued")
+        o.max_agents = 2                                                 # family not allowed: said, not silent
+        with mock.patch.object(board.subprocess, "Popen"), mock.patch.object(board.B, "live_workers", return_value=[]), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            board.dispatch_once(self.conn, o, ["claude"], [], "/bin/ask-agent")
+        self.assertIn("task #1 (cursor): cursor is not in --agents claude", err.getvalue())
+        boardlib.post(self.conn, self.tid, USER, f"dir: {self.tmp.name}\nmode: write\n{REQUEST}", "request", to="cursor")
+        with mock.patch.object(board.subprocess, "Popen") as popen, \
+                mock.patch.object(board.B, "live_workers", return_value=[]), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:     # write turn, no --allow-write: said why
+            board.dispatch_once(self.conn, o, ["claude"], [], "/bin/ask-agent")
+        self.assertIn(f"task #2: mode=write in {Path(self.tmp.name).resolve()} — pass --allow-write", err.getvalue())
+        popen.assert_not_called()
+
+    def test_live_send_gives_a_family_turn_the_rooms_dir(self):
+        loader = importlib.machinery.SourceFileLoader("bridge_live_mod", str(BIN / "bridge-live"))
+        live = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(live)
+        repo = Path(self.tmp.name) / "repo"
+        repo.mkdir()
+        peers = {"claude": {"room": "r", "dir": str(repo), "status": "ready"}}
+        o = argparse.Namespace(room="r", message=REQUEST, kind="request", to="cursor", no_wait=False)
+        with mock.patch.object(live, "room_peers", return_value=peers), mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(live.send(o), 0)
+        self.assertEqual(self.tasks()[-1]["dir"], str(repo.resolve()))    # not dispatch's cwd
+        o.message = f"dir: {self.tmp.name}\n{REQUEST}"                     # an explicit dir: is the caller's choice
+        with mock.patch.object(live, "room_peers", return_value=peers), mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(live.send(o), 0)
+        self.assertEqual(self.tasks()[-1]["dir"], str(Path(self.tmp.name).resolve()))
+        o.message, o.to = REQUEST, "a2a"                                   # an a2a turn leaves the machine: no local path
+        with mock.patch.object(live, "room_peers", return_value=peers), mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(live.send(o), 0)
+        last = self.conn.execute("SELECT body FROM messages WHERE kind='request' ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertNotIn(str(repo), last["body"])
+
     def test_the_cli_and_the_mcp_server_take_the_same_path(self):
         p = subprocess.run([sys.executable, str(BIN / "bridge-board"), "post", "room:r", REQUEST, "-k", "request",
-                            "--to", "copilot"], capture_output=True, text=True, env=dict(os.environ))
+                            "--to", "copilot"], capture_output=True, text=True, env=dict(os.environ), check=False)
         self.assertEqual(p.returncode, 0, p.stderr)
         board = _load()
         with mock.patch.dict(os.environ, {"AGENT_BRIDGE_AGENT": "claude"}):

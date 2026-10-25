@@ -336,7 +336,8 @@ listens on loopback unless told otherwise, and is needed for nothing local.
 | not offered: `message/stream`, push notifications (`capabilities` says so; `UnsupportedOperation` / `PushNotificationNotSupported`) | the board has no push channel either; polling is the model |
 | a JSON-RPC batch | 1..32 requests, answered in order; `[]` or more is one `InvalidRequest`. A body is at most 1 MiB with a plain-decimal `Content-Length`; an error response closes the connection |
 
-What the server enforces, on every request: the token (the card is the only unauthenticated resource); one topic
+What the server enforces, on every request: the token, read from `clients.json` per request so `client add|remove`
+needs no restart (the card is the only unauthenticated resource); one topic
 per client, so a client never reads or closes another's requests; the operator's family list as the egress gate;
 the operator's directory; the peer task cap of §6.5 (a client holds at most five open turns on its topic; they are
 user-origin for dispatch, since the operator issued the token); and the rule that **nothing on the board spawns
@@ -344,7 +345,10 @@ anything** — a remote task waits in `submitted` until a human runs `bridge-boa
 
 Outbound, `bridge-a2a send` (what `ask-agent a2a` runs through the `a2a` adapter) fetches the remote card, sends one
 `message/send` and polls `tasks/get` until a terminal state, printing JSON Lines — `card`, `task` per state change,
-`result` — so the adapter's `parse()` and a human read one stream. The remote URL comes from `AGENT_BRIDGE_A2A_URL`
+`result` — so the adapter's `parse()` and a human read one stream. When `--timeout` passes first, the client withdraws
+its task (`tasks/cancel`, best-effort: a network failure leaves it queued, and a task that completed meanwhile is
+reported with its real state and text), prints `result.state = timeout` and exits 1, so a request nobody waits for is
+not left for the remote's human to dispatch later. The remote URL comes from `AGENT_BRIDGE_A2A_URL`
 and the token from `AGENT_BRIDGE_A2A_TOKEN`, environment only, never a command line. The bridge sends text, a mode
 and a shape; no credential, no path grant (`--add-dir` is not forwarded), no command — the remote agent's own rails
 are the rails. A request `to=a2a` on the board is a turn to that remote like any other family, with two differences

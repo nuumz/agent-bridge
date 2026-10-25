@@ -66,6 +66,17 @@ class FailLoud(unittest.TestCase):
         self.assertNotIn("recorded review", out)                 # the marker's own sentence went with it
         self.assertEqual(out.count("## Git"), 1)
 
+    def test_the_run_to_done_grant_sentence_is_replaced_like_the_marker(self):
+        line = ('- **Never `git commit` without the user asking in the current turn.** "ok" is not a request: offer the '
+                'chain, wait. "ทำให้จบ" in the turn → `commit-autonomy on --repo <the MR worktree> -- "<their words>"` '
+                'once, then report what landed. A commit that lands without authorization: report the SHA and ask.\n')
+        out = self.bs.strip_claude_only(line)
+        self.assertNotIn("commit-autonomy", out)
+        self.assertEqual(self.bs.leaks(out), [])                  # so the mirror is written, not refused
+        self.assertIn(self.bs.COMMIT_TOKEN_NOTE, out)
+        self.assertIn("report the SHA and ask", out)              # the sentences around it survive
+        self.assertIn('"ok" is not a request', out)
+
     def test_the_note_agrees_with_the_bridge_note(self):
         out = self.bs.strip_claude_only(self.GIT_BULLET)
         self.assertNotIn("even when asked", out)                 # ruling 2026-10-23: a peer commits when the user asks
@@ -96,10 +107,10 @@ class FailLoud(unittest.TestCase):
             text, notes = self.bs.strip_report("## A\nkeep <!-- bridge:skip -->secret<!-- /bridge:skip --> on\n"
                                                "## Skills (Claude Code)\n- x CLAUDE_COMMIT_AUTHORIZED=1 y\n## B\n")
         self.assertNotIn("secret", text)
-        self.assertEqual(notes, ["mirror: 1 bridge:skip region(s) and 1 section(s) dropped, 0 commit-marker line(s) "
-                                 "replaced by the peer note",
-                                 "mirror: section '## Efficient Agent Usage' not found (SKIP_HEADINGS entry is stale "
-                                 "or the file moved on)"])         # configured but absent: said, not silent
+        self.assertEqual(notes, [("mirror: 1 bridge:skip region(s) and 1 section(s) dropped, 0 commit-marker line(s) "
+                                  "replaced by the peer note"),
+                                 ("mirror: section '## Efficient Agent Usage' not found (SKIP_HEADINGS entry is stale "
+                                  "or the file moved on)")])         # configured but absent: said, not silent
 
     def test_leaks_are_named(self):
         self.assertEqual(self.bs.leaks("plain text"), [])

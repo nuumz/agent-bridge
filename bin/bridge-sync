@@ -56,6 +56,7 @@ SKIP_MARK = re.compile(r"<!-- bridge:skip -->.*?<!-- /bridge:skip -->\n?", re.S)
 # The Claude-side commit marker — a peer must never learn to self-authorize. The old fenced recipe goes as a block;
 # an inline mention takes only its own sentence with it (a one-bullet Git section keeps its other rules).
 COMMIT_TOKEN = "CLAUDE_COMMIT_AUTHORIZED"
+SELF_AUTH = (COMMIT_TOKEN, "commit-autonomy on")   # both let Claude authorize itself; a sentence with either goes
 COMMIT_TOKEN_BLOCK = re.compile(r"```[^\n]*\n[^\n]*\.commit-authorized[^\n]*\n```\n?")
 COMMIT_TOKEN_NOTE = ("*(The authorization marker is Claude-side only — a peer has none. `git commit` / `push` / `tag` "
                      "only when the user asked for it in the current turn, as the bridge note says; otherwise hand the "
@@ -176,7 +177,8 @@ def _without_token_sentence(line: str) -> str:
     for part in parts:
         if not part:
             continue
-        part = COMMIT_TOKEN_NOTE if COMMIT_TOKEN in part else part
+        if any(t in part for t in SELF_AUTH) and "<!-- bridge:skip" not in part:   # an open skip marker must survive
+            part = COMMIT_TOKEN_NOTE                                                    # so leaks() still refuses
         if not (part == COMMIT_TOKEN_NOTE and out and out[-1] == COMMIT_TOKEN_NOTE):   # one note per line
             out.append(part)
     return prefix + " ".join(out)
@@ -188,7 +190,7 @@ def strip_report(body: str) -> tuple[str, list[str]]:
     a filter that matches nothing stays audible (SKIP_HEADINGS named sections that no longer existed, 2026-10-23)."""
     body, regions = SKIP_MARK.subn("", body)
     body = COMMIT_TOKEN_BLOCK.sub(COMMIT_TOKEN_NOTE + "\n", body)
-    lines = [_without_token_sentence(ln) if COMMIT_TOKEN in ln else ln for ln in body.split("\n")]
+    lines = [_without_token_sentence(ln) if any(t in ln for t in SELF_AUTH) else ln for ln in body.split("\n")]
     out, skipping, level, dropped = [], False, 0, []
     for line in lines:
         m = re.match(r"(#{1,6}) ", line)

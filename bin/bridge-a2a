@@ -22,8 +22,9 @@ tasks/cancel withdraws. A client never chooses the directory (-d is yours), sees
 
 Outbound: `send` is what `ask-agent a2a` runs (the `a2a` adapter). URL from --url or AGENT_BRIDGE_A2A_URL; the token
 only from AGENT_BRIDGE_A2A_TOKEN — never on a command line, and never in any other peer's environment. Exit 0 completed
-· 1 failed / canceled / rejected / timed out (the state and the peer's message go to stderr as `[a2a] <state>: …`) ·
-2 usage · 3 hop guard (inside a bridged run that is not the a2a run itself).
+· 1 failed / canceled / rejected / timed out (the state and the peer's message go to stderr as `[a2a] <state>: …`; a
+timed-out send withdraws its task with tasks/cancel so the remote never dispatches what nobody waits for) · 2 usage
+· 3 hop guard (inside a bridged run that is not the a2a run itself).
 Spec of the mapping: docs/PROTOCOL.md §10.4. State: ~/.agent-bridge/state/a2a/.
 """
 from __future__ import annotations
@@ -147,6 +148,7 @@ def status(_o) -> int:
     if not st or not alive(st.get("pid")):
         print("no server running" + (f" (stale state for pid {st.get('pid')})" if st else ""))
         return 1
+    st["clients"] = sorted(a2a.load_clients())   # live: the server reads this table per request, not at start
     print(json.dumps(st, indent=2))
     return 0
 
@@ -174,7 +176,7 @@ def client(o) -> int:
         return 1
     del clients[o.name]
     a2a.save_clients(clients)
-    print(f"client {o.name} removed (a running server keeps the old table until restarted)")
+    print(f"client {o.name} removed — a running server refuses its token from the next request on")
     return 0
 
 
@@ -213,7 +215,7 @@ def send(o) -> int:
     if not text:
         print("bridge-a2a: empty prompt", file=sys.stderr)
         return 2
-    cli = a2a.Client(url, os.environ.get(a2a.TOKEN_VAR), timeout=min(30.0, float(o.timeout)))
+    cli = a2a.Client(url, os.environ.get(a2a.TOKEN_VAR), timeout=max(5.0, min(30.0, float(o.timeout))))
     context = o.context
     if context == "last":
         try:
@@ -245,8 +247,19 @@ def send(o) -> int:
         print(f"[a2a] error: {exc}", file=sys.stderr)
         return 1
     answer = a2a.text_of(final)
-    if state not in a2a.TERMINAL:
-        state = "timeout"
+    if state not in a2a.TERMINAL:                 # the deadline passed: withdraw the task so nobody dispatches it later
+        try:
+            cli.cancel(tid)
+            emit({"type": "task", "id": tid, "context_id": ctx, "state": "canceled"})
+            answer, state = answer or "no reply within --timeout; the task was withdrawn (tasks/cancel)", "timeout"
+        except a2a.A2AError as exc:
+            if exc.code == a2a.NOT_CANCELABLE:    # it finished between the last poll and the cancel: that is the answer
+                final = cli.get(tid)
+                state, answer = (final.get("status") or {}).get("state"), a2a.text_of(final)
+                emit({"type": "task", "id": tid, "context_id": ctx, "state": state})
+            else:                                 # unreachable: say so, still a timeout
+                emit({"type": "error", "message": str(exc), "code": exc.code})
+                answer, state = answer or f"no reply within --timeout; withdrawal failed: {exc}", "timeout"
     emit({"type": "result", "state": state, "text": answer, "task_id": tid, "context_id": ctx,
           "agent": info.get("name"), "url": url})
     if state != "completed":

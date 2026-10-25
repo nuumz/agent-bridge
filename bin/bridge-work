@@ -96,10 +96,14 @@ def review_verdict(review: str) -> str | None:
 
 
 def review_valid(rc: int, review: str) -> bool:
-    """A review counts only when the run finished (rc 0, not an [[ASK]]) and answered in the requested shape."""
+    """A review counts only when the run finished (rc 0, not an [[ASK]]) and answered in the requested shape: a table or
+    NONE. With a BRIDGE_VERDICT line the reviewer has committed to a decision, so narration around the table/NONE is
+    tolerated (Cursor prefixes its board check); without one, free text is no review."""
     text = VERDICT_LINE_RE.sub("", review or "").strip()
-    is_table = any(re.fullmatch(r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?", ln.strip()) for ln in text.splitlines())
-    return rc == 0 and (text.upper() == "NONE" or is_table)
+    lines = [ln.strip() for ln in text.splitlines()]
+    is_table = any(re.fullmatch(r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?", ln) for ln in lines)
+    has_none = text.upper() == "NONE" or (review_verdict(review) is not None and "NONE" in (ln.upper() for ln in lines))
+    return rc == 0 and (has_none or is_table)
 
 
 def review_label(reviewer_used: str, implementer_used: str) -> str:
