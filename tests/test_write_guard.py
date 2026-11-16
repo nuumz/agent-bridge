@@ -100,6 +100,9 @@ class CopilotArgv(unittest.TestCase):
         owned = ADAPTERS["copilot"].argv(opts(discard_ok=True), "q")
         self.assertNotIn("--deny-tool=shell(git restore)", owned)
         self.assertIn("--deny-tool=shell(git commit)", owned)
+        # a bridge-owned worktree keeps the option-form denies: `git -C <wt> commit` is a commit too
+        self.assertIn("--deny-tool=shell(git -C:*)", owned)
+        self.assertIn("--deny-tool=shell(git --git-dir:*)", owned)
 
     def test_a_deep_run_names_model_and_effort_and_dash_m_wins(self):
         cp = ADAPTERS["copilot"]
@@ -235,6 +238,8 @@ class CursorHold(unittest.TestCase):
         deny = self.deny()
         self.assertIn("Shell(git push *)", deny)
         self.assertNotIn("Shell(git restore)", deny)
+        self.assertIn("Shell(git -C *)", deny)              # `git -C <wt> commit` is a commit in its worktree too
+        self.assertIn("Shell(git --git-dir *)", deny)
 
     def other(self) -> Cursor:
         other = Cursor()

@@ -30,15 +30,18 @@ PROTOCOL = ("\n\n(Bridge protocol: write the answer in the reply body itself, do
 USER_AUTHOR = f"user:{os.environ.get('USER', 'user')}"
 
 
-def protocol(conv: Conv | None) -> str:
-    """With a board-backed thread the peer asks back live (board_post + board_wait); [[ASK]] stays the fallback."""
-    if conv is None or conv.topic is None:
+def protocol(conv: Conv | None, remote: bool = False) -> str:
+    """With a board-backed thread the peer asks back live (board_post + board_wait); [[ASK]] stays the fallback. A
+    remote family has no board tools, so it gets the plain protocol on any thread."""
+    if remote or conv is None or conv.topic is None:
         return PROTOCOL
     return (f"\n\n(Bridge protocol: write the answer in the reply body itself, do not narrate. This thread is board topic "
             f"'{conv.topic_name}' — board_read it for history; the bridge posts your reply there for you, so do NOT "
-            f"board_post your answer. If you need something only the caller can provide: board_ask_user (a fact card) on "
-            f"that topic, then board_wait for the answer; if nothing arrives after two waits or the wait is refused, end "
-            f"with one line `[[ASK]] <the same question>` and stop. {BOARD_PROTOCOL})")
+            f"board_post your answer. An access or a permission you lack (a path, a tool, write mode): end with one "
+            f"line `[[ASK]] <what and why>` at once — a running session cannot be granted more; the caller re-runs it "
+            f"with the grant. Any other fact only the caller can provide: board_ask_user (a fact card) on that topic, "
+            f"then board_wait for the answer; if nothing arrives after two waits or the wait is refused, end with one "
+            f"line `[[ASK]] <the same question>` and stop. {BOARD_PROTOCOL})")
 
 
 def run(binary: str, argv: list[str], cwd: str, timeout: int, log: Path, env_extra: dict[str, str] | None = None,
@@ -156,7 +159,6 @@ class Conv:
         # board mirror: every turn is also a message on topic conv:<name>, so peers can board_read the thread,
         # `bridge-board tail conv:<name>` follows it live, and the user can steer a dialog by posting there
         self.board, self.topic_name, self.topic = board, f"conv:{name}", None
-        self.last_author: str | None = None   # the peer identity of the latest reply mirrored (for its ask-back card)
         if board is not None:
             self.topic = boardlib.topic_id(board, self.topic_name, USER_AUTHOR)
             self.seen = board.execute("SELECT COALESCE(MAX(seq),0) FROM messages WHERE topic_id=?", (self.topic,)).fetchone()[0]
@@ -182,31 +184,17 @@ class Conv:
             card = None if peer else self.open_card()
             boardlib.post(self.board, self.topic, author, text.strip(), "answer" if (peer or card) else "note",
                           card["seq"] if card else None)
-        if peer and author:
-            self.last_author = author
         if self.topic is not None and not peer:  # a request was just recorded: the run starts after this seq
             self.mark = self.board.execute("SELECT COALESCE(MAX(seq),0) FROM messages WHERE topic_id=?", (self.topic,)).fetchone()[0]
 
-    def open_card(self, family: str | None = None) -> dict | None:
-        """The newest open card to the user on this thread — optionally one posted by a run of `family` (cursor,
-        claude, …: each run is a new `<family>#<pid>` identity, the question is the same) — else None."""
+    def open_card(self) -> dict | None:
+        """The newest open card to the user on this thread (a live peer's board_ask_user), else None."""
         if self.topic is None:
             return None
-        who = "AND m.author LIKE ? " if family else ""
-        row = self.board.execute(f"SELECT m.seq, m.author, m.body FROM messages m WHERE m.topic_id=? {who}"
+        row = self.board.execute(f"SELECT m.seq, m.author, m.body FROM messages m WHERE m.topic_id=? "
                                  f"AND m.addressee LIKE 'user:%' AND {boardlib.OPEN_REQUEST} ORDER BY m.seq DESC LIMIT 1",
-                                 (self.topic, *((family + "%",) if family else ()))).fetchone()
+                                 (self.topic,)).fetchone()
         return dict(row) if row else None
-
-    def ask_user(self, author: str, question: str, how: str) -> int | None:
-        """The peer's [[ASK]] as a fact card to the user on the thread's topic, so it shows in `bridge-board cards`
-        with every other open card; None without a board or while a card of this peer is still open there (it asked
-        with board_ask_user already, or an earlier run's card was never answered)."""
-        if self.topic is None or self.open_card(re.split(r"[#@:]", author)[0]):
-            return None
-        body = boardlib.card("fact", [(question, "-", "-", f"the run stopped (exit 5); nothing proceeds until "
-                                                            f"answered — {how} \"<answer>\" (closes this card)")])
-        return boardlib.post(self.board, self.topic, author, body, "request", None, boardlib.user_identity())
 
     def _already_posted(self, author: str, text: str) -> bool:
         """True when `author` posted this text itself during the run (a peer that ignored 'do NOT board_post')."""
@@ -307,7 +295,7 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
     for n in agent.prepare(o, False):
         print(f"[bridge] {n}", file=sys.stderr)
     resolve_depth(o, prompt, conv)
-    full_prompt = agent.preamble(o) + prompt + protocol(conv)
+    full_prompt = agent.preamble(o) + prompt + protocol(conv, agent.remote)
     binary = agent.resolve()
     if not binary:
         hint = {"copilot": "npm install -g @github/copilot  (or: brew install copilot-cli)",
@@ -321,6 +309,7 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
     RUNS.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"   # pid: parallel runs must not share a log
     log = RUNS / f"{stamp}-{agent.name}.json"
+    o.usage_file = str(log.with_suffix(".usage.json"))
     (RUNS / f"{stamp}-{agent.name}.prompt.txt").write_text(full_prompt + "\n")
     if named is not None:
         named["log"] = log                     # execute's ledger row names it even if the run raises from here on
@@ -333,6 +322,8 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
         err_txt = log.with_suffix(".err").read_text(errors="replace")
         out_txt = log.read_text(errors="replace")
         failed = agent.parse(out_txt) if out_txt.strip() else None   # what the peer said before it died, if anything
+        if failed:
+            agent.read_usage(failed, log)
         board.finish(status, failed)
         if status == 143:
             print(f"ask-agent: killed after {o.timeout}s. From an agent shell run this in the background "
@@ -354,6 +345,7 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
         return status, failed, log
 
     parsed = agent.parse(log.read_text(encoding="utf-8", errors="replace"))
+    agent.read_usage(parsed, log)
     if parsed.metrics.get("tool_failures"):
         print(f"[bridge] warning: {agent.name} had {parsed.metrics['tool_failures']} tool failures "
               f"({parsed.metrics.get('permission_denials', 0)} permission denials); "
@@ -406,12 +398,11 @@ def print_parsed(agent: Adapter, p: Parsed, log: Path | None, conv: Conv | None)
               + (f"{len(bad)} do not resolve (UNVERIFIED): {listed}" if bad else "all resolve"), file=sys.stderr)
     m = ASK_RE.search(p.result or "")
     if m:
+        # the ask goes to the caller (the lead) alone, never as a card to the user: the lead answers it, or grants an
+        # access by re-running the thread with it, under its own workspace rules, and asks the user only what those
+        # rules keep for them (user ruling 2026-11-16)
         how = f"ask-agent {agent.name} --conv {conv.name}" if conv else f"ask-agent {agent.name} --session {p.session}"
-        print(f"[bridge] the peer asks back: {m.group(1)}\n[bridge] answer with: {how} \"<answer>\"", file=sys.stderr)
-        if conv:
-            seq = conv.ask_user(conv.last_author or f"{agent.name}@hop", m.group(1), how)
-            if seq:
-                print(f"[bridge] card posted on {conv.topic_name} seq={seq} (see `bridge-board cards`)",
-                      file=sys.stderr)
+        print(f"[bridge] the peer asks back: {m.group(1)}\n[bridge] answer with: {how} \"<answer>\" (to grant an "
+              f"access it names, add it to that run: --add-dir, -m write)", file=sys.stderr)
         return 5
     return 0

@@ -70,15 +70,19 @@ EXPECT = {
                "plan": dict(has=[("--mode", "plan")], not_=["--force"]),
                "write": dict(has=["--force"], not_=["--mode"])},
         board_ask=dict(has=["--approve-mcps"], not_=["--force"]),
-        git_deny=None, hold={"ask": ["Write(**)"], "write": [f"Shell({c})" for c in core.GIT_DENY]},
+        # commit/push/tag and their option forms (`git -C <dir> commit`) are held in every mode
+        git_deny=None, hold={"ask": ["Write(**)", *(f"Shell({c})" for c in core.GIT_DENY + core.GIT_OPTION_FORMS)],
+                             "plan": [f"Shell({c})" for c in core.GIT_DENY + core.GIT_OPTION_FORMS],
+                             "write": [f"Shell({c})" for c in core.GIT_DENY + core.GIT_OPTION_FORMS]},
         add_dir=lambda d: ("--add-dir", d), model=lambda m: ("--model", m),
         resume=lambda s: ("--resume", s), cont="--continue",
         quota="You're out of usage. Upgrade your plan or wait for the limit to reset.",
     ),
     "copilot": dict(
         output=("--output-format", "json"), prompt_flag="-p",
-        modes={"ask": dict(has=["--deny-tool=write", "--deny-tool=shell"], not_=["--allow-all-tools"]),
-               "plan": dict(has=["--deny-tool=write", "--deny-tool=shell"], not_=["--allow-all-tools"]),
+        # read-only: the CLI's own read-only check runs the shell, so there is no blanket shell deny
+        modes={"ask": dict(has=["--deny-tool=write"], not_=["--allow-all-tools", "--deny-tool=shell"]),
+               "plan": dict(has=["--deny-tool=write"], not_=["--allow-all-tools", "--deny-tool=shell"]),
                "write": dict(has=["--allow-all-tools"], not_=["--deny-tool=write", "--deny-tool=shell"])},
         board_ask=dict(has=["--deny-tool=write"], not_=["--allow-all-tools"]),
         git_deny=lambda c: f"--deny-tool=shell({c})", hold=None,
@@ -207,12 +211,13 @@ class Conformance(unittest.TestCase):
             self.assertEqual(argv[-2], x["prompt_flag"], "the prompt is the last argument, after its flag")
             self.assertIn(PROMPT, argv[-1])
             self.assertIn("Bridge protocol", argv[-1], "the protocol suffix rides on the prompt")
-            if agent.supports_deny and mode == "write":
-                for cmd in core.GIT_DENY:               # history stays the user's
-                    self.assertTrue(present(argv, x["git_deny"](cmd)), (cmd, argv))
-                for cmd in core.GIT_DISCARD:            # the caller's checkout: their uncommitted work stays
-                    self.assertTrue(present(argv, x["git_deny"](cmd)), (cmd, argv))
+            if agent.supports_deny:
+                for cmd in core.GIT_DENY:               # history stays the user's, in every mode
+                    self.assertTrue(present(argv, x["git_deny"](cmd)), (mode, cmd, argv))
                 for cmd in core.BRIDGE_CMDS:            # one hop: no bridge command, local or over the network
+                    self.assertTrue(present(argv, x["git_deny"](cmd)), (mode, cmd, argv))
+            if agent.supports_deny and mode == "write":
+                for cmd in core.GIT_DISCARD:            # the caller's checkout: their uncommitted work stays
                     self.assertTrue(present(argv, x["git_deny"](cmd)), (cmd, argv))
             if not agent.supports_deny:
                 self.assertIsNone(x["git_deny"], "a family without a deny flag declares a hold or a sandbox instead")
@@ -266,7 +271,9 @@ class Conformance(unittest.TestCase):
                       p.stdout)
         self.assertEqual(len(self.calls()), before + 1, "one spawn per run")
         call = self.calls()[before]
-        self.assertEqual(call["argv"], expected, "the run sends exactly what --dry-run showed")
+        def same(argv):                     # the usage file is named after the run's log, which a dry run has not got
+            return ["--usage-output-file=" if a.startswith("--usage-output-file=") else a for a in argv]
+        self.assertEqual(same(call["argv"]), same(expected), "the run sends exactly what --dry-run showed")
         self.assertEqual(call["cwd"], str(self.work.resolve()))
         self.assertIn(core.HOP_VAR, call["env"], "the peer is told it is one hop in")
         self.assertRegex(call["env"].get(core.IDENTITY_VAR, ""), rf"^{name}#\d+$")

@@ -1,17 +1,20 @@
 """P2 — the protocol on top of addressed messages: one card shape for everything that needs the human, a `blocked`
-that names what is missing, personas as @roles, the peer's [[ASK]] and bridge-fix's decision card landing on the board
-as cards, and a live peer that is fed only what reaches it and answers the agent it talked to."""
+that names what is missing, personas as @roles, the peer's [[ASK]] going to its caller (not to the user as a card),
+bridge-fix's decision card landing on the board, and a live peer that is fed only what reaches it and answers the agent
+it talked to."""
 from __future__ import annotations
 
 import argparse
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -172,30 +175,33 @@ class Roles(Board):
 
 
 class AskBack(Board):
-    def test_the_peers_ask_lands_as_a_fact_card_once(self):
+    def test_the_peers_ask_goes_to_its_caller_not_to_the_user(self):
         conv = runner.Conv("t1", self.conn)
         conv.record("caller", "cursor", "look at X", author=USER)
-        conv.record("cursor", "caller", "need the env\n[[ASK]] which env?", "s1", peer="cursor", author=CURSOR)
+        conv.record("cursor", "caller", "need the env\n[[ASK]] grant /x/spec, the cited rules are there", "s1",
+                    peer="cursor", author=CURSOR)
         agent = argparse.Namespace(name="cursor")
-        parsed = Parsed("need the env\n[[ASK]] which env?", "s1", 1, 1, False, "")
-        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+        parsed = Parsed("need the env\n[[ASK]] grant /x/spec, the cited rules are there", "s1", 1, 1, False, "")
+        err = io.StringIO()
+        with mock.patch("sys.stdout"), redirect_stderr(err):
             self.assertEqual(runner.print_parsed(agent, parsed, Path("-"), conv), 5)
-            self.assertEqual(runner.print_parsed(agent, parsed, Path("-"), conv), 5)   # printed twice, posted once
-        cards = boardlib.user_cards(self.conn)
-        self.assertEqual([(c["topic"], c["author"], c["to"]) for c in cards], [("conv:t1", CURSOR, USER)])
-        self.assertIn("| which env? | - | - |", cards[0]["body"])
-        self.assertIn("ask-agent cursor --conv t1", cards[0]["body"])
-        self.assertEqual(boardlib.header(cards[0]["body"])["shape"], "fact")
-        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM messages WHERE kind='request'").fetchone()[0], 1)
+        # the lead decides first (user ruling 2026-11-16): nothing reaches the user's cards, the caller gets the command
+        self.assertEqual(boardlib.user_cards(self.conn), [])
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM messages WHERE kind='request'").fetchone()[0], 0)
+        self.assertIn("answer with: ask-agent cursor --conv t1", err.getvalue())
+        self.assertIn("--add-dir", err.getvalue())
         self.assertIn(core.BOARD_PROTOCOL, runner.protocol(conv))
-        self.assertIn("board_ask_user", runner.protocol(conv))                        # one way to ask, not two
+        self.assertIn("An access or a permission you lack is never a card", core.BOARD_PROTOCOL)
+        self.assertIn("`[[ASK]] <what and why>` at once", runner.protocol(conv))   # access: no live wait
+        self.assertIn("board_ask_user", runner.protocol(conv))                        # a fact: asked live
         self.assertNotIn("board_ask_user", runner.protocol(None))                     # no board: the plain protocol
-        # the next run of the thread: the card is still open, so a repeated [[ASK]] posts nothing new …
+        # a fact the peer asked live with board_ask_user is still closed by the caller's `--conv` answer
+        tid = boardlib.topic_id(self.conn, "conv:t1", None)
+        live = boardlib.post(self.conn, tid, CURSOR, boardlib.card("fact", [("which env?", "-", "-", "uat")]),
+                             "request", None, boardlib.user_identity())
+        cards = boardlib.user_cards(self.conn)
+        self.assertEqual([c["seq"] for c in cards], [live])
         again = runner.Conv("t1", self.conn)
-        with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
-            runner.print_parsed(agent, parsed, Path("-"), again)
-        self.assertEqual(len(boardlib.user_cards(self.conn)), 1)
-        # … and the caller's `--conv` answer is mirrored as the reply that closes it
         again.record("caller", "cursor", "uat", author=USER)
         self.assertEqual(boardlib.user_cards(self.conn), [])
         last = self.conn.execute("SELECT kind, reply_to FROM messages ORDER BY seq DESC LIMIT 1").fetchone()

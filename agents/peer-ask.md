@@ -39,7 +39,7 @@ Exit code meanings — copy the matching line:
 - 0 ok · 1 peer reported an error (answer may still be useful) · 2 usage error (quote the ask-agent message)
 - 3 hop guard: this subagent was spawned inside a bridged run — report it, do nothing else
 - 5 the peer asked back: quote the `[[ASK]]` question and the exact `ask-agent … --conv/--session … "<answer>"` command
-  the bridge printed; the caller (or the user) answers, not you
+  the bridge printed; the caller answers it or grants the access it names, not you — nothing went to the user
 - 6 cursor write refused while a read-only run holds the deny · 7 **peer out of quota** (quote the line; the caller must
   tell the user which peer is out and for how long — do not retry) · 127 peer CLI not installed · 143 killed at timeout
   (quote the log path; the caller may resume with `--session` from the log)

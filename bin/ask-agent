@@ -237,8 +237,9 @@ def main() -> int:
         o.session = session or ""
         resolve_depth(o, prompt, conv)
         notes = agent.prepare(o, True)
+        o.usage_file = "<run log>.usage.json"           # a real run names it after its log
         print(json.dumps({"agent": agent.name, "binary": agent.resolve() or "NOT INSTALLED", "cwd": o.dir,
-                          "argv": agent.argv(o, agent.preamble(o) + prompt + protocol(conv)),
+                          "argv": agent.argv(o, agent.preamble(o) + prompt + protocol(conv, agent.remote)),
                           "env": {HOP_VAR: "1", **BoardRun(agent, False, Path("-")).env},
                           "prepare": notes, "conv": o.conv or None, "session": session}, ensure_ascii=False, indent=2))
         return 0

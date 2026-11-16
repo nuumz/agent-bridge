@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from .core import (BOARD_TOOLS, CURSOR_PULL, STATE, BRIDGE_CMDS, CLAUDE_READ_ONLY_BASH, CLAUDE_WORKTREE_BASH,
-                   CLAUDE_WRITE_BASH, DISABLED, GIT_DENY, GIT_DISCARD, HOME, ROOT, dirty_paths, find_bin, last_json,
-                   sum_keys)
+                   CLAUDE_WRITE_BASH, DISABLED, GIT_DENY, GIT_DISCARD, GIT_OPTION_FORMS, HOME, ROOT, dirty_paths,
+                   find_bin, last_json, sum_keys)
 
 class Parsed:
     def __init__(self, result: str, session: str | None = None, tok_in: Any = "?", tok_out: Any = "?",
@@ -25,6 +25,11 @@ class Parsed:
             result, session, tok_in, tok_out, is_error, extra)
         self.metrics = metrics if metrics is not None else {}
         self.citations: list[dict] = []          # set by the runner: the answer's file:line citations, as scored
+
+
+# the board MCP server a run can carry on its own command line (Copilot, Codex); bridge-sync registers it for the rest
+BOARD_SERVER = "bridge_board"
+BOARD_BIN = ROOT / "bin" / "bridge-board"
 
 
 class Adapter:
@@ -56,6 +61,9 @@ class Adapter:
     def prepare(self, o: argparse.Namespace, dry: bool) -> list[str]:
         """Make the machine-wide rules reachable for this run; returns notes for the [bridge] line."""
         return []
+
+    def read_usage(self, parsed: Parsed, log: Path) -> None:
+        """Fold a usage file the run wrote beside its log into `parsed` (Copilot's --usage-output-file)."""
 
     def preamble(self, o: argparse.Namespace) -> str:
         """Text prepended to the prompt when a rules file cannot be injected (e.g. fresh worktree)."""
@@ -143,7 +151,8 @@ class Claude(Adapter):
                     "cannot be approved, so use ONE simple command per Bash call — no `for` loops, no `VAR=…;` prefixes, "
                     "no `&&` chains. Pre-approved: the read-only set (rg, git log/show/diff, cat/sed -n, find, ls) plus build/"
                     "test runners (mvn, gradle, bun, npm test/run, npx, tsc, pytest, python -m pytest, ruff, go, cargo, make) "
-                    "and git add. Touch only the files the task names; leave everything uncommitted."
+                    "and git add. Touch only the files the task names; leave everything uncommitted — the caller "
+                    "commits: end with the changed files and a one-line commit message."
                     + ("" if getattr(o, "discard_ok", False) else
                        " This is the caller's checkout: git restore/checkout/switch/stash/reset/clean are denied — "
                        "their uncommitted work stays as it is.") + ")\n\n")
@@ -213,7 +222,11 @@ class Cursor(Adapter):
     # per ask run. Allowlist cannot override Shell(*) (verified 2026-09-12). Keep Write(**) + denials for the known
     # Write bypass (printf > file) and common filesystem mutators. Residual: unrestricted shell can still write via
     # python/node/redirection — ask preamble tells the peer to use read-only shell only.
-    DENY_ENTRIES = (
+    # a write run (`--force`: everything but the global deny) holds these instead: history stays the user's, and in
+    # the caller's checkout (not discard_ok) their uncommitted work stays
+    WRITE_ENTRIES = tuple(f"Shell({c}{s})" for c in GIT_DENY + GIT_OPTION_FORMS for s in ("", " *"))
+    # …and ask and plan runs hold them too: commit/push/tag are the lead's in every peer run (user ruling 2026-11-16)
+    DENY_ENTRIES = WRITE_ENTRIES + (
         "Write(**)",
         "Shell(printf)", "Shell(printf *)",
         "Shell(tee)", "Shell(tee *)",
@@ -230,9 +243,6 @@ class Cursor(Adapter):
         "Shell(dd)", "Shell(dd *)",
         "Shell(truncate)", "Shell(truncate *)",
     )
-    # a write run (`--force`: everything but the global deny) holds these instead: history stays the user's, and in
-    # the caller's checkout (not discard_ok) their uncommitted work stays
-    WRITE_ENTRIES = tuple(f"Shell({c}{s})" for c in GIT_DENY for s in ("", " *"))
     DISCARD_ENTRIES = tuple(f"Shell({c}{s})" for c in GIT_DISCARD for s in ("", " *"))
     DENY_STATE = STATE / "cursor-deny.json"
     DENY_LOCK = STATE / "cursor-deny.lock"
@@ -300,7 +310,7 @@ class Cursor(Adapter):
                 state["pids"].append(os.getpid())
             if "Write(**)" in entries and os.getpid() not in state.setdefault("ask", []):
                 state["ask"].append(os.getpid())            # the holders a write run must not start under
-            return f"cursor: {what} held (Shell(*) not denied — git/rg/cat ok; holders: {state['pids']})"
+            return f"cursor: {what} held (Shell(*) not denied — git (not -C/-c)/rg/cat ok; holders: {state['pids']})"
         note = self._deny_state(fn)
         if not self._held:
             self._held = True
@@ -348,6 +358,8 @@ class Cursor(Adapter):
         notes = []
         if o.mode == "ask" and not dry:
             notes.append(self._deny_acquire())
+        elif o.mode == "plan" and not dry:     # no Write(**): `--mode plan` keeps files read-only; writes may start
+            notes.append(self._deny_acquire(self.WRITE_ENTRIES, "git commit/push/tag"))
         elif o.mode == "write":
             holders = [q for q in self._deny_holders() if q != os.getpid()]
             if holders:
@@ -493,11 +505,14 @@ class Copilot(Adapter):
         ) or "- no repo-level instruction file found"
         access = ", ".join(str(r) for r in roots)
         mode = (
-            "Read-only: shell and file writes are denied, including builds/tests. Use native glob, rg and view tools; "
-            "do not attempt bash even for git status/diff. If the task requires shell evidence, report that limit."
+            "Read-only: file writes are denied. The shell runs read-only commands only (git log/show/diff/grep/status/"
+            "blame, cat, sed -n); one that writes, runs another program or needs approval is denied, builds/tests too. "
+            "Run git from the working directory, never `git -C`: the CLI refuses -C even for a read; read other "
+            "granted roots with the file tools. If the task requires other shell evidence, report that limit."
             if o.mode != "write" else
             "Write: edit only the task's allowed file set, run its verification command, and report the actual output. "
-            "Do not stage, commit, push or tag. An analysis alone is not an implementation."
+            "Do not stage, commit, push or tag — the caller commits: end with the changed files and a one-line commit "
+            "message. An analysis alone is not an implementation."
         )
         return (
             f"(Bridge workspace bootstrap\nWorking directory: {cwd}\n"
@@ -506,7 +521,8 @@ class Copilot(Adapter):
             f"Existing instruction files to check before work:\n{inventory}\n"
             "Copilot discovers personal instructions and skills itself; also follow applicable path-scoped repo rules. "
             "This inventory is not proof they loaded. Do not create or copy instructions, or build a knowledge graph "
-            "just to prepare the workspace unless the task requests it.\n"
+            "just to prepare the workspace unless the task requests it; do not load the graphify skill (no graph is "
+            "built for a bridged run).\n"
             f"{mode}\n"
             "Discover paths before reading them; do not guess a workspace layout. A denied tool/path cannot be approved "
             "in this headless run: do not retry it or bypass it. Continue with authorized evidence; if essential evidence "
@@ -520,12 +536,33 @@ class Copilot(Adapter):
         # event the session id + usage — before 2026-09-26 the bridge used `-s` plain text and Copilot runs had no
         # session to resume and no duration/cost in the run logs
         a = ["--no-ask-user", "--output-format", "json"]
+        # no MCP server but the board: the built-in GitHub server and the user's ~/.copilot servers loaded on every run
+        # and none was ever called (117 runs to 2026-11-16), a write run's --allow-all-tools would approve all of their
+        # tools (a browser driver, web search) unasked; one probe without them reached its first model call in 5.0 s
+        # against a 7.1 s median (1.0.112)
+        a += ["--disable-builtin-mcps"] + [f"--disable-mcp-server={n}" for n in self._user_mcp_servers(o.board)]
+        if o.board:
+            # the board rides on the run (as for Codex): nothing is written to ~/.copilot; a read-only run asks before
+            # any MCP tool, so the server is allowed by name (measured: board_status answered, 2026-11-16)
+            board = {"type": "local", "command": str(BOARD_BIN), "args": ["serve"], "tools": ["*"],
+                     "env": {"AGENT_BRIDGE_AGENT": self.name, "AGENT_BRIDGE_HOP": "1"}}
+            a += ["--additional-mcp-config", json.dumps({"mcpServers": {BOARD_SERVER: board}}),
+                  f"--allow-tool={BOARD_SERVER}"]
+        if getattr(o, "usage_file", ""):
+            a += [f"--usage-output-file={o.usage_file}"]       # tokens and the model that ran: not in the JSONL
         if o.mode == "write":
             a += ["--allow-all-tools"]            # …minus history, the caller's checkout, and a second hop
-            for c in GIT_DENY + (() if getattr(o, "discard_ok", False) else GIT_DISCARD) + BRIDGE_CMDS:
-                a += [f"--deny-tool=shell({c})", f"--deny-tool=shell({c}:*)"]
+            denied = GIT_DENY + (GIT_OPTION_FORMS if getattr(o, "discard_ok", False) else GIT_DISCARD) + BRIDGE_CMDS
         else:
-            a += ["--deny-tool=write", "--deny-tool=shell"]
+            # read-only git and reads (user ruling 2026-11-16): no shell deny and no allow rule, so the shell runs what
+            # the CLI's own read-only check approves (git log/show/diff/grep -n/status/blame, cat, sed -n) and, with
+            # --no-ask-user, refuses whatever it would ask about — git log --output=, git grep -O, rg --pre, find -exec,
+            # `git -c`, `git -C`, a redirect (measured on 1.0.112 in a scratch repo, 2026-11-16). An allow rule such as
+            # shell(git log) would let `git log --output=<file>` write, so there is none.
+            a += ["--deny-tool=write"]
+            denied = GIT_DENY + BRIDGE_CMDS
+        for c in denied:
+            a += [f"--deny-tool=shell({c})", f"--deny-tool=shell({c}:*)"]
         for t in o.deny:
             a += [f"--deny-tool={t}"]
         if o.model:
@@ -536,6 +573,34 @@ class Copilot(Adapter):
         for d in o.add_dir:
             a += [f"--add-dir={d}"]
         return a
+
+    @staticmethod
+    def _user_mcp_servers(board: bool) -> list[str]:
+        """Every server of ~/.copilot/mcp-config.json — a user-registered bridge_board too when the run opts out."""
+        try:
+            servers = json.loads((HOME / ".copilot/mcp-config.json").read_text()).get("mcpServers") or {}
+        except (OSError, ValueError, AttributeError):
+            return []
+        return [n for n in servers if n != BOARD_SERVER or not board] if isinstance(servers, dict) else []
+
+    def read_usage(self, parsed, log):
+        # the file is the session's running total, like ai_credits_session: on a resumed session it is never this
+        # run's spend (measured: a resume grew the same file's counts, 2026-11-16)
+        try:
+            u = json.loads(log.with_suffix(".usage.json").read_text())
+        except (OSError, ValueError):
+            return
+        models = u.get("modelMetrics") if isinstance(u, dict) else None
+        if not isinstance(models, dict):
+            return
+        use = [m.get("usage") or {} for m in models.values() if isinstance(m, dict)]
+        for key, field in (("tokens_session_in", "inputTokens"), ("tokens_session_out", "outputTokens")):
+            counts = [x[field] for x in use if isinstance(x.get(field), int) and not isinstance(x[field], bool)]
+            if counts:                                 # no count is unknown, never a measured zero
+                parsed.metrics[key] = sum(counts)
+        if isinstance(u.get("currentModel"), str):
+            parsed.metrics["model"] = u["currentModel"]
+            parsed.extra += f" model={u['currentModel']}"
 
     def argv(self, o, prompt):
         a = self._base(o)
@@ -609,8 +674,6 @@ class Codex(Adapter):
     codex-rs `exec/src/cli.rs` (2026-10-24) and are not yet verified against a real CLI (SHARED-RULES §2)."""
     name, binary = "codex", "codex"
     rules_mirror = "~/.codex/AGENTS.md (Codex's global instructions; not written by bridge-sync yet)"
-    BOARD_SERVER = "bridge_board"
-    BOARD_BIN = ROOT / "bin" / "bridge-board"
 
     @staticmethod
     def _home() -> Path:
@@ -650,7 +713,8 @@ class Codex(Adapter):
                     "there is no network, and "
                     ".git/ stays read-only — never git commit/push/tag, and do not work around a denied path. Touch only "
                     "the files the task names; run the task's verification command and report its actual output; leave "
-                    "everything uncommitted."
+                    "everything uncommitted — the caller commits: end with the changed files and a one-line commit "
+                    "message."
                     + ("" if getattr(o, "discard_ok", False) else
                        " This is the caller's checkout: do not git restore/checkout/switch/stash/reset/clean — their "
                        "uncommitted work stays as it is.") + ")\n\n")
@@ -672,9 +736,9 @@ class Codex(Adapter):
             # the board MCP rides on the run as `-c` overrides (values parse as TOML), so nothing is written to
             # ~/.codex/config.toml; identity is still resolved by the server from the run's pid, never from this env —
             # and should that lookup miss (no `ps`), the hop marker makes the fallback `codex@hop`, not the primary
-            a += ["-c", f"mcp_servers.{self.BOARD_SERVER}.command={json.dumps(str(self.BOARD_BIN))}",
-                  "-c", f'mcp_servers.{self.BOARD_SERVER}.args=["serve"]',
-                  "-c", f'mcp_servers.{self.BOARD_SERVER}.env={{AGENT_BRIDGE_AGENT="{self.name}", AGENT_BRIDGE_HOP="1"}}']
+            a += ["-c", f"mcp_servers.{BOARD_SERVER}.command={json.dumps(str(BOARD_BIN))}",
+                  "-c", f'mcp_servers.{BOARD_SERVER}.args=["serve"]',
+                  "-c", f'mcp_servers.{BOARD_SERVER}.env={{AGENT_BRIDGE_AGENT="{self.name}", AGENT_BRIDGE_HOP="1"}}']
         return a
 
     def argv(self, o, prompt):

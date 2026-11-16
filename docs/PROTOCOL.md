@@ -260,7 +260,7 @@ The direct channel (§10.2) and the pipelines read these from a reply body; each
 
 | Marker | Where | Meaning |
 |---|---|---|
-| `[[ASK]] <question>` | last line of a peer's reply | the peer needs one fact only the caller has; `ask-agent` exits 5 and, with a board thread, posts the question as a fact card |
+| `[[ASK]] <question>` | last line of a peer's reply | the peer needs one fact or one access only the caller has; `ask-agent` exits 5 to the caller, which answers or grants it — nothing is posted to the user |
 | `[[AGREE]]` / `[[DONE]]` | a dialog or live-room reply | nothing left to dispute — not "verified". Both sides ending on it ends a dialog; a live peer is not woken by replies that only agree back |
 | `[[STOP]]` | a `user:*` `decision` | ends a running dialog before its next turn, or every live peer the decision reaches |
 | `BRIDGE_VERDICT=APPROVE` / `BRIDGE_VERDICT=REVISE` | last line of a `bridge-work` review | decides the fix loop; `REVISE` without a finding row is itself a must-fix |
