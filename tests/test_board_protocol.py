@@ -195,19 +195,16 @@ class AskBack(Board):
         self.assertIn("`[[ASK]] <what and why>` at once", runner.protocol(conv))   # access: no live wait
         self.assertIn("board_ask_user", runner.protocol(conv))                        # a fact: asked live
         self.assertNotIn("board_ask_user", runner.protocol(None))                     # no board: the plain protocol
-        # a fact the peer asked live with board_ask_user is still closed by the caller's `--conv` answer
+        # a card left open on the thread (another run's, or one from before runs withdrew their own) is never answered
+        # by the caller's next `--conv` message: that is a new turn, so it is a note and the card stays for the lead
         tid = boardlib.topic_id(self.conn, "conv:t1", None)
         live = boardlib.post(self.conn, tid, CURSOR, boardlib.card("fact", [("which env?", "-", "-", "uat")]),
                              "request", None, boardlib.user_identity())
-        cards = boardlib.user_cards(self.conn)
-        self.assertEqual([c["seq"] for c in cards], [live])
         again = runner.Conv("t1", self.conn)
         again.record("caller", "cursor", "uat", author=USER)
-        self.assertEqual(boardlib.user_cards(self.conn), [])
+        self.assertEqual([c["seq"] for c in boardlib.user_cards(self.conn)], [live])
         last = self.conn.execute("SELECT kind, reply_to FROM messages ORDER BY seq DESC LIMIT 1").fetchone()
-        self.assertEqual(tuple(last), ("answer", cards[0]["seq"]))
-        again.record("caller", "cursor", "and now?", author=USER)                      # no open card: a plain note
-        self.assertEqual(self.conn.execute("SELECT kind FROM messages ORDER BY seq DESC LIMIT 1").fetchone()[0], "note")
+        self.assertEqual(tuple(last), ("note", None))
 
     def test_without_a_board_the_ask_is_only_printed(self):
         conv = runner.Conv("t2", None)

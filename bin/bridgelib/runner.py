@@ -101,6 +101,7 @@ class BoardRun:
             return
         if self.pid is not None:
             boardlib.worker_unregister(self.board, self.pid)
+        self._withdraw_cards(status)
         if self.task_id is None:
             return
         text = (parsed.result or "").strip() if parsed is not None else ""
@@ -112,6 +113,31 @@ class BoardRun:
                                "done" if ok else "failed")
         except boardlib.BoardError:
             pass
+
+    def _withdraw_cards(self, status: int) -> None:
+        """A card this run posted (board_ask_user) and nobody answered ends with the run: the run's own `[[ASK]]` (or,
+        without one, the stderr line below) takes the question to its caller, the lead, which answers it or asks the user (user ruling 2026-11-16). Left open,
+        the card outlived its run and was handed to the user days later with no session able to use the answer."""
+        rows = self.board.execute(f"SELECT t.name, m.topic_id, m.seq, m.addressee, m.body FROM messages m JOIN topics "
+                                  f"t ON t.id=m.topic_id WHERE m.author=? AND m.addressee LIKE 'user:%' AND "
+                                  f"{boardlib.OPEN_REQUEST}", (self.identity,)).fetchall()
+        for r in rows:
+            try:
+                boardlib.post(self.board, r["topic_id"], self.identity,
+                              f"withdrawn: the run ended (exit {status}); the question goes to its caller first",
+                              "done", reply_to=r["seq"], to=r["addressee"])
+            except boardlib.BoardError as exc:
+                print(f"[bridge] warning: could not withdraw card seq {r['seq']}: {exc}", file=sys.stderr)
+                continue
+            # the caller sees the question whether or not the reply carried an [[ASK]] (a crash, a run out of time);
+            # a card() body gives its questions, any other request body its first line after the header — or its
+            # first line at all, when every line reads as a header (`Question: which env?`)
+            body = r["body"]
+            lines = [ln for ln in body.splitlines()[len(boardlib.header(body)):] if ln.strip()]
+            whole = [ln for ln in body.splitlines() if ln.strip()]
+            asked = " · ".join(boardlib.card_questions(body)) or (lines or whole or [""])[0]
+            print(f"[bridge] withdrew the run's open card {r['name']} seq {r['seq']} — it asked: {asked[:300]}",
+                  file=sys.stderr)
 
     def _reply(self, ok: bool, status: int, text: str) -> None:
         """A dispatched task that is a turn owes its request a closing reply. The run usually posts it itself
@@ -180,21 +206,11 @@ class Conv:
             f.write(f"### {n}. {frm} → {to}\n\n{text.strip()}\n\n")
         self.state_path.write_text(json.dumps(self.state, indent=2))
         if self.topic is not None and author and not self._already_posted(author, text):
-            # the caller's next message answers the card the peer left open, if any — so `--conv` closes it
-            card = None if peer else self.open_card()
-            boardlib.post(self.board, self.topic, author, text.strip(), "answer" if (peer or card) else "note",
-                          card["seq"] if card else None)
+            # the caller's message is a new turn, never an answer to a card left on the thread: a run withdraws its
+            # own cards when it ends, so a card still open here is another run's, or one from before that rule
+            boardlib.post(self.board, self.topic, author, text.strip(), "answer" if peer else "note")
         if self.topic is not None and not peer:  # a request was just recorded: the run starts after this seq
             self.mark = self.board.execute("SELECT COALESCE(MAX(seq),0) FROM messages WHERE topic_id=?", (self.topic,)).fetchone()[0]
-
-    def open_card(self) -> dict | None:
-        """The newest open card to the user on this thread (a live peer's board_ask_user), else None."""
-        if self.topic is None:
-            return None
-        row = self.board.execute(f"SELECT m.seq, m.author, m.body FROM messages m WHERE m.topic_id=? "
-                                 f"AND m.addressee LIKE 'user:%' AND {boardlib.OPEN_REQUEST} ORDER BY m.seq DESC LIMIT 1",
-                                 (self.topic,)).fetchone()
-        return dict(row) if row else None
 
     def _already_posted(self, author: str, text: str) -> bool:
         """True when `author` posted this text itself during the run (a peer that ignored 'do NOT board_post')."""
@@ -317,7 +333,18 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
         conv.record(frm, agent.name, prompt, author=USER_AUTHOR if frm == "caller" else None)
 
     board = BoardRun(agent, o.board, log, o.timeout)
-    status = run(binary, agent.argv(o, full_prompt), o.dir, o.timeout, log, board.env, board.on_start, agent.env_keep)
+
+    def peer_run(argv: list[str], run_log: Path, **kw: Any) -> int:
+        try:
+            return run(binary, argv, o.dir, o.timeout, run_log, board.env, keep=agent.env_keep, **kw)
+        except SystemExit as exc:            # a signal to ask-agent (a caller's Bash cap, bridge-fix): the run is over
+            try:
+                board.finish(exc.code if isinstance(exc.code, int) else 1, None)
+            except Exception as err:  # noqa: BLE001 — the signal's exit code must survive a board failure
+                print(f"[bridge] warning: could not end the run on the board: {err}", file=sys.stderr)
+            raise
+
+    status = peer_run(agent.argv(o, full_prompt), log, on_start=board.on_start)
     if status != 0:
         err_txt = log.with_suffix(".err").read_text(errors="replace")
         out_txt = log.read_text(errors="replace")
@@ -369,8 +396,7 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
                    "Do not narrate, do not call tools.")
         rlog = RUNS / f"{stamp}-{agent.name}.recover.json"
         (RUNS / f"{stamp}-{agent.name}.recover.prompt.txt").write_text(rprompt + "\n")
-        if run(binary, agent.resume_argv(o, parsed.session, rprompt), o.dir, o.timeout, rlog, board.env,
-               keep=agent.env_keep) != 0:
+        if peer_run(agent.resume_argv(o, parsed.session, rprompt), rlog) != 0:
             print(f"ask-agent: recovery run failed (see {rlog.with_suffix('.err')}); resume by hand with --session "
                   f"{parsed.session}", file=sys.stderr)
             board.finish(1, parsed)

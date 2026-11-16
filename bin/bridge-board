@@ -111,7 +111,8 @@ TOOLS = [
      "choice only they own, kind=fact for information nobody else has. Give the question, the options, your "
      "recommendation and what happens if nobody decides; the card is posted as a request to the user on the topic "
      "(shape decision|fact) and they reply kind=decision (a decision) or kind=answer (a fact) to its seq. Keep working "
-     "on what does not depend on the answer; say in your done which part rests on the default.",
+     "on what does not depend on the answer; say in your done which part rests on the default. In a bridged run, a "
+     "card still open when the run ends is withdrawn: repeat its question as [[ASK]] in your reply.",
      "inputSchema": {"type": "object", "required": ["topic", "kind", "question", "options", "recommendation",
                                                     "if_undecided"], "properties": {
          "topic": {"type": "string"}, "kind": {"type": "string", "enum": ["decision", "fact"]},

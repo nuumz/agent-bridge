@@ -7,6 +7,7 @@ import argparse
 import importlib.machinery
 import importlib.util
 import io
+from contextlib import redirect_stderr
 import os
 import subprocess
 import sys
@@ -19,7 +20,7 @@ BIN = Path(__file__).resolve().parents[1] / "bin"
 sys.path.insert(0, str(BIN))
 
 import boardlib
-from bridgelib import ledger
+from bridgelib import ledger, runner
 from bridgelib.adapters import ADAPTERS, Parsed
 from bridgelib.runner import BoardRun
 
@@ -138,6 +139,51 @@ class Turns(unittest.TestCase):
     def replies(self, seq: int) -> list[dict]:
         return [dict(r) for r in self.conn.execute("SELECT author, kind, body, addressee FROM messages WHERE "
                                                    "reply_to=? ORDER BY seq", (seq,))]
+
+    def test_a_card_left_open_by_an_ended_run_is_withdrawn_to_its_caller(self):
+        ask = boardlib.card("fact", [("which env?", "-", "-", "uat")])
+        mine = boardlib.post(self.conn, self.tid, CURSOR_RUN, ask, "request", to=USER)
+        other = boardlib.post(self.conn, self.tid, "claude#1", ask, "request", to=USER)   # another run: untouched
+        with mock.patch.dict(os.environ, {"AGENT_BRIDGE_IDENTITY": CURSOR_RUN}):
+            run = BoardRun(ADAPTERS["cursor"], True, Path(self.tmp.name) / "run.json", 60)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            run.finish(0, Parsed("[[ASK]] which env?"))           # an [[ASK]] reply ends with status 0 here
+        self.assertEqual([c["seq"] for c in boardlib.user_cards(self.conn)], [other])
+        (r,) = self.replies(mine)
+        self.assertEqual((r["author"], r["kind"]), (CURSOR_RUN, "done"))
+        self.assertIn("which env?", err.getvalue())                       # the caller sees what was asked
+        plain = boardlib.post(self.conn, self.tid, CURSOR_RUN, "shape: fact\n\nwhich branch?", "request", to=USER)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            run.finish(143, None)                                    # not a card() table, no [[ASK]]
+        self.assertEqual(self.replies(plain)[0]["kind"], "done")
+        self.assertIn("it asked: which branch?", err.getvalue())
+        boardlib.post(self.conn, self.tid, CURSOR_RUN, "Question: which tag?\nshape: fact", "request", to=USER)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            run.finish(1, None)                                      # every line reads as a header
+        self.assertIn("it asked: Question: which tag?", err.getvalue())
+
+    def test_a_signalled_run_still_ends_on_the_board(self):
+        agent = mock.Mock(remote=False, env_keep=(), recovery=False)
+        agent.name = "cursor"
+        agent.preamble.return_value, agent.prepare.return_value = "", []
+        agent.resolve.return_value, agent.argv.return_value = "/bin/true", []
+        board = mock.Mock(env={})
+        o = argparse.Namespace(ignore_quota=True, depth="standard", dir=self.tmp.name, board=True, timeout=5)
+        with mock.patch.object(runner, "RUNS", Path(self.tmp.name) / "runs"), \
+                mock.patch.object(runner, "BoardRun", return_value=board), \
+                mock.patch.object(runner, "run", side_effect=SystemExit(143)), self.assertRaises(SystemExit):
+            runner._execute(agent, o, "q", None, None)
+        board.finish.assert_called_once_with(143, None)
+        board.finish.side_effect = RuntimeError("database is locked")      # the signal's code survives it
+        with mock.patch.object(runner, "RUNS", Path(self.tmp.name) / "runs"), \
+                mock.patch.object(runner, "BoardRun", return_value=board), \
+                mock.patch.object(runner, "run", side_effect=SystemExit(143)), \
+                redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            runner._execute(agent, o, "q", None, None)
+        self.assertEqual(raised.exception.code, 143)
 
     def test_the_bridge_answers_a_turn_whose_run_did_not(self):
         seq = boardlib.post(self.conn, self.tid, USER, REQUEST, "request", to="cursor")     # the run answered: as is

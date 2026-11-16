@@ -128,7 +128,7 @@ cannot read itself rather than guess, and never to stall on a checklist. Three c
 |---|---|---|
 | Live question while it runs | `board_ask_user` (a fact card) on the thread's topic, then `board_wait` | `bridge-board cards` shows it as seq N; `bridge-board post conv:<name> "<answer>" -k answer --reply-to N` — the run continues and the card closes |
 | Ask-back at the end (an access or a permission it lacks: at once) | the reply ends with one line `[[ASK]] <question>`; `ask-agent` exits **5** to the caller and prints how to resume — nothing is posted to the user | `ask-agent <peer> --conv <name> "<answer>"` (or `--session <id>` for a run without a thread) — same session, nothing is re-sent; to grant an access, add it to that run (`--add-dir`, `-m write`) |
-| A decision only a human can make | a **card** (`board_ask_user`): question · options · recommendation · default if nobody answers | `bridge-board cards` lists every open card; `bridge-board post <topic> "…" -k decision --reply-to N` |
+| A decision only a human can make | a **card** (`board_ask_user`): question · options · recommendation · default if nobody answers | `bridge-board cards` lists every open card; `bridge-board post <topic> "…" -k decision --reply-to N` — a bridged run's card is withdrawn when that run ends, its question then going to the run's caller |
 
 `bridge-fix` stops at the same kind of card before it changes anything (exit 3), and every `bridge-panel` report carries
 a **Voices** line right after its header — who answered, who answered through a fallback peer, who failed, who asked

@@ -192,7 +192,8 @@ A card is a `request` addressed to `user:*` whose body is `boardlib.card()`: hea
 `shape:` equal to the card kind, optional `due:`, a blank line, then one table row per question — question · options ·
 recommendation · if undecided. A *decision* card is a choice only the human owns; a *fact* card is information nobody
 else has, with the safe default the agent takes if nobody answers, so the team does not stop. The user answers with
-`decision` (a decision card) or `answer` (a fact card) `reply_to` the card; any `user:*` reply closes it. Cells carry no
+`decision` (a decision card) or `answer` (a fact card) `reply_to` the card; any `user:*` reply closes it, and a bridged
+run withdraws its own still-open cards when it ends (§6.5). Cells carry no
 newline and no `|`, so a question cannot forge a header or break the table. An agent MUST NOT guess a decision or a
 fact only the user has; it posts the card, keeps working on what does not depend on it, and says in its `done` which
 part rests on the default.
@@ -210,7 +211,10 @@ request and the task together (`blocked` → task failed). A closing reply by an
 the user) cancels the task. When the run ends without having posted that reply — a remote family (§10.4) has no board
 tools; a run crashed or answered off the board — the transport posts it from the run's result as `<family>:task<N>`:
 `answer` with the text, or `blocked` with a `missing:` line when the run failed or the text misses the request's
-shape (§6.3). A turn therefore always closes its request; nothing else is ever posted on a run's behalf.
+shape (§6.3). A turn therefore always closes its request. The one other post on a run's behalf: when any run ends,
+every card it addressed to `user:*` that is still open is withdrawn with a `done` reply as that run; the question
+reaches its caller as the run's `[[ASK]]` or, with none, as a `[bridge] withdrew the run's open card … it asked: …`
+line on the caller's stderr, so no card outlives the session that could use its answer.
 
 ## 7. Topics
 
