@@ -2,6 +2,7 @@
 name: design-decision
 summary: decide between design options, review a proposed contract / persistence shape, or brainstorm a flow before it is built
 level: negotiate
+depth: deep
 grill: recommend
 triggers: "DECISION UNDER DEBATE|option [AB12]|which (option|design|shape)|brainstorm|design review|contract (review|for)|should .* (stay|be) (PROPOSED|the)|ควรเป็น"
 form: panel

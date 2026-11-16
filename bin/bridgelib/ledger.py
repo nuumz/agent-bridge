@@ -43,6 +43,15 @@ def load_playbooks() -> dict[str, dict]:
     return books
 
 
+def depth_for(kind: str, text: str, books: dict[str, dict] | None = None) -> str:
+    """`deep` when the run's playbook (the given kind, else the one the text classifies to) says `depth: deep`."""
+    books = books if books is not None else load_playbooks()
+    if not kind:
+        ranked = classify(text, books)
+        kind = ranked[0][0] if ranked else ""
+    return "deep" if books.get(kind, {}).get("depth") == "deep" else "standard"
+
+
 def classify(text: str, books: dict[str, dict] | None = None) -> list[tuple[str, int]]:
     """Playbooks whose trigger pattern hits the text, best first (hit count, then playbook order)."""
     books = books if books is not None else load_playbooks()

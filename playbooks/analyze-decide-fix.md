@@ -2,6 +2,7 @@
 name: analyze-decide-fix
 summary: a defect end-to-end — panel finds the cause, a human rules, the bridge implements on a branch
 level: negotiate
+depth: deep
 grill: recommend
 triggers: "analy[sz]e.*(decision|decide).*fix|root cause.*(then|and) fix|fix .* end.to.end|วิเคราะห์.*ตัดสิน.*แก้|analyze > decision > fix"
 form: fix-flow

@@ -4,12 +4,14 @@ branch `bridge/<name>`) keeps them, so a failed attempt there can still be disca
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
@@ -98,6 +100,103 @@ class CopilotArgv(unittest.TestCase):
         owned = ADAPTERS["copilot"].argv(opts(discard_ok=True), "q")
         self.assertNotIn("--deny-tool=shell(git restore)", owned)
         self.assertIn("--deny-tool=shell(git commit)", owned)
+
+    def test_a_deep_run_names_model_and_effort_and_dash_m_wins(self):
+        cp = ADAPTERS["copilot"]
+        with mock.patch.dict(os.environ, {cp.DEEP_VAR: "model-x:xhigh"}):
+            deep = cp.argv(opts(mode="ask", depth="deep"), "q")
+            self.assertIn("--model=model-x", deep)
+            self.assertIn("--reasoning-effort=xhigh", deep)
+            named = cp.argv(opts(mode="ask", depth="deep", model="model-y"), "q")
+            self.assertIn("--model=model-y", named)
+            self.assertFalse([x for x in named if x.startswith("--reasoning-effort") or x == "--model=model-x"])
+            plain = cp.argv(opts(mode="ask", depth="standard"), "q")       # `auto` refuses an effort flag
+            self.assertFalse([x for x in plain if x.startswith(("--model", "--reasoning-effort"))])
+        with mock.patch.dict(os.environ, {cp.DEEP_VAR: "model-z"}):        # no effort part → the model's default
+            self.assertFalse([x for x in cp.argv(opts(mode="ask", depth="deep"), "q") if x.startswith("--reasoning")])
+
+    def test_depth_comes_from_the_playbook_of_the_kind_or_of_the_prompt(self):
+        from bridgelib import ledger
+        books = {"review-change": {"depth": "deep", "triggers": r"\breview\b"},
+                 "implement": {"triggers": r"\bimplement\b"}}
+        self.assertEqual(ledger.depth_for("review-change", "", books), "deep")
+        self.assertEqual(ledger.depth_for("", "review this diff", books), "deep")
+        self.assertEqual(ledger.depth_for("implement", "review this diff", books), "standard")   # a given kind wins
+        self.assertEqual(ledger.depth_for("", "what time is it", books), "standard")
+        shipped = ledger.load_playbooks()
+        self.assertEqual({k for k, b in shipped.items() if b.get("depth") == "deep"},
+                         {"review-change", "defect-root-cause", "design-decision", "spec-vs-code",
+                          "analyze-decide-fix"})
+
+
+class DeepRuns(unittest.TestCase):
+    """The depth a run resolves reaches the argv Copilot is launched with: from the run, its thread and its dry run."""
+
+    def launch(self, root: Path, prompt: str, conv=None, **kw) -> list[str]:
+        """The argv execute hands the CLI, stopped right there."""
+        import boardlib
+        from bridgelib import ledger, runner
+        seen = []
+
+        def stop(binary, argv, *a, **k):
+            seen.append(argv)
+            raise OSError("stopped at launch")
+
+        agent = ADAPTERS["copilot"]
+        o = argparse.Namespace(**{"mode": "ask", "deny": [], "model": "", "add_dir": [], "session": "", "cont": False,
+                                  "board": False, "timeout": 5, "ignore_quota": True, "no_recover": True, "conv": "",
+                                  "kind": "", "depth": "", "worktree": None, "dir": str(root), **kw})
+        with mock.patch.object(agent, "resolve", return_value=sys.executable), \
+                mock.patch.object(runner, "run", side_effect=stop), \
+                mock.patch.object(runner, "RUNS", root / "runs"), \
+                mock.patch.object(ledger, "STATE", root), mock.patch.object(ledger, "RUNS", root / "runs"), \
+                mock.patch.object(ledger, "LEDGER", root / "ledger.jsonl"), \
+                mock.patch.object(boardlib, "BOARD_DIR", root / "board"), \
+                mock.patch.object(boardlib, "DB_PATH", root / "board" / "board.db"), \
+                mock.patch.dict(os.environ, {agent.DEEP_VAR: "model-x:high"}), redirect_stderr(io.StringIO()):
+            with self.assertRaises(OSError):
+                runner.execute(agent, o, prompt, None, conv)
+        return seen[0]
+
+    def test_a_review_is_launched_deep_and_a_question_is_not(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIn("--model=model-x", self.launch(Path(d), "review this diff"))
+            self.assertIn("--model=model-x", self.launch(Path(d), "ช่วยreviewโค้ดนี้"))        # glued to Thai text
+            self.assertNotIn("--model=model-x", self.launch(Path(d), "what time is it"))
+            self.assertNotIn("--model=model-x", self.launch(Path(d), "review this diff", depth="standard"))
+            self.assertNotIn("--model=model-x", self.launch(Path(d), "add a preview pane"))     # not a review
+
+    def test_a_thread_that_ran_deep_stays_deep(self):
+        from bridgelib import runner
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(runner, "CONV_DIR", Path(d) / "conv"):
+            self.launch(Path(d), "review this diff", runner.Conv("rv"))
+            # the follow-up classifies to no playbook; the thread's session must not drop to the default model
+            self.assertIn("--model=model-x", self.launch(Path(d), "and the second file?", runner.Conv("rv")))
+            self.assertNotIn("--model=model-x", self.launch(Path(d), "and the second file?", runner.Conv("other")))
+            # a --kind given (bridge-panel passes the panel's to every role, on a conv a re-run reuses) decides
+            self.assertNotIn("--model=model-x", self.launch(Path(d), "and the second file?", runner.Conv("rv"),
+                                                            kind="doc-readiness"))
+            # … and sets the thread's depth: a follow-up without --kind inherits it
+            self.assertNotIn("--model=model-x", self.launch(Path(d), "and the second file?", runner.Conv("rv")))
+
+    def test_a_dry_run_prints_the_argv_a_run_would_use(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_BRIDGE")}
+            env.update(HOME=d, AGENT_BRIDGE_COPILOT_DEEP="model-x:high")
+            thread = Path(d) / ".agent-bridge" / "state" / "conv" / "rv"          # a thread that ran deep
+            thread.mkdir(parents=True)
+            (thread / "state.json").write_text(json.dumps({"name": "rv", "sessions": {}, "turns": 2, "depth": "deep"}))
+
+            def argv(prompt: str, *flags: str) -> list[str]:
+                p = subprocess.run([sys.executable, str(BIN / "ask-agent"), "copilot", "--dry-run", "--no-board",
+                                    *flags, prompt], cwd=d, env=env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                return json.loads(p.stdout)["argv"]
+
+            self.assertIn("--model=model-x", argv("review this diff"))
+            self.assertNotIn("--model=model-x", argv("review this diff", "--depth", "standard"))
+            self.assertIn("--model=model-x", argv("and the second file?", "--conv", "rv"))
+            self.assertNotIn("--model=model-x", argv("and the second file?"))
 
 
 class CursorHold(unittest.TestCase):

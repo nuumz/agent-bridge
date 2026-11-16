@@ -2,9 +2,10 @@
 name: review-change
 summary: review a diff, MR, or uncommitted worktree for defects, or adjudicate an existing set of review findings
 level: routine
+depth: deep
 grill: skip
 level_when_adjudicating: confirm
-triggers: "\\bMR\\b|merge request|![0-9]{3,4}|review (this|the|my) (diff|change|worktree)|รีวิว|review|git diff|adjudicat|review findings|open review threads"
+triggers: "\\bMR\\b|merge request|![0-9]{3,4}|review (this|the|my) (diff|change|worktree)|รีวิว|(?<![a-z])review|git diff|adjudicat|review findings|open review threads"
 form: direct
 peers: cursor
 mode: ask

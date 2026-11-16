@@ -39,7 +39,7 @@ nesting). In playbooks and work-skills a quoted value is read JSON-style — the
 | Kind | Directory | Required keys | Optional keys | Body |
 |---|---|---|---|---|
 | Panel role | `roles/` | `name`, `summary`, `peer` | `model`, `mode`, `fallback_peer`, `timeout` (seconds, only ever raises `-t`) | the persona prompt; demand `file:line` or `UNVERIFIED` |
-| Playbook | `playbooks/` | `name`, `summary`, `triggers` (regex scored against the request), `level` (`routine` / `confirm` / `negotiate` — anything else is a KeyError in `bridge-plan`) | `form` (direct / panel / pipeline / fix-flow), `grill`, `peers`, `alt_peers`, `mode`, `panel_roles`, `optional_roles`, `command`, `agent`, `level_when_adjudicating`, `inputs`, `output`, `budget` | when and how to run it; evidence for the defaults |
+| Playbook | `playbooks/` | `name`, `summary`, `triggers` (regex scored against the request), `level` (`routine` / `confirm` / `negotiate` — anything else is a KeyError in `bridge-plan`) | `form` (direct / panel / pipeline / fix-flow), `grill`, `peers`, `alt_peers`, `mode`, `panel_roles`, `optional_roles`, `command`, `agent`, `level_when_adjudicating`, `inputs`, `output`, `budget`, `depth` (`deep`: a Copilot run takes the model and effort in `AGENT_BRIDGE_COPILOT_DEEP` — not `level`, the session depth) | when and how to run it; evidence for the defaults |
 | Work-skill | `work-skills/` | `name`, `summary`, `triggers` | `paths` (regex on the `--files` set), `verify_hint` | `### implementer` and `### reviewer` sections, injected into those prompts |
 
 Keep a new file in the same shape as its neighbours and add a row to the matching table in `SHARED-RULES.md`.

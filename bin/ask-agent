@@ -48,7 +48,7 @@ from bridgelib.adapters import ADAPTERS, Adapter  # noqa: E402
 from bridgelib.core import (PEER_TALK_RULE, DISABLED, HOP_VAR, QUOTA_TTL, add_dirs_from_env, bridge_owned,  # noqa: E402
                             cited_roots, dirty_paths, hop_active, quota_block, version_of)
 from bridgelib.runner import (AGREE_RE, CONV_DIR, USER_AUTHOR, BoardRun, Conv, execute, print_parsed,  # noqa: E402
-                              protocol)
+                              protocol, resolve_depth)
 
 
 def list_agents() -> int:
@@ -157,6 +157,9 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="print the raw peer output instead of the parsed answer")
     ap.add_argument("--no-recover", action="store_true", help="skip the narration-only auto-resume (Cursor)")
     ap.add_argument("--kind", default="", help="playbook kind for the outcome ledger (default: classified from the prompt)")
+    ap.add_argument("--depth", default="", choices=["", "deep", "standard"],
+                    help="deep = the peer's strongest model and effort where the adapter maps one (Copilot); "
+                         "default: the playbook's `depth` for the run's kind. -M overrides it")
     ap.add_argument("--ignore-quota", action="store_true",
                     help=f"run even if the peer was marked out of quota in the last {QUOTA_TTL // 60} min (exit 7 otherwise)")
     ap.add_argument("--no-board", dest="board", action="store_false",
@@ -232,6 +235,7 @@ def main() -> int:
     session = o.session or (conv.session_for(agent.name) if conv else None)
     if o.dry_run:
         o.session = session or ""
+        resolve_depth(o, prompt, conv)
         notes = agent.prepare(o, True)
         print(json.dumps({"agent": agent.name, "binary": agent.resolve() or "NOT INSTALLED", "cwd": o.dir,
                           "argv": agent.argv(o, agent.preamble(o) + prompt + protocol(conv)),

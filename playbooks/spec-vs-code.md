@@ -2,6 +2,7 @@
 name: spec-vs-code
 summary: check whether a spec / contract claim matches the code as built (SUPPORTED · CONTRADICTED · NOT-FOUND per claim)
 level: routine
+depth: deep
 grill: skip
 triggers: "SUPPORTED|CONTRADICTED|NOT-FOUND|as[- ]built|spec (claim|vs)|ตรงกับโค้ด|matches the code|drift"
 form: direct

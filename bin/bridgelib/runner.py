@@ -280,6 +280,22 @@ def execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | N
             pass
 
 
+def resolve_depth(o: argparse.Namespace, prompt: str, conv: Conv | None = None) -> None:
+    """--depth as given, else the playbook's `depth` for the run's kind (adapters read o.depth when building argv). A
+    run with no --kind on a thread that ran deep stays deep: a follow-up ("and file Y?") classifies to no playbook, and
+    the session it resumes must not drop to the CLI's default model mid-review. A --kind given decides its run and sets
+    the thread's depth. `--session` / `-c` alone carry no depth."""
+    if not getattr(o, "depth", ""):
+        from . import ledger
+        kind = getattr(o, "kind", "")
+        o.depth = ("deep" if not kind and conv is not None and conv.state.get("depth") == "deep"
+                   else ledger.depth_for(kind, prompt))
+        if conv is not None and kind:
+            conv.state["depth"] = o.depth
+    if conv is not None and o.depth == "deep":
+        conv.state["depth"] = "deep"          # saved with the request this run records (a dry run saves nothing)
+
+
 def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | None, conv: Conv | None,
              frm: str = "caller", named: dict | None = None) -> tuple[int, Parsed | None, Path | None]:
     o.session = session or ""
@@ -290,6 +306,7 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
             return 7, None, None
     for n in agent.prepare(o, False):
         print(f"[bridge] {n}", file=sys.stderr)
+    resolve_depth(o, prompt, conv)
     full_prompt = agent.preamble(o) + prompt + protocol(conv)
     binary = agent.resolve()
     if not binary:

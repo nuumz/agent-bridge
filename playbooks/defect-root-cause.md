@@ -2,6 +2,7 @@
 name: defect-root-cause
 summary: find the root cause of a defect or incident and the smallest safe fix (optionally a patch sketch)
 level: confirm
+depth: deep
 grill: recommend
 triggers: "root cause|incident|symptom|defect|[A-Z]+[0-9]+-[A-Z]+-[0-9]+|bug|why does|ทำไม.*ผิด"
 form: panel

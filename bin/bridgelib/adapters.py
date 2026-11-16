@@ -463,6 +463,10 @@ class Copilot(Adapter):
     skip_bin_substr = ("github.copilot-chat/copilotCli",)
     supports_deny = True
     rules_mirror = "~/.copilot/instructions/agent-bridge-user-rules.instructions.md"
+    # A deep run (ask-agent --depth, or the playbook's `depth: deep`) names a model and an effort: left on `auto`, the
+    # CLI's router rated reviews and root-cause hunts "medium complexity" and ran 58 of 81 on its mid model
+    # (2026-10-30..11-13), and `auto` refuses --reasoning-effort. Model ids change monthly — override here, not in code.
+    DEEP_VAR, DEEP_DEFAULT = "AGENT_BRIDGE_COPILOT_DEEP", "gpt-6.1-sol:high"
 
     def auth_hint(self):
         try:
@@ -526,6 +530,9 @@ class Copilot(Adapter):
             a += [f"--deny-tool={t}"]
         if o.model:
             a += [f"--model={o.model}"]
+        elif getattr(o, "depth", "") == "deep":
+            model, _, effort = (os.environ.get(self.DEEP_VAR) or self.DEEP_DEFAULT).partition(":")
+            a += [f"--model={model}"] + ([f"--reasoning-effort={effort}"] if effort else [])
         for d in o.add_dir:
             a += [f"--add-dir={d}"]
         return a
