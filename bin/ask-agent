@@ -28,6 +28,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -49,6 +50,14 @@ from bridgelib.core import (PEER_TALK_RULE, DISABLED, HOP_VAR, QUOTA_TTL, add_di
                             cited_roots, dirty_paths, hop_active, quota_block, version_of)
 from bridgelib.runner import (AGREE_RE, CONV_DIR, USER_AUTHOR, BoardRun, Conv, execute, print_parsed,  # noqa: E402
                               protocol, resolve_depth)
+
+# a prompt that leans on an earlier turn; sent with no --conv/--session it reaches a fresh session that has none of
+# it (the 2026-11-15 stale card began as such a follow-up)
+FOLLOW_UP_RE = re.compile(
+    r"\b(?:your|the) (?:previous|last|earlier) (?:answer|reply|response)\b"
+    r"|\byour (?:previous|last|earlier) (?:review|message|round|turn|output|findings?)\b"
+    r"|\bas (?:you|I) (?:said|mentioned|asked)\b|\bfollow(?:ing)?[- ]up (?:on|to)\b|\bcontinu(?:e|ing) (?:from|where)\b"
+    r"|คำตอบก่อนหน้า|ข้อความก่อนหน้า|ที่ตอบไป|เมื่อกี้|ที่คุยกันไว้", re.IGNORECASE)
 
 
 def list_agents() -> int:
@@ -233,6 +242,10 @@ def main() -> int:
 
     conv = Conv(o.conv, boardlib.connect() if o.board else None) if o.conv else None
     session = o.session or (conv.session_for(agent.name) if conv else None)
+    if not session and (hit := FOLLOW_UP_RE.search(prompt)):
+        print(f"[bridge] the prompt reads like a follow-up (\"{hit.group(0)}\") but starts a new {agent.name} "
+              "session that has none of it — continue a thread this peer is on with --conv <name> or --session "
+              "<id>; a self-contained prompt can ignore this", file=sys.stderr)
     if o.dry_run:
         o.session = session or ""
         resolve_depth(o, prompt, conv)

@@ -175,6 +175,12 @@ class Roles(Board):
 
 
 class AskBack(Board):
+    def test_a_conv_thread_closed_idle_reopens_when_used_again(self):
+        runner.Conv("t9", self.conn)
+        boardlib.close_topic(self.conn, "conv:t9")
+        runner.Conv("t9", self.conn)
+        self.assertIsNone(self.conn.execute("SELECT closed_at FROM topics WHERE name='conv:t9'").fetchone()[0])
+
     def test_the_peers_ask_goes_to_its_caller_not_to_the_user(self):
         conv = runner.Conv("t1", self.conn)
         conv.record("caller", "cursor", "look at X", author=USER)

@@ -246,7 +246,10 @@ it, and a side that left is not re-added.
 The user, the leader, either side of a `dm:`, or the creator of a topic that has no members may close it. A topic with
 members closes only after a **summary**: a `done` to `*`, not a reply, posted after the last request and the last
 reopening — what was done, the evidence, what is still open — so the record ends with the outcome. A finished bridge
-run closes its own topics; closed topics older than 14 days are deleted by `gc`.
+run closes its own topics. `gc` closes a topic idle for 14 days that waits on nobody and nobody holds (no open request
+but one to an ended `<family>#<pid>` or `<family>:task<N>` run, no queued or claimed task, not a `dm:`, no member
+whose run is still registered) and deletes closed topics older than 14 days. A `--conv` thread run with the board,
+an `a2a:` and a `live:` topic reopen on use; a room only by the user or the primary.
 
 ## 8. Body conventions and markers
 

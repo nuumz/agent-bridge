@@ -676,3 +676,25 @@ class CitedRoots(unittest.TestCase):
             argv[mode] = json.loads(out.stdout)["argv"]
         self.assertIn(f"--add-dir={self.home / 'spec'}", argv["ask"])
         self.assertNotIn(f"--add-dir={self.home / 'spec'}", argv["write"])
+
+    def test_a_follow_up_prompt_without_a_thread_is_flagged(self):
+        import os
+        import subprocess
+        from bridgelib import core
+        env = {k: v for k, v in os.environ.items() if k not in (core.HOP_VAR, core.ADD_DIRS_VAR)}
+        env["HOME"] = str(self.home)
+        err = {}
+        for name, extra, prompt in (("bare", [], "fix what your previous answer missed"),
+                                    ("thai", [], "แก้ตามที่ตอบไปเมื่อกี้"),
+                                    ("session", ["--session", "abc"], "fix what your previous answer missed"),
+                                    ("fresh", [], "what the previous reviewer read is in round2.diff"),
+                                    ("interdiff", [], "the previous round's findings were fixed; re-review"),
+                                    ("interdiff-th", [], "findings รอบก่อนหน้าแก้แล้ว ดู interdiff"),
+                                    ("new-conv", ["--conv", "no-such-thread-1117"], "fix your previous findings")):
+            out = subprocess.run([str(Path(__file__).resolve().parents[1] / "bin" / "ask-agent"), "copilot",
+                                  "--dry-run", "-d", str(self.home / "code"), *extra, prompt],
+                                 capture_output=True, text=True, env=env)
+            err[name] = "reads like a follow-up" in out.stderr
+        self.assertEqual(err, {"bare": True, "thai": True, "session": False, "fresh": False, "interdiff": False,
+                               "interdiff-th": False,
+                               "new-conv": True})

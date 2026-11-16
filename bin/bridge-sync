@@ -464,9 +464,11 @@ def main() -> int:
     sync_mcp()
     conn = boardlib.connect()
     try:
-        removed = boardlib.gc(conn, BOARD_GC_DAYS)
+        idle, removed = boardlib.close_idle(conn, BOARD_GC_DAYS), boardlib.gc(conn, BOARD_GC_DAYS)
     finally:
         conn.close()
+    if idle:
+        say(f"bridge-sync: board closed {idle} topic(s) idle for {BOARD_GC_DAYS} days")
     if removed:
         say(f"bridge-sync: board gc removed {removed} closed topic(s) older than {BOARD_GC_DAYS} days")
     # run logs / threads / panels: `bridge-panel gc` existed since 2026-09-12 but nothing called it (1447 log files,

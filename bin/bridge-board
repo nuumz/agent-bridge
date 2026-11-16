@@ -555,9 +555,10 @@ def main() -> int:
         elif o.cmd == "close":
             B.close_topic_as(conn, o.topic, me)
         elif o.cmd == "gc":
-            n = B.gc(conn, o.days)
+            idle, n = B.close_idle(conn, o.days), B.gc(conn, o.days)
             if not o.quiet:
-                print(f"gc: removed {n} closed topic(s) older than {o.days} days")
+                print(f"gc: closed {idle} topic(s) idle for {o.days} days; removed {n} closed topic(s) older than "
+                      f"{o.days} days")
         elif o.cmd == "task":
             if o.tcmd == "add":
                 print("task", B.task_add(conn, B.topic_id(conn, o.topic, None if peer else me), o.title, o.body, me, peer,

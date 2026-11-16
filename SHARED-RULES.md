@@ -416,8 +416,11 @@ whatever its env says.
   `conv:panel-<name>-*` threads on report or abort, `bridge-work` closes `conv:work-<name>-*`, `bridge-live` closes
   `live:<room>` when the last peer leaves (its peers are registered in `workers` like any bridged run)
   and reopens it when one rejoins (the backlog is still there until gc).
-  `bridge-sync` runs `gc` — topics closed >14 days ago are deleted; the user closes anything else with
-  `bridge-board close <topic>`.
+  `bridge-sync` runs `gc` — a topic idle >14 days that waits on nobody and nobody holds (no open request but one
+  to an ended `<family>#<pid>` or `<family>:task<N>` run, no queued or claimed task, not a `dm:`, no member
+  whose run is registered) is closed; a `--conv` thread run with the board, `a2a:` and `live:` reopen on use, a
+  room only by the user or the primary. Topics closed >14 days ago are deleted; the user closes anything else
+  with `bridge-board close <topic>`.
 
 ## 7. Files
 

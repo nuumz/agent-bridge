@@ -357,6 +357,31 @@ class Membership(Board):
         self.assertEqual(boardlib.gc(self.conn, 14), 1)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM members").fetchone()[0], 0)
 
+    def test_close_idle_closes_only_topics_that_wait_on_nobody(self):
+        names = ("conv:idle", "conv:card", "conv:task", "conv:new", "conv:ask", "conv:dead", "dm:a+b", "room:held",
+                 "conv:task1", "conv:livetask", "conv:a2atask")
+        tids = {n: boardlib.topic_id(self.conn, n, USER) for n in names}
+        for n, tid in tids.items():
+            boardlib.post(self.conn, tid, USER, "turn", "note")
+        boardlib.post(self.conn, tids["conv:card"], CURSOR, boardlib.card("fact", [("q", "-", "-", "-")]),
+                      "request", to=USER)
+        boardlib.task_add(self.conn, tids["conv:task"], "t", "", USER, False)
+        ask = "shape: one line\n\nq"
+        boardlib.post(self.conn, tids["conv:ask"], USER, ask, "request", to=PRIMARY)       # a standing agent owes it
+        boardlib.post(self.conn, tids["conv:dead"], USER, ask, "request", to="cursor#1")   # its run has ended
+        boardlib.post(self.conn, tids["conv:task1"], USER, ask, "request", to="cursor:task1")
+        boardlib.post(self.conn, tids["conv:livetask"], USER, ask, "request", to="claude@live:task1")  # standing
+        boardlib.post(self.conn, tids["conv:a2atask"], USER, ask, "request", to="a2a:task1x")         # a client
+        boardlib.member_add(self.conn, tids["room:held"], CURSOR)
+        self.conn.execute("INSERT INTO workers(pid, identity, family) VALUES(1, ?, 'cursor')", (CURSOR,))
+        self.conn.execute("UPDATE topics SET created_at=created_at-20*86400 WHERE name!='conv:new'")
+        self.conn.execute("UPDATE messages SET created_at=created_at-20*86400 WHERE topic_id!=?", (tids["conv:new"],))
+        self.assertEqual(boardlib.close_idle(self.conn, 14), 3)
+        still = {r[0] for r in self.conn.execute("SELECT name FROM topics WHERE closed_at IS NULL")}
+        self.assertEqual(still, {"conv:card", "conv:task", "conv:new", "conv:ask", "dm:a+b", "room:held",
+                                 "conv:livetask", "conv:a2atask"})
+        self.assertEqual(boardlib.gc(self.conn, 14), 0)          # closed now: deleted only 14 days on
+
 
 class ServerAndCli(Board):
     def test_the_new_tools_through_the_server(self):

@@ -790,3 +790,23 @@ def gc(conn: sqlite3.Connection, days: int) -> int:
             conn.execute("DELETE FROM topics WHERE id=?", (tid,))
         conn.execute("DELETE FROM agents WHERE last_seen<?", (cutoff,))
     return len(ids)
+
+
+def close_idle(conn: sqlite3.Connection, days: int) -> int:
+    """Close open topics with no message for `days` days that wait on nobody — no open request except one to a
+    `<family>#<pid>` or `<family>:task<N>` run (gone once its run ended), no queued or claimed task — and that nobody
+    holds: never a dm (only the user or the primary may reopen one), never a room with a member whose run is still
+    registered — so the open list holds live work; gc deletes them `days` later and a `--conv` thread used again in
+    between reopens (Conv). Open topics had piled up to 494 since 2026-09 (user ruling 2026-11-17)."""
+    cutoff = now() - days * 86400
+    conn.create_function("is_turn_run", 1, lambda a: a is not None and is_turn_run(a), deterministic=True)
+    with tx(conn):
+        return conn.execute(
+            "UPDATE topics SET closed_at=? WHERE closed_at IS NULL AND COALESCE((SELECT MAX(x.created_at) FROM "
+            "messages x WHERE x.topic_id=topics.id), created_at, 0)<? AND NOT EXISTS (SELECT 1 FROM tasks k WHERE "
+            "k.topic_id=topics.id AND k.status IN ('queued','claimed')) AND NOT EXISTS (SELECT 1 FROM messages m "
+            f"WHERE m.topic_id=topics.id AND NOT (m.addressee LIKE '%#%' OR is_turn_run(m.addressee)) AND "
+            f"{OPEN_REQUEST}) AND name NOT LIKE 'dm:%' "
+            "AND NOT EXISTS (SELECT 1 FROM members b JOIN workers w ON w.identity=b.agent WHERE b.topic_id=topics.id "
+            "AND b.left_at IS NULL)",
+            (now(), cutoff)).rowcount

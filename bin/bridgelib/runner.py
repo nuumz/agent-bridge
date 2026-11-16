@@ -187,6 +187,7 @@ class Conv:
         self.board, self.topic_name, self.topic = board, f"conv:{name}", None
         if board is not None:
             self.topic = boardlib.topic_id(board, self.topic_name, USER_AUTHOR)
+            boardlib.reopen_topic(board, self.topic_name)   # closed idle by gc: a card on a closed topic is unseen
             self.seen = board.execute("SELECT COALESCE(MAX(seq),0) FROM messages WHERE topic_id=?", (self.topic,)).fetchone()[0]
             self.mark = self.seen                 # seq at the start of the current run (for the mirror dedupe)
 
