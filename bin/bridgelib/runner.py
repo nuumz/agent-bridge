@@ -230,14 +230,17 @@ def execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | N
             conv: Conv | None, frm: str = "caller") -> tuple[int, Parsed | None, Path | None]:
     """One bridged call: prepare workspace, run, parse, auto-recover, record. Returns (rc, parsed, log)."""
     t0 = time.time()
-    rc, parsed, log = 2, None, None
+    rc, parsed, log, named = 2, None, None, {}
     try:
-        rc, parsed, log = _execute(agent, o, prompt, session, conv, frm)
+        rc, parsed, log = _execute(agent, o, prompt, session, conv, frm, named)
         return rc, parsed, log
     finally:
         agent.finish(o)                        # release per-run setup (Cursor's temporary Write(**) deny) on every path
         try:                                   # outcome ledger — a fact per run, feeds `bridge-plan learn`
             from . import ledger
+            # a run that raised after writing its prompt still names its log, so a backfill rebuilds that prompt into
+            # this row instead of adding a second one
+            run_log = log or named.get("log")
             panel = re.search(r"Panel `([^`]+)`", prompt)
             ranked = ledger.classify(prompt) if not getattr(o, "kind", "") else []
             extra = parsed.extra if parsed and parsed.extra else ""
@@ -248,8 +251,12 @@ def execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | N
             session = parsed.session if parsed else None
             cost_session = float(cost.group(1)) if cost else None   # cumulative when the run resumed a session
             # the evidence the answer carries: how many of its file:line citations resolve in the workspace
-            cites = (evidence.verify_citations(o.dir, {"run": parsed.result})
+            cites = (evidence.verify_citations(o.dir, {"run": parsed.result},
+                                               evidence.named_roots(prompt, getattr(o, "add_dir", []), o.dir))
                      if parsed and parsed.result and getattr(o, "dir", None) and Path(o.dir).is_dir() else [])
+            ask = ASK_RE.search(parsed.result or "") if parsed else None
+            if parsed:
+                parsed.citations = cites               # print_parsed names the ones that did not resolve
             ledger.record({"type": "run", "peer": agent.name, "mode": o.mode,
                            "kind": getattr(o, "kind", "") or (ranked[0][0] if ranked else "other"),
                            "panel": panel.group(1) if panel else None, "conv": getattr(o, "conv", "") or None,
@@ -260,18 +267,21 @@ def execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | N
                            "tokens_out": parsed.tok_out if parsed and isinstance(parsed.tok_out, int) else None,
                            "turns": int(turns.group(1)) if turns else None,
                            "cache_write": int(cache_write.group(1)) if cache_write else None,
-                           "log": str(log) if log else None,
+                           "log": str(run_log) if run_log else None,
                            **(parsed.metrics if parsed else {}),      # Copilot: tool_calls, failures, denials, premium
                            "tool_calls": (int(tools.group(1)) if tools else      # Claude: counted from the transcript
                                           (parsed.metrics.get("tool_calls") if parsed else None)),
                            "citations_ok": sum(1 for c in cites if c["status"] == "ok"), "citations_total": len(cites),
-                           "asked_back": bool(parsed and ASK_RE.search(parsed.result or ""))})
+                           "citations_rev": evidence.RESOLVER_REV,
+                           # the roots the run could read: `bridge-plan learn --replay` re-scores the answer on them
+                           "dir": getattr(o, "dir", None), "add_dir": list(getattr(o, "add_dir", None) or []) or None,
+                           "asked_back": bool(ask), "ask": ask.group(1)[:240] if ask else None})
         except Exception:  # noqa: BLE001 — the ledger must never break a run
             pass
 
 
-def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | None,
-             conv: Conv | None, frm: str = "caller") -> tuple[int, Parsed | None, Path | None]:
+def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | None, conv: Conv | None,
+             frm: str = "caller", named: dict | None = None) -> tuple[int, Parsed | None, Path | None]:
     o.session = session or ""
     if not o.ignore_quota:
         blocked = quota_block(agent.name)
@@ -295,6 +305,8 @@ def _execute(agent: Adapter, o: argparse.Namespace, prompt: str, session: str | 
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"   # pid: parallel runs must not share a log
     log = RUNS / f"{stamp}-{agent.name}.json"
     (RUNS / f"{stamp}-{agent.name}.prompt.txt").write_text(full_prompt + "\n")
+    if named is not None:
+        named["log"] = log                     # execute's ledger row names it even if the run raises from here on
     if conv:                                   # dialog relays (frm = the other peer) are already on the board as replies
         conv.record(frm, agent.name, prompt, author=USER_AUTHOR if frm == "caller" else None)
 
@@ -369,6 +381,12 @@ def print_parsed(agent: Adapter, p: Parsed, log: Path | None, conv: Conv | None)
     extra = f" {p.extra}" if p.extra else ""
     cv = f" conv={conv.name}" if conv else ""
     print(f"\n[bridge] agent={agent.name} session={p.session or '?'} tokens=in:{p.tok_in}/out:{p.tok_out}{extra}{cv} log={log}")
+    bad = [c for c in p.citations if c["status"] != "ok"]
+    if p.citations:                            # checked against the files, not by a model: what fails is UNVERIFIED
+        listed = "; ".join(f"{c['cite']} — {c['status']}" for c in bad[:8])
+        listed += f"; +{len(bad) - 8} more" if len(bad) > 8 else ""
+        print(f"[bridge] citations: {len(p.citations)} checked, "
+              + (f"{len(bad)} do not resolve (UNVERIFIED): {listed}" if bad else "all resolve"), file=sys.stderr)
     m = ASK_RE.search(p.result or "")
     if m:
         how = f"ask-agent {agent.name} --conv {conv.name}" if conv else f"ask-agent {agent.name} --session {p.session}"

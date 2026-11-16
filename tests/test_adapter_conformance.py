@@ -331,6 +331,19 @@ class Conformance(unittest.TestCase):
         self.assertEqual(p.returncode, 5, p.stderr)
         self.assertIn("[bridge] the peer asks back: which environment showed the timeout?", p.stderr)
         self.assertIn(f"ask-agent {name} --session {agent.parse(_fakebin.fixture(agent.binary)).session}", p.stderr)
+        row = json.loads((self.home / ".agent-bridge" / "state" / "ledger.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(row["ask"], "which environment showed the timeout?")    # what `learn --team` classifies
+
+    @per_family
+    def test_the_answers_citations_are_checked_against_the_files(self, name, agent, x):
+        (self.work / "src").mkdir(exist_ok=True)
+        (self.work / "src" / "retry.py").write_text("a = 1\nb = 2\nc = 3\n")
+        p = self.ask(name, "--no-board", "-d", str(self.work), PROMPT, FAKEBIN_RESULT="The bug is at src/retry.py:99.")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("[bridge] citations: 1 checked, 1 do not resolve (UNVERIFIED): src/retry.py:99 — OUT OF RANGE "
+                      "(file has 3 lines)", p.stderr)
+        p = self.ask(name, "--no-board", "-d", str(self.work), PROMPT, FAKEBIN_RESULT="The bug is at src/retry.py:2.")
+        self.assertIn("[bridge] citations: 1 checked, all resolve", p.stderr)
 
     @per_family
     def test_list_probes_the_binary_and_its_version(self, name, agent, x):

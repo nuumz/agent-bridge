@@ -54,6 +54,15 @@ class ClaudeResume(unittest.TestCase):
         recover = claude.resume_argv(self.opts(), "abc", "q")
         self.assertIn("--fork-session", recover)
 
+    def test_a_new_session_is_named_after_the_task_not_the_preamble(self):
+        claude = ADAPTERS["claude"]
+        for mode in ("ask", "write"):
+            o = self.opts(mode=mode, conv="panel-x-critic")
+            argv = claude.argv(o, claude.preamble(o) + "Review src/a.py\nmore")
+            self.assertEqual(argv[argv.index("--name") + 1], "bridge · panel-x-critic: Review src/a.py")
+        for o in (self.opts(session="abc"), self.opts(cont=True)):
+            self.assertNotIn("--name", claude.argv(o, "q"))
+
 
 if __name__ == "__main__":
     unittest.main()

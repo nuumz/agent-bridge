@@ -40,9 +40,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger  # noqa: E402
-from bridgelib.evidence import cite_score, citation_table, low_evidence, verify_citations  # noqa: E402
-from bridgelib.core import (BOARD_PROTOCOL, PEER_TALK_RULE, ROOT, STATE, detach, guarded_rc, hop_active,  # noqa: E402
-                            lang_rule, run_tool, share_add_dirs)
+from bridgelib.evidence import (RESOLVER_REV, cite_score, citation_table, low_evidence, named_roots,  # noqa: E402
+                                verify_citations)
+from bridgelib.core import (BOARD_PROTOCOL, PEER_TALK_RULE, ROOT, STATE, add_dirs_from_env, detach,  # noqa: E402
+                            guarded_rc, hop_active, lang_rule, run_tool, share_add_dirs)
 
 ROLES = ROOT / "roles"
 PANELS = STATE / "panel"
@@ -228,13 +229,21 @@ def worker_prompt(name: str, role: dict, q: dict, problem: str, hypothesis: str,
             + BOARD_PROTOCOL)
 
 
-def cross_prompt(name: str, role: dict, others: dict[str, str], directed: list[str], cites: str = "") -> str:
+def cross_prompt(name: str, role: dict, others: dict[str, str], directed: list[str], cites: str = "",
+                 rows: list[dict] | None = None) -> str:
     shown = "\n\n".join(f"### {r}\n{t[:MAX_SHARE]}" for r, t in others.items())
     asked = ("\n\nQuestions addressed to you:\n- " + "\n- ".join(directed)) if directed else ""
     cite_block = f"\n\n{cites}\nA citation marked other than `ok` is not evidence — say so when a role leaned on it.\n" if cites else ""
+    # the role's own misses with the checker's reason, inside the turn it already gets — the one repair asked for;
+    # what it cannot correct it marks UNVERIFIED
+    own = [c for c in rows or [] if role["name"] in c["roles"] and c["status"] != "ok"]
+    repair = ("\n\nYour own citations that did not resolve:\n"
+              + "".join(f"- `{c['cite']}` — {c['status']}\n" for c in own)
+              + "Open each file and restate the claim with the corrected path:line, or mark it UNVERIFIED.\n"
+              ) if own else ""
     return (f"Panel `{name}`, cross-examination. Everything below is now shared: the other roles' answers and the "
             f"machine-checked citation table. Your own conclusion is still yours to defend or change.\n\n"
-            f"{shown}{cite_block}{asked}\n\n"
+            f"{shown}{cite_block}{repair}{asked}\n\n"
             "For each other role: CHALLENGE (with file:line showing why it is wrong or incomplete) or RATIFY (one line). "
             "Answer every question addressed to you. Then restate your own conclusion in one paragraph, changed or not. "
             "End with [[AGREE]] if nothing remains in dispute. Write in the reply body, do not narrate. "
@@ -390,7 +399,11 @@ def run(o) -> int:
     (out / "findings.json").write_text(json.dumps(findings, ensure_ascii=False, indent=2))
     (out / "status.json").write_text(json.dumps({"answered": used, "fallbacks": fallbacks, "failed": failed,
                                                  "asked_back": list(needs_input),
-                                                 "degraded": bool(fallbacks or failed or needs_input)},
+                                                 "degraded": bool(fallbacks or failed or needs_input),
+                                                 # what `bridge-plan learn --replay` needs once gc took the run logs,
+                                                 # and what `synth` / `fix` re-run with
+                                                 "problem": o.problem, "dir": str(Path(o.dir).resolve()),
+                                                 "add_dir": o.add_dir, "kind": kind},
                                                 ensure_ascii=False, indent=2))
     need = 1 if o.allow_single else 2
     if len(findings) < need:
@@ -405,7 +418,8 @@ def run(o) -> int:
         ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start)
         close_panel_topics(o.name, chosen)
         return 4
-    cites = verify_citations(o.dir, findings)
+    roots = named_roots(o.problem, o.add_dir, o.dir)
+    cites = first = verify_citations(o.dir, findings, roots)      # first: the pass before cross-examination
     (out / "citations.json").write_text(json.dumps(cites, ensure_ascii=False, indent=2))
     unresolved = [c for c in cites if c["status"] != "ok"]
     print(f"[panel] citations: {len(cites)} checked, {len(unresolved)} unresolved", file=sys.stderr)
@@ -425,7 +439,7 @@ def run(o) -> int:
             before = tree_state(o.dir)
             peer = used.get(r, role["peer"])
             conv = f"panel-{o.name}-{r}" + (f"-{peer}" if peer != role["peer"] else "")
-            rc, text = ask(peer, conv, cross_prompt(o.name, role, others, asked.get(r, []), cite_md),
+            rc, text = ask(peer, conv, cross_prompt(o.name, role, others, asked.get(r, []), cite_md, first),
                            o, (role.get("model") if peer == role["peer"] else None) or None, role.get("mode") or "ask",
                            role_timeout(role))
             if rc not in (0, 5):
@@ -443,7 +457,7 @@ def run(o) -> int:
         (out / "cross.json").write_text(json.dumps(cross, ensure_ascii=False, indent=2))
 
     if cross:
-        cites = verify_citations(o.dir, {**findings, **{f"{r} (cross)": t for r, t in cross.items()}})
+        cites = verify_citations(o.dir, {**findings, **{f"{r} (cross)": t for r, t in cross.items()}}, roots)
         (out / "citations.json").write_text(json.dumps(cites, ensure_ascii=False, indent=2))
         cite_md = citation_table(cites)
     low = low_evidence(cites, list(findings))
@@ -454,9 +468,9 @@ def run(o) -> int:
                      synth_prompt(o.name, o.problem, findings, cross, cite_md, low), o)
     if rc not in (0, 5):
         print(f"[panel] ABORT — synthesis failed ({report[:200]}); findings/cross are saved — "
-              f"`bridge-panel synth {o.name} -p {leader_peer} -d {o.dir}` re-runs just this step", file=sys.stderr)
+              f"`bridge-panel synth {o.name} -p {leader_peer}` re-runs just this step", file=sys.stderr)
         (out / "report.md").unlink(missing_ok=True)
-        ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start, cites)
+        ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start, cites, first)
         return 4
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     roles_line = ", ".join(f"{r} ({used[r]})" if used.get(r) and used[r] != roles[r]["peer"] else r for r in findings)
@@ -492,7 +506,7 @@ def run(o) -> int:
         print(f"[panel] {verdict.strip()}", file=sys.stderr)
         print(f"[panel] patch={out / 'patch.md'}", file=sys.stderr)
     post(topic, f"Report written: {out / 'report.md'}\n\n" + report[:3000])
-    ledger_row(o, kind, findings, used, fallbacks, failed, 0, t_start, cites)
+    ledger_row(o, kind, findings, used, fallbacks, failed, 0, t_start, cites, first)
     close_panel_topics(o.name, chosen)
     print(head + report)
     print(f"\n[panel] report={out / 'report.md'} board={topic} threads=panel-{o.name}-*", file=sys.stderr)
@@ -521,12 +535,15 @@ def voices_from_status(findings: dict, status: dict) -> str:
 
 
 def ledger_row(o, kind: str, findings: dict, used: dict, fallbacks: dict, failed: dict, rc: int, t_start: float,
-               cites: list[dict] | None = None) -> None:
+               cites: list[dict] | None = None, first: list[dict] | None = None) -> None:
     try:
         ledger.record({"type": "panel", "name": o.name, "kind": kind, "peers": o.peers, "roles": list(findings),
                        "answered": used, "fallbacks": list(fallbacks), "failed": list(failed), "rc": rc,
                        "fix": bool(o.fix), "cross": not o.no_cross, "agreement": bool(o.agreement),
                        "citations": {r: list(cite_score(cites or [], r)) for r in findings},
+                       # before cross-examination, where each role was handed its own misses to correct
+                       "citations_first": {r: list(cite_score(first or [], r)) for r in findings},
+                       "citations_rev": RESOLVER_REV,
                        "low_evidence": sorted(low_evidence(cites or [], list(findings))),
                        "duration_s": round(time.time() - t_start)})
     except Exception:  # noqa: BLE001 — the ledger must never break a panel
@@ -566,10 +583,20 @@ def gc(o) -> int:
     """
     cutoff = time.time() - o.days * 86400
     targets = [(PANELS, "panel"), (STATE / "conv", "conv")]
-    removed, pruned, kept = [], [], 0
+    removed, pruned, kept, held = [], [], 0, 0
+    # what a `bridge-plan mark` verdict names stays whole — the run's log, prompt and stderr, the panel's dir: the
+    # human-checked traces `learn --replay` measures a change on (2026-11-16: half of them were already deleted). A run
+    # is kept by its stem (a recovered run's verdict says `<stem>.recover`); the `panel` of a run verdict is the panel
+    # the run was a role in, not a verdict on that panel
+    verdicts = [r for r in ledger.rows() if r.get("type") == "verdict"]
+    keep_runs = {r["run"].split(".")[0] for r in verdicts if r.get("run")}
+    keep_panels = {r["panel"] for r in verdicts if r.get("panel") and not r.get("run")}
     for root, label in targets:
         for d in sorted(root.glob("*")) if root.is_dir() else []:
             if not d.is_dir():
+                continue
+            if label == "panel" and d.name in keep_panels:
+                held += 1
                 continue
             newest = max((f.stat().st_mtime for f in d.rglob("*") if f.is_file()), default=d.stat().st_mtime)
             if newest < cutoff:
@@ -593,18 +620,35 @@ def gc(o) -> int:
                 kept += 1
     runs = STATE / "runs"
     old = [f for f in runs.glob("*") if f.is_file() and f.stat().st_mtime < cutoff] if runs.is_dir() else []
+    judged = [f for f in old if f.name.split(".")[0] in keep_runs]          # `.recover` files share the run's stem
+    old = [f for f in old if f not in judged]
     for f in old:
         if not o.dry_run:
             f.unlink()
     verb = "would remove" if o.dry_run else "removed"
     pverb = "would prune" if o.dry_run else "pruned"
     print(f"bridge-panel gc: {verb} {len(removed)} dir(s), {pverb} {len(pruned)} card-bearing dir(s), "
-          f"and {verb} {len(old)} run log file(s) older than {o.days} days; kept {kept} fresh dir(s).")
+          f"and {verb} {len(old)} run log file(s) older than {o.days} days; kept {kept} fresh dir(s), and {held} "
+          f"panel dir(s) and {len(judged)} run file(s) a verdict names "
+          f"({sum(f.stat().st_size for f in judged) / 1e6:.1f} MB).")
     for r in removed:
         print(f"  {verb}: {r}")
     for r in pruned:
         print(f"  {pverb}: {r}")
     return 0
+
+
+def rerun_context(out: Path, o) -> dict:
+    """A re-run of one stage (synth, fix) works as the panel ran: in the dir in its status.json unless -d is given,
+    under its kind, with the roots its roles were granted (absolute, as `run` keeps them) granted to the child peer
+    too. Returns status.json, its add_dir cut to the roots that still exist."""
+    status = json.loads((out / "status.json").read_text()) if (out / "status.json").is_file() else {}
+    o.dir = o.dir or status.get("dir") or os.getcwd()
+    o.kind_resolved = status.get("kind", "")     # the ledger row and the depth follow the panel's kind, not the prompt
+    # a root since removed is neither granted nor checked (os.path.isdir is False where 3.11-3.13 Path.is_dir raises)
+    status["add_dir"] = [d for d in status.get("add_dir") or [] if os.path.isdir(d)]
+    share_add_dirs(status["add_dir"])
+    return status
 
 
 def fix(o) -> int:
@@ -619,6 +663,7 @@ def fix(o) -> int:
         print(f"bridge-panel: -p must name the implementer peer ({imp['peer']})", file=sys.stderr)
         return 2
     case = (out / "case.md").read_text() if (out / "case.md").is_file() else ""
+    rerun_context(out, o)
     print(f"[panel] patch sketch with {imp['peer']} …", file=sys.stderr)
     rc, patch = ask(imp["peer"], f"panel-{o.name}-implementer",
                     fix_prompt(o.name, (out / "report.md").read_text(), case, imp), o,
@@ -643,14 +688,19 @@ def synth(o) -> int:
     if o.leader not in [x.strip() for x in o.peers.split(",")]:
         print(f"bridge-panel: -p must name the leader peer ({o.leader})", file=sys.stderr)
         return 2
-    cites = verify_citations(o.dir, {**findings, **{f"{r} (cross)": t for r, t in cross.items()}})
+    status = rerun_context(out, o)
+    # the run's question (a panel from before 2026-11-16 kept only the leader's), checked in the run's roots only: this
+    # command's --add-dir lets the leader read more, but report.md takes every line that resolves to `fix`, whose
+    # implementer may be another vendor, granted the run's roots alone
+    problem = status.get("problem") or problem
+    roots = named_roots(problem, status["add_dir"], o.dir)
+    cites = verify_citations(o.dir, {**findings, **{f"{r} (cross)": t for r, t in cross.items()}}, roots)
     (out / "citations.json").write_text(json.dumps(cites, ensure_ascii=False, indent=2))
     cite_md = citation_table(cites)
     low = low_evidence(cites, list(findings))
     print(f"[panel] re-synthesising `{o.name}` from {len(findings)} saved findings …", file=sys.stderr)
     rc, report = ask(o.leader, f"panel-{o.name}-leader", synth_prompt(o.name, problem, findings, cross, cite_md, low), o)
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    status = json.loads((out / "status.json").read_text()) if (out / "status.json").is_file() else {}
     head = (f"# Panel `{o.name}` — re-synthesised {stamp}\n\nLeader: {o.leader} · roles: {', '.join(findings)}\n\n"
             f"> **Voices** — {voices_from_status(findings, status)}\n\n"
             + (f"> {low_evidence_line(low)}\n\n" if low else ""))
@@ -699,14 +749,14 @@ def main() -> int:
     x = sub.add_parser("fix", help="re-run only the patch sketch from a panel's saved report (1 peer run)")
     x.add_argument("name")
     x.add_argument("-p", "--peers", required=True)
-    x.add_argument("-d", "--dir", default=os.getcwd())
+    x.add_argument("-d", "--dir", help="default: the run's, from its status.json, else the current directory")
     x.add_argument("--add-dir", action="append", default=[])
     x.add_argument("-t", "--timeout", type=int, default=420)
     x.add_argument("--detach", action="store_true")
     y = sub.add_parser("synth", help="re-run only the synthesis from a panel's saved findings (1 peer run)")
     y.add_argument("name")
     y.add_argument("-p", "--peers", required=True)
-    y.add_argument("-d", "--dir", default=os.getcwd())
+    y.add_argument("-d", "--dir", help="default: the run's, from its status.json, else the current directory")
     y.add_argument("--add-dir", action="append", default=[])
     y.add_argument("-t", "--timeout", type=int, default=420)
     y.add_argument("--leader", default="claude")
@@ -716,6 +766,9 @@ def main() -> int:
     s.add_argument("name")
     o = ap.parse_args()
     share_add_dirs(getattr(o, "add_dir", []))
+    # the roots every peer run is granted — absolute, with those an orchestrator (bridge-fix) passed down — are the
+    # ones `run` checks citations against and keeps in status.json for synth and fix
+    o.add_dir = add_dirs_from_env()
     if o.cmd == "roles":
         for n, m in load_roles().items():
             fb = f" (fallback: {m['fallback_peer']})" if m.get("fallback_peer") else ""

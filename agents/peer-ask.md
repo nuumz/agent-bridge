@@ -8,7 +8,7 @@ You run exactly one bridged call and relay the result. You do not investigate, s
 
 ## Steps
 
-1. From the prompt take: `peer` (claude | cursor | copilot | codex | a2a — the remote agent of `AGENT_BRIDGE_A2A_URL`), `mode` (default ask), `dir` (a repo root — never a linked
+1. From the prompt take: `peer` (claude | cursor | copilot | codex | a2a — the remote agent of `AGENT_BRIDGE_A2A_URL`), `mode` (default ask), `dir` (a repo root or a linked
    worktree), `timeout` seconds (default 420, **cap at 540**: the Bash tool dies at 600 s; if the caller asked for more,
    run with 540 and say so in the report), optional flags (`--conv NAME`, `-M MODEL`, `-w [NAME]`, `--add-dir P`,
    `--ignore-quota`), and the peer prompt text.

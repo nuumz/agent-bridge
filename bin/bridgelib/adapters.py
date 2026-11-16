@@ -24,6 +24,7 @@ class Parsed:
         self.result, self.session, self.tok_in, self.tok_out, self.is_error, self.extra = (
             result, session, tok_in, tok_out, is_error, extra)
         self.metrics = metrics if metrics is not None else {}
+        self.citations: list[dict] = []          # set by the runner: the answer's file:line citations, as scored
 
 
 class Adapter:
@@ -59,6 +60,22 @@ class Adapter:
     def preamble(self, o: argparse.Namespace) -> str:
         """Text prepended to the prompt when a rules file cannot be injected (e.g. fresh worktree)."""
         return ""
+
+    # the bridge's own preambles: a CLI that titles an unnamed session after the prompt's first line would show one of
+    # these for every bridged run (Copilot: `(Bridge workspace bootstrap`, Claude and Codex:
+    # `(Headless read-only run…`), and `bridge-plan learn --replay` takes a run's roots from the task after them.
+    # Cursor's are up to three one-line paragraphs, one of which names the mirrored rule files
+    PREAMBLE_RE = re.compile(r"^(?:\((?:Bridge workspace bootstrap|Headless (?:write|read-only) run)\b.*?\)\n\n"
+                             r"|(?:Read-only run: do not|Before anything else, read and follow|Cursor on the board:)"
+                             r"[^\n]*\n\n)+", re.S)
+
+    @classmethod
+    def session_name(cls, o: argparse.Namespace, prompt: str) -> str:
+        """`bridge · <conv>: <the task's first line>`, at most 80 chars — the name a new session is given."""
+        task = cls.PREAMBLE_RE.sub("", prompt, count=1)
+        first = next((line.strip() for line in task.splitlines() if line.strip()), "")
+        label = ": ".join(p for p in (getattr(o, "conv", ""), first) if p) or "task"
+        return f"bridge · {label}"[:80]
 
     def finish(self, o: argparse.Namespace) -> None:
         """Undo anything prepare() set up for the run; idempotent, also runs on timeout/signal via atexit."""
@@ -113,6 +130,8 @@ class Claude(Adapter):
             a += ["--resume", o.session, "--fork-session"]
         elif o.cont:
             a += ["--continue", "--fork-session"]
+        else:
+            a += ["--name", self.session_name(o, prompt)]
         return a + ["--", prompt]
 
     def resume_argv(self, o, session, prompt):
@@ -517,6 +536,8 @@ class Copilot(Adapter):
             a += [f"--resume={o.session}"]
         elif o.cont:
             a += ["--continue"]
+        else:
+            a += [f"--name={self.session_name(o, prompt)}"]
         return a + ["-p", prompt]
 
     def resume_argv(self, o, session, prompt):
@@ -550,6 +571,14 @@ class Copilot(Adapter):
         for source, target in (("premiumRequests", "premium_requests"), ("totalApiDurationMs", "api_duration_ms")):
             if isinstance(u.get(source), (int, float)) and not isinstance(u[source], bool):
                 metrics[target] = u[source]
+        # AI credits: each `session.usage_checkpoint` carries the session's running total in nano-AIU — cumulative
+        # over a resumed session, like Claude's cost_session, so it is kept as the session's figure, never as this
+        # run's spend
+        totals = [(e.get("data") or {}).get("totalNanoAiu") for e in events
+                  if e.get("type") == "session.usage_checkpoint"]
+        totals = [n for n in totals if isinstance(n, (int, float)) and not isinstance(n, bool)]
+        if totals:
+            metrics["ai_credits_session"] = round(max(totals) / 1e9, 6)
         if isinstance((u.get("codeChanges") or {}).get("filesModified"), list):
             metrics["files_modified"] = len(edited)
         extra = f"premium={u.get('premiumRequests', '?')} api={u.get('totalApiDurationMs', '?')}ms"

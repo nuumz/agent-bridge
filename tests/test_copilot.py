@@ -132,6 +132,19 @@ class CopilotRuntime(unittest.TestCase):
                 self.assertTrue(parsed.is_error)
                 self.assertIn("incomplete", parsed.result.lower())
 
+    def test_new_session_is_named_after_the_task_not_the_bootstrap(self):
+        agent = Copilot()
+        with tempfile.TemporaryDirectory() as tmp:
+            prompt = agent.preamble(self.opts(dir=tmp)) + "\n  Review src/a.py for races\nmore detail"
+            self.assertIn("--name=bridge · Review src/a.py for races", agent.argv(self.opts(), prompt))
+            self.assertIn("--name=bridge · panel-x-critic: Review src/a.py for races",
+                          agent.argv(self.opts(conv="panel-x-critic"), prompt))
+            long = agent.argv(self.opts(), "x" * 200)
+            self.assertEqual(len(next(a for a in long if a.startswith("--name="))), len("--name=") + 80)
+        for o in (self.opts(session="abc"), self.opts(cont=True)):
+            self.assertFalse(any(a.startswith("--name") for a in agent.argv(o, "q")))
+        self.assertFalse(any(a.startswith("--name") for a in agent.resume_argv(self.opts(), "abc", "q")))
+
     def test_live_run_persists_metrics_and_warns_without_discarding_the_answer(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -181,8 +194,82 @@ class CopilotRuntime(unittest.TestCase):
             self.assertEqual(row["permission_denials"], 1)
             self.assertNotIn("premium_requests", row)
 
+    def test_a_run_that_raises_after_writing_its_prompt_stays_one_row_after_backfill(self):
+        # the ledger row names the log _execute chose: before 2026-11-16 it had none, so a later backfill rebuilt the
+        # saved prompt into a second row of the same run
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent = Copilot()
+            with mock.patch.object(agent, "resolve", return_value=sys.executable), \
+                    mock.patch.object(runner, "run", side_effect=OSError("launch failed")), \
+                    mock.patch.object(runner, "RUNS", root / "runs"), \
+                    mock.patch.object(ledger, "STATE", root), \
+                    mock.patch.object(ledger, "RUNS", root / "runs"), \
+                    mock.patch.object(ledger, "LEDGER", root / "ledger.jsonl"), \
+                    mock.patch.object(boardlib, "BOARD_DIR", root / "board"), \
+                    mock.patch.object(boardlib, "DB_PATH", root / "board" / "board.db"), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(OSError):
+                    runner.execute(agent, self.opts(dir=tmp), "Review src/a.py", None, None)
+                live = ledger.rows()
+                ledger.backfill()
+                after = ledger.rows()
+            self.assertEqual(len(live), 1)
+            self.assertEqual([(r["type"], r["rc"], r["log"]) for r in after], [("run", 2, live[0]["log"])])
+            self.assertTrue(Path(live[0]["log"].replace(".json", ".prompt.txt")).is_file())
+
 
 class CopilotLearning(unittest.TestCase):
+    def test_usage_checkpoints_give_the_sessions_ai_credits(self):
+        raw = stream({"type": "session.usage_checkpoint", "data": {"totalNanoAiu": 4000000000}},
+                     {"type": "assistant.message", "data": {"content": "Done."}},
+                     {"type": "session.usage_checkpoint", "data": {"totalNanoAiu": 9935744000}},
+                     {"type": "result", "sessionId": "s", "exitCode": 0, "usage": {"premiumRequests": 1}})
+        self.assertEqual(Copilot().parse(raw).metrics["ai_credits_session"], 9.935744)   # the running total, last
+        self.assertNotIn("ai_credits_session", Copilot().parse(fixture()).metrics)        # no checkpoint, no figure
+
+    def test_backfill_reads_the_ask_back_from_the_saved_answer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            runs.mkdir()
+            (runs / "20261022-120000-1-copilot.prompt.txt").write_text("Review")
+            (runs / "20261022-120000-1-copilot.json").write_text(stream(
+                {"type": "assistant.message",
+                 "data": {"content": "One fact is missing.\n[[ASK]] Allow access to /x/a.diff"}},
+                {"type": "result", "sessionId": "s", "exitCode": 0, "usage": {}}))
+            with mock.patch.object(ledger, "STATE", root), \
+                    mock.patch.object(ledger, "RUNS", runs), \
+                    mock.patch.object(ledger, "LEDGER", root / "ledger.jsonl"):
+                ledger.backfill()
+                row = ledger.rows()[0]
+            self.assertEqual((row["asked_back"], row["ask"]), (True, "Allow access to /x/a.diff"))
+
+    def test_backfill_keeps_rows_whose_trace_is_gone_and_what_only_the_live_row_knew(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            runs.mkdir()
+            (runs / "20261022-120000-1-copilot.prompt.txt").write_text("Review")
+            log = runs / "20261022-120000-1-copilot.json"
+            log.write_text(fixture())
+            gone = str(runs / "20261001-120000-1-claude.json")          # `bridge-panel gc` took this log
+            with mock.patch.object(ledger, "STATE", root), \
+                    mock.patch.object(ledger, "RUNS", runs), \
+                    mock.patch.object(ledger, "LEDGER", root / "ledger.jsonl"):
+                ledger.record({"ts": 1, "type": "run", "peer": "claude", "rc": 0, "log": gone,
+                               "citations_ok": 3, "citations_total": 4})
+                ledger.record({"ts": 2, "type": "panel", "name": "gone-panel", "rc": 0})
+                ledger.record({"ts": 3, "type": "run", "peer": "copilot", "rc": 0, "log": str(log),
+                               "citations_rev": 2, "dir": "/w"})                 # no log holds these two
+                self.assertEqual(ledger.backfill(), (2, 1))
+                rows = {r.get("log") or r.get("name"): r for r in ledger.rows()}
+            self.assertEqual(rows[gone]["citations_total"], 4)
+            self.assertIn("gone-panel", rows)
+            rebuilt = rows[str(log)]
+            self.assertTrue(rebuilt["backfilled"])
+            self.assertEqual((rebuilt["citations_rev"], rebuilt["dir"]), (2, "/w"))
+
     def test_backfill_preserves_copilot_session_metrics_and_partial_stream_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -224,6 +311,114 @@ class CopilotLearning(unittest.TestCase):
                 self.assertEqual(ledger.rows()[0]["rc"], 1)
                 ledger.backfill()                                # a second rebuild must not forget it
                 self.assertEqual(ledger.rows()[0]["rc"], 1)
+
+    def test_backfill_reads_a_recovered_run_once_from_its_recovery_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            runs.mkdir()
+            (runs / "20261022-120000-1-claude.prompt.txt").write_text("Review")
+            (runs / "20261022-120000-1-claude.json").write_text(json.dumps(
+                {"type": "result", "result": "I will read the files now.", "session_id": "s", "total_cost_usd": 0.1}))
+            (runs / "20261022-120000-1-claude.recover.prompt.txt").write_text("Answer now")
+            recovered = runs / "20261022-120000-1-claude.recover.json"
+            recovered.write_text(json.dumps(
+                {"type": "result", "result": "The bug is at a.py:3.", "session_id": "s", "total_cost_usd": 0.3}))
+            with mock.patch.object(ledger, "STATE", root), \
+                    mock.patch.object(ledger, "RUNS", runs), \
+                    mock.patch.object(ledger, "LEDGER", root / "ledger.jsonl"):
+                # the live row names the log the answer came from (runner: `parsed, log = rp, rlog`)
+                ledger.record({"ts": 9, "type": "run", "peer": "claude", "rc": 0, "log": str(recovered),
+                               "citations_rev": 2})
+                self.assertEqual(ledger.backfill(), (1, 0))                  # one run, one row
+                row, = ledger.rows()
+        self.assertEqual((row["log"], row["cost_session"], row["citations_rev"]), (str(recovered), 0.3, 2))
+
+    def test_backfill_keeps_the_ask_back_and_session_a_codex_log_has_no_result_for(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            runs.mkdir()
+            (runs / "20261022-120000-1-codex.prompt.txt").write_text("Review")
+            log = runs / "20261022-120000-1-codex.json"
+            log.write_text("\n".join(json.dumps(e) for e in (
+                {"type": "thread.started", "thread_id": "th-1"},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": "[[ASK]] Allow access to /x"}},
+                {"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 7}})) + "\n")
+            with mock.patch.object(ledger, "STATE", root), \
+                    mock.patch.object(ledger, "RUNS", runs), \
+                    mock.patch.object(ledger, "LEDGER", root / "ledger.jsonl"):
+                ledger.record({"ts": 1, "type": "run", "peer": "codex", "rc": 5, "log": str(log), "session": "th-1",
+                               "asked_back": True, "ask": "Allow access to /x", "duration_s": 120})
+                ledger.backfill()
+                row, = ledger.rows()
+        self.assertEqual((row["asked_back"], row["ask"], row["session"], row["rc"], row["duration_s"]),
+                         (True, "Allow access to /x", "th-1", 5, 120))     # a Codex log holds no duration
+        self.assertEqual(row["tokens_out"], 7)                               # what the log holds is still read
+
+    def test_backfill_prices_a_turn_against_the_carried_turns_of_its_session(self):
+        start = int(time.mktime(time.strptime("20261022120000", "%Y%m%d%H%M%S")))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            runs.mkdir()
+            (runs / "20261022-120000-1-claude.prompt.txt").write_text("Review")
+            log = runs / "20261022-120000-1-claude.json"
+            log.write_text(json.dumps({"type": "result", "result": "ok", "session_id": "s", "total_cost_usd": 0.55,
+                                       "duration_ms": 30000}))
+            with mock.patch.object(ledger, "STATE", root), \
+                    mock.patch.object(ledger, "RUNS", runs), \
+                    mock.patch.object(ledger, "LEDGER", root / "ledger.jsonl"):
+                # the session's first turn: `bridge-panel gc` took its log, so only its carried row holds the total
+                ledger.record({"ts": start - 60, "type": "run", "peer": "claude", "rc": 0, "session": "s",
+                               "cost_session": 0.40, "cost": 0.40, "log": str(runs / "20261022-115800-1-claude.json")})
+                ledger.backfill()
+                rows = {r["log"]: r for r in ledger.rows()}
+        self.assertEqual(rows[str(log)]["cost"], 0.15)
+
+    def test_backfill_keeps_a_pruned_panel_and_what_only_the_live_panel_row_knew(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            runs.mkdir()
+            pruned, whole = root / "panel" / "pruned", root / "panel" / "whole"
+            pruned.mkdir(parents=True)
+            (pruned / "agreement.md").write_text("card\n")                      # all gc left of it
+            whole.mkdir()
+            (whole / "status.json").write_text(json.dumps({"answered": {"root-cause": "claude"}}))
+            (whole / "report.md").write_text("# Panel whole — 2026-10-22 12:00\n")
+            with mock.patch.object(ledger, "STATE", root), \
+                    mock.patch.object(ledger, "RUNS", runs), \
+                    mock.patch.object(ledger, "LEDGER", root / "ledger.jsonl"):
+                ledger.record({"ts": 1, "type": "panel", "name": "pruned", "rc": 0,
+                               "citations": {"root-cause": [3, 4]}})
+                ledger.record({"ts": 2, "type": "panel", "name": "whole", "rc": 1, "citations_rev": 2})
+                self.assertEqual(ledger.backfill(), (0, 2))
+                panels = {r["name"]: r for r in ledger.rows()}
+        self.assertEqual((panels["pruned"]["rc"], panels["pruned"]["citations"]), (0, {"root-cause": [3, 4]}))
+        self.assertEqual((panels["whole"]["rc"], panels["whole"]["citations_rev"]), (1, 2))   # the exit status is live
+        self.assertTrue(panels["whole"]["backfilled"])
+
+    def test_backfill_carries_every_row_of_a_run_or_panel_with_nothing_on_disk(self):
+        # a rebuild replaces every row of what it rebuilds, so two rows of a run or panel with nothing left on disk are
+        # two facts: deduplicating them lost an attempt whichever row it kept
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            runs.mkdir()
+            with mock.patch.object(ledger, "STATE", root), \
+                    mock.patch.object(ledger, "RUNS", runs), \
+                    mock.patch.object(ledger, "LEDGER", root / "ledger.jsonl"):
+                # a panel run twice under one name: an earlier backfill rebuilt the first attempt, the second is live
+                ledger.record({"ts": 1, "type": "panel", "name": "rerun", "rc": 4, "backfilled": True})
+                ledger.record({"ts": 2, "type": "panel", "name": "rerun", "rc": 0})
+                # a live session: a row per turn, each naming the session's one log
+                turns = str(root / "live" / "claude" / "peer.jsonl")
+                ledger.record({"ts": 3, "type": "run", "peer": "claude", "mode": "live", "rc": 0, "log": turns})
+                ledger.record({"ts": 4, "type": "run", "peer": "claude", "mode": "live", "rc": 1, "log": turns})
+                ledger.backfill()
+                self.assertEqual([(r["type"], r["ts"], r["rc"]) for r in ledger.rows()],
+                                 [("panel", 1, 4), ("panel", 2, 0), ("run", 3, 0), ("run", 4, 1)])
 
     def test_plan_card_names_alternative_peers(self):
         path = Path(__file__).resolve().parents[1] / "bin" / "bridge-plan"

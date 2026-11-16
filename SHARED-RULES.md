@@ -118,6 +118,9 @@ to cwd, access roots and mode limits. It points to native instruction/skill disc
 creating a context tree. This is an inventory, not proof of loaded instructions. It does not enable `--trust-folder`,
 `--allow-all-paths`, extra roots or shell access. Supply external evidence explicitly or grant a specific root with
 `--add-dir`; the peer must not retry a denied tool or bypass a denied path. Essential missing access uses `[[ASK]]`.
+Because the bootstrap leads every prompt, a new Copilot or Claude session gets `--name "bridge · <conv>: <task's first
+line>"` (80 chars max) — unnamed, the session lists title every run after the preamble (`(Bridge workspace bootstrap`,
+`(Headless read-only run`); resumes and forks keep the name they had.
 Instruction files above cwd and outside every `--add-dir` root are listed as outside file access. Note that Copilot's
 `--add-dir` also loads that root's `.github/skills` and `.github/agents` as trusted configuration — grant only roots
 whose repo config you trust. `bridge-panel run|fix|synth`, `bridge-work run` and `bridge-fix run` take the same
@@ -130,11 +133,17 @@ granted roots it adds the path's git repo root when that root lies strictly unde
 `state/` — only that one `state/<kind>/<name>` folder (never the ledger, `runs/` or the bridge checkout). Each grant is
 printed as `[bridge] add-dir (cited in prompt): <root>`. Write mode never widens on its own; scratch files, non-git
 directories and paths outside HOME still need an explicit `--add-dir` or must be inlined in the prompt.
+After the answer, `ask-agent` checks its `file:line` citations against the files (`-d`, the `--add-dir` roots and the
+files the prompt names by absolute path and the roots those paths grant an ask or plan run (a write run is checked against them too, though not granted them) — the resolver of §9) and prints `[bridge] citations: N checked,
+M do not resolve (UNVERIFIED): <cite> — <reason>; …` (at most 8 named) or `… all resolve` on stderr: a script's
+check, never a model's; the caller holds the session and may resume it to ask for the corrected `path:line`.
 
 Copilot JSONL must end with a `result` event to count as a completed stream (legacy plain-text output is still
 accepted). Tool failures can be recovered during a run, so they produce a warning and operational metrics, not an
 automatic task failure. Live and backfilled ledger rows preserve `premium_requests`, `api_duration_ms`,
-`files_modified` when reported, plus `tool_calls`, `tool_failures`, `permission_denials` for JSONL. `bridge-plan learn`
+`files_modified` when reported, plus `tool_calls`, `tool_failures`, `permission_denials` for JSONL, and
+`ai_credits_session` (the largest `totalNanoAiu` of the stream's `session.usage_checkpoint` events ÷ 10⁹ — the session's
+running total, cumulative over a resumed session like Claude's `cost_session`, never this run's own spend). `bridge-plan learn`
 groups Copilot operations by job kind and mode, including panel workers; backfilled modes and absent usage remain
 unknown. Reported premium usage is not dollars or a quality score and is not assumed to be a per-run billing delta.
 Backfill keeps the exit status a live row recorded for the same log (`rc_source: live`) instead of re-deriving it.
@@ -516,7 +525,7 @@ critics is not worth a second run.
 | | Content | Why |
 |---|---|---|
 | **Shared, identical, model-free** | the *case file* (`panel/<name>/case.md`): the problem plus every file it names, quoted with line numbers, built locally before any peer runs | one text, one set of line numbers: two roles cannot disagree because they read different revisions, and a citation means the same line to everyone |
-| **Shared after the first pass** | every finding + the *verified citation table* (`citations.json`): each `path:line` any role wrote, checked against the files — `ok` with the line text, or `NO SUCH FILE` / `OUT OF RANGE` / `BLANK LINE` | the cross-examination and the report argue over facts a script checked, not over each other's prose; an unresolved citation is UNVERIFIED however many roles repeated it |
+| **Shared after the first pass** | every finding + the *verified citation table* (`citations.json`): each `path:line` any role wrote, checked against the files — `ok` with the line text, or `NO SUCH FILE` / `AMBIGUOUS` / `OUT OF RANGE` / `BLANK LINE` / `UNREADABLE` / `OUTSIDE THE ROOTS`. A path resolves as written, then by basename: the workspace first (a nested checkout such as a bridge worktree only when the tree has no such file), then the `--add-dir` roots, the files the problem names by absolute path and the roots `cited_roots` grants a run for the paths it names (a git checkout strictly under HOME, one bridge `state/<kind>/<name>` folder — never the bridge checkout or `state/runs`). Nothing outside those roots is read, because a resolved line reaches every other role's vendor: an absolute, `~/` or `..` path to a file elsewhere is `OUTSIDE THE ROOTS` (unread — `--add-dir` grants it; a symlink a root holds counts as inside it, while a `..` path counts where it lands once links are followed), an absolute path that does not exist is read workspace-relative (as a container's `/app/x.py` is), and a root at or above HOME is never walked | the cross-examination and the report argue over facts a script checked, not over each other's prose; an unresolved citation is UNVERIFIED however many roles repeated it |
 | **Private** | the first pass: a worker sees only its own question, not the other roles' questions and not the leader's hypothesis (`--hypothesis` opts in) | four roles that start from one guess produce ratification, not a panel |
 
 A crashed worker run is excluded from the findings and listed at the top of the report — an error message is not evidence.
@@ -529,13 +538,17 @@ reads like three.
 who fell back, who failed — are kept): one voice is not a panel, and five one-role "reports" reached the user before this
 rule (2026-09-26). `--allow-single` synthesises anyway. A failed leader synthesis also exits 4 and leaves no report;
 `synth` re-runs it alone.
-`bridge-panel synth <name> -p claude -d DIR` rebuilds the report from the saved record for one peer run (a failed leader
+`bridge-panel synth <name> -p claude` rebuilds the report from the saved record for one peer run (a failed leader
 run costs nothing else). `--fix` adds one closing run: the `implementer` role turns the agreed report into a patch
 sketch in `panel/<name>/patch.md` — a diff to review, still read-only, no file written; `bridge-panel fix <name>`
-re-runs that stage alone. The patch must also correct any comment or docstring the change falsifies (a surviving
+re-runs that stage alone; `synth` and `fix` re-run with the run's dir, kind and granted roots (from `status.json`; `-d`
+overrides the dir; a `synth --add-dir` lets the leader read more but never widens the citation check, since
+`report.md` reaches `fix`). The patch must also correct any comment or docstring the change falsifies (a surviving
 `# BUG: <the fixed thing>` line was the first run's defect, 2026-09-12), and `patch.md` opens with the local
 `git apply --check` verdict — a diff the checker rejects is a lead, not a patch. `bridge-panel gc [--days 14]
-[--dry-run]` deletes panel dirs, conversation threads and run logs older than N days.
+[--dry-run]` deletes panel dirs, conversation threads and run logs older than N days, except what a `bridge-plan mark`
+verdict names: that run's files (log, prompt, stderr, `.recover`) and that panel's dir stay whole — the human-checked
+traces `learn --replay` measures a change on. `status.json` keeps the panel's `problem`, `dir` and `add_dir` for it.
 
 A role file = frontmatter (`name`, `peer`, optional `model` → `-M`, optional `mode` → `-m` (default `ask`), optional
 `timeout` → raises `-t` for that role only, never lowers it (as-built-realist: 600), `summary`) + the
@@ -545,7 +558,10 @@ will see the repo; the leader never investigates, and the report may cite only e
 a role whose citations — in its finding and its cross-examination — mostly failed the machine check (≥2 made,
 under half resolving) is named **low-evidence** in
 the synthesis prompt and the report header — its claims are weighed as UNVERIFIED unless another role's citation
-holds; the panel ledger row carries `citations` per role and `low_evidence`;
+holds; the panel ledger row carries `citations` per role (`citations_first`: the same before cross-examination),
+`citations_rev` and `low_evidence`; the cross-examination hands each role its own citations that did not resolve, with
+the checker's reason, and asks for the corrected `path:line` or UNVERIFIED — the one repair, inside the turn the role
+already gets (no extra run);
 a worker that asks back (exit 5) is listed at the top of the report with the exact `--conv` command to answer it; the
 report is a lead for the human — decisions stay with the user (`peer review: panel <name>, <date>`). Cost: 2 + 2 × roles
 peer runs with cross-examination (1 + roles without). Measured 2026-09-12 on one probe incident, three rounds, same
@@ -580,17 +596,32 @@ Claude run rows also carry `turns` and `cache_write` (context the run pulled in)
 from them. `cost` is the run's own cost: Claude reports `total_cost_usd` cumulatively over a resumed session (`--conv`,
 cross-examination, synthesis), so the row keeps that as `cost_session` and subtracts the total the run resumed from. Quality: after verifying a peer's findings, `bridge-plan mark <panel|log> [-r role] --kept N --rejected M`
 appends a `type: verdict` row; `learn` prints kept-rate per peer/role and suggests dropping one below 50% over ≥10
-findings. `learn --backfill` rebuilds run/panel rows from disk and carries work/fix/verdict rows over.
+findings. `learn --backfill` rebuilds run/panel rows from disk; it carries over every row it cannot rebuild: work, fix,
+verdict, blocked and shape_miss rows, `bridge-live` turns, and every row of a run or panel whose log or dir gc
+already deleted or pruned to its card (until 2026-11-16 it dropped those, most of a month's rows) — a panel name
+run twice keeps both attempts. A rebuilt row keeps from the live one its exit status and every field the
+files left empty (citations, `dir`, a Codex/A2A `ask` or duration, a session …); a recovered run is one row, read from its `.recover` log; a
+run's cost is priced against every earlier row of its session, carried ones too.
 **Scorecard** (`bridge-plan learn --team [--days 30]`): one row per (role|kind, peer) from what a script could check —
-`runs`, `ok%` (rc 0), `ask` (asked back), `med $`, `tools` (median tool calls — how much the run did), `cites`
-(file:line citations in the answer that resolve / made;
-every run row now carries `citations_ok/total`, `tool_calls`, `tokens_in`, `asked_back`), `miss` (replies refused for
+`runs`, `ok%` (rc 0), `ask` (asked back), `acc` (of those, ask-backs that asked for access — a path outside the run's
+roots, a shell or an MCP its mode denies — read from the row's `ask` text), `med $`, `tools` (median tool calls — how
+much the run did), `cites` (file:line citations in the answer that resolve / made, counted only from rows whose
+`citations_rev` is the resolver's current `evidence.RESOLVER_REV` — bumped with any resolver change, because an older
+resolver's misses were not the peer's; every run row carries `citations_ok/total`, `citations_rev`, `tool_calls`,
+`tokens_in`, `asked_back`, `ask`, `dir`, `add_dir`), `miss` (replies refused for
 missing the requested shape), `blk` (blocked replies), `decl` (the same request missed twice), `kept` (verdicts).
 Board rows carry a peer family, no role, so they sit under `board`. Suggestions name the better peer in the same row
 (≥3 runs) or the role's `fallback_peer`: under half the citations resolving (≥3), two shape misses, asked back in
-more than half the runs. `bridge-plan "<request>"` prints one `scorecard` line when another peer ended rc=0 at least
+more than half the runs; two or more access ask-backs suggest the grant instead — `--add-dir`, the diff or `git show`
+output inlined in the brief, or claude for a review pinned to a git ref (its read-only mode runs git). `bridge-plan "<request>"` prints one `scorecard` line when another peer ended rc=0 at least
 20 points more often on that kind over 3+ runs — a lead; `-p` stays the human's choice. Never the peer's own word:
 tool calls and tokens say how much it did, citations and verdicts whether it was any good.
+**Replay** (`bridge-plan learn --replay [--base REV] [--days N]`): re-scores the citations of every answer whose log is
+still on disk, plus the panel dirs a verdict names, with `REV`'s `bin/bridgelib/evidence.py` (default HEAD) and the
+working tree's, both against today's files — drift since a run hits both alike, so the difference is the change.
+Slices: held-in, held-out (a fixed quarter by the sha256 of the log name — counts only, never examples: tune on
+held-in), adjudicated (what a verdict names); `fixed` / `regressed` count per answer. It writes nothing and refuses
+`--backfill` / `--team`; a resolver change that moves statuses bumps `RESOLVER_REV`.
 **The tool proposes; a human edits the playbook.** Decisions (grain · gate · vocabulary · status) never move to a peer
 or to this loop.
 

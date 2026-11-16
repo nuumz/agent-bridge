@@ -6,6 +6,8 @@
     bridge-plan agree <name>                                         check a session card: exit 0 = no TODO left, else exit 3
     bridge-plan learn [--backfill] [--days N] [--team]               what the ledger says per kind, with suggestions;
                                                                      --team: the scorecard per (role|kind, peer)
+    bridge-plan learn --replay [--base REV] [--days N]               re-score the saved answers' citations: REV's
+                                                                     resolver vs the working tree (writes nothing)
     bridge-plan mark <panel|run-log> [-r role] --kept N --rejected M  after verifying a peer's findings: what survived
 
 Session depth (frontmatter `level:` of each playbook — not a third agreement level; edit the file to change a default):
@@ -18,6 +20,8 @@ Session cards live under panel/ or work/ (never conv/). Learning loop: ledger ro
 from __future__ import annotations
 
 import argparse
+import functools
+import hashlib
 import json
 import os
 import re
@@ -25,15 +29,16 @@ import statistics
 import subprocess
 import sys
 import time
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # Installed as a Claude Code plugin, the subagents in agents/ are namespaced `agent-bridge:peer-*`
 SUBAGENT = "agent-bridge:" if "/.claude/plugins/" in str(Path(__file__).resolve()) else ""
-from bridgelib import ledger  # noqa: E402
+from bridgelib import evidence, ledger  # noqa: E402
 from bridgelib import grill as grill_plan  # noqa: E402
 from bridgelib.core import (  # noqa: E402
-    find_session_card, session_card_form_home, session_card_path,
+    ROOT, find_session_card, session_card_form_home, session_card_path,
 )
 
 def doc_roots() -> list[Path]:
@@ -295,6 +300,13 @@ def role_fallbacks() -> dict[str, str]:
     return out
 
 
+# An ask-back that asks for access — a path outside the run's roots, a shell or an MCP its mode denies — is a gap in the
+# brief or the grant, not a question for the user (2026-11-16: 18 of the 25 asks whose text survived)
+ACCESS_ASK_RE = re.compile(r"(?<![\w.])(?:~|/)[\w.@+-]*/|authori[sz]ed|denied|outside|permission|\baccess\b|\bshell\b"
+                           r"|\bgit (?:show|diff|fetch|grep|log)\b|\bgit -C\b|\bmcp\b|snapshot|นอกขอบเขต"
+                           r"|ห้าม(?:ใช้)?\s*shell", re.I)
+
+
 def scorecard(rows: list[dict]) -> dict[tuple[str, str], dict]:
     """Per (role|kind, peer): what the ledger can prove about a peer's work — runs and rc, ask-backs, cost, citations
     that resolved, replies that missed the requested shape, blocks, declines (the same request missed twice), and the
@@ -302,9 +314,9 @@ def scorecard(rows: list[dict]) -> dict[tuple[str, str], dict]:
     sc: dict[tuple[str, str], dict] = {}
 
     def cell(key):
-        return sc.setdefault(key, {"runs": 0, "ok": 0, "asked_back": 0, "cost": [], "tools": [], "cites_ok": 0,
-                                   "cites_total": 0, "shape_miss": 0, "blocked": 0, "declined": 0, "kept": 0,
-                                   "verdicts": 0})
+        return sc.setdefault(key, {"runs": 0, "ok": 0, "asked_back": 0, "asked_access": 0, "cost": [], "tools": [],
+                                   "cites_ok": 0, "cites_total": 0, "shape_miss": 0, "blocked": 0, "declined": 0,
+                                   "kept": 0, "verdicts": 0})
     misses: dict[tuple[str, str, int], set] = {}
     for r in rows:
         t = r.get("type")
@@ -313,12 +325,14 @@ def scorecard(rows: list[dict]) -> dict[tuple[str, str], dict]:
             c["runs"] += 1
             c["ok"] += r.get("rc") == 0
             c["asked_back"] += bool(r.get("asked_back") or r.get("rc") == 5)
+            c["asked_access"] += bool(ACCESS_ASK_RE.search(r.get("ask") or ""))
             if r.get("cost"):
                 c["cost"].append(r["cost"])
             if r.get("tool_calls") is not None:
                 c["tools"].append(r["tool_calls"])
-            c["cites_ok"] += r.get("citations_ok") or 0
-            c["cites_total"] += r.get("citations_total") or 0
+            if r.get("citations_rev") == evidence.RESOLVER_REV:   # an older resolver's misses were not the peer's
+                c["cites_ok"] += r.get("citations_ok") or 0
+                c["cites_total"] += r.get("citations_total") or 0
         elif t in ("shape_miss", "blocked"):
             c = cell(("board", family(r.get("peer"))))
             c[t] += 1
@@ -363,6 +377,11 @@ def team_suggestions(sc: dict[tuple[str, str], dict]) -> list[str]:
         if c["runs"] >= 3 and c["asked_back"] / c["runs"] > 0.5:
             out.append(f"{role} on {peer}: asked back in {c['asked_back']}/{c['runs']} runs — the request lacks an "
                        f"input it needs (see `bridge-plan` missing inputs){hint}")
+        if c["asked_access"] >= 2:
+            out.append(f"{role} on {peer}: {c['asked_access']} ask-backs asked for access, not for a fact — grant the "
+                       "root with --add-dir or inline the diff / `git show` output in the brief"
+                       + ("" if peer == "claude" else "; a review pinned to a git ref fits claude, whose read-only "
+                          "mode runs git"))
     return out
 
 
@@ -372,16 +391,18 @@ def team(rows: list[dict], days: int) -> int:
         print("bridge-plan: no run, board or verdict rows in the window")
         return 0
     print(f"scorecard — last {days} days, per (role|kind, peer); what a script could check, never the peer's own word")
-    print(f"{'role|kind':22} {'peer':8} {'runs':>4} {'ok%':>4} {'ask':>3} {'med $':>6} {'tools':>5} {'cites':>9} "
-          f"{'miss':>4} {'blk':>3} {'decl':>4} {'kept':>7}")
+    print(f"cites: only rows scored by citation resolver rev {evidence.RESOLVER_REV} · acc: ask-backs that asked for "
+          "access (a path outside the run's roots, a shell or MCP its mode denies)")
+    print(f"{'role|kind':22} {'peer':8} {'runs':>4} {'ok%':>4} {'ask':>3} {'acc':>3} {'med $':>6} {'tools':>5} "
+          f"{'cites':>9} {'miss':>4} {'blk':>3} {'decl':>4} {'kept':>7}")
     for (role, peer), c in sorted(sc.items()):
         okp = f"{round(100 * c['ok'] / c['runs'])}%" if c["runs"] else "-"
         cites = f"{c['cites_ok']}/{c['cites_total']}" if c["cites_total"] else "-"
         kept = f"{c['kept']}/{c['verdicts']}" if c["verdicts"] else "-"
         med = f"{statistics.median(c['cost']):.2f}" if c["cost"] else "-"
         tools = f"{statistics.median(c['tools']):.0f}" if c["tools"] else "-"
-        print(f"{role[:22]:22} {peer[:8]:8} {c['runs']:4} {okp:>4} {c['asked_back']:3} {med:>6} {tools:>5} {cites:>9} "
-              f"{c['shape_miss']:4} {c['blocked']:3} {c['declined']:4} {kept:>7}")
+        print(f"{role[:22]:22} {peer[:8]:8} {c['runs']:4} {okp:>4} {c['asked_back']:3} {c['asked_access']:3} {med:>6} "
+              f"{tools:>5} {cites:>9} {c['shape_miss']:4} {c['blocked']:3} {c['declined']:4} {kept:>7}")
     print("\nsuggestions (a lead — the human edits the playbook, the role file or -p):")
     for s in team_suggestions(sc) or ["- none"]:
         print("- " + s if not s.startswith("- ") else s)
@@ -445,13 +466,174 @@ def mark(o) -> int:
     return 0
 
 
+def load_resolver(rev: str) -> types.ModuleType:
+    """evidence.py as it stood at `rev`, loaded as a module of its own: the base a resolver change is measured on."""
+    src = subprocess.run(["git", "-C", str(ROOT), "show", f"{rev}:bin/bridgelib/evidence.py"],
+                         capture_output=True, text=True)
+    if src.returncode:
+        raise ValueError(f"no bin/bridgelib/evidence.py at {rev!r} in {ROOT}: {src.stderr.strip()[:200]}")
+    mod = types.ModuleType(f"evidence_at_{rev}")
+    mod.__package__ = "bridgelib"                 # a relative import in that revision resolves against today's package
+    exec(compile(src.stdout, f"{rev}:bin/bridgelib/evidence.py", "exec"), mod.__dict__)
+    return mod
+
+
+PROTOCOL_HEAD = "\n\n(Bridge protocol:"        # how both runner.protocol() variants open, at the end of a saved prompt
+
+
+def bare_prompt(saved: str) -> str:
+    """The task a run was given, which it took its roots from (runner.execute): the saved `.prompt.txt` adds the
+    adapter's preamble before it and the bridge protocol after it."""
+    from bridgelib.adapters import Adapter
+    task = Adapter.PREAMBLE_RE.sub("", saved, count=1)
+    return task.rpartition(PROTOCOL_HEAD)[0] or task
+
+
+def held_out(stem: str) -> bool:
+    """A fixed quarter of the saved answers, by log name: tune a check on the rest, read this slice's numbers only."""
+    return int(hashlib.sha256(stem.encode()).hexdigest(), 16) % 4 == 0
+
+
+def replay_units(rows: list[dict]) -> list[dict]:
+    """Saved answers a resolver can re-score: each run row whose log is still on disk, with the roots the run had (the
+    row's `dir`, else the prompt's `Working directory:` line or the log's cwd), and each panel dir a verdict names —
+    gc keeps those whole. Slices: held-in / held-out by log name, `adjudicated` for what a verdict names."""
+    from bridgelib.adapters import ADAPTERS
+    verdicts = [r for r in rows if r.get("type") == "verdict"]
+    judged_runs = {r["run"].split(".")[0] for r in verdicts if r.get("run")}   # a recovered run's says `<stem>.recover`
+    units, seen = [], set()
+    for r in rows:
+        log = Path(r["log"]) if r.get("type") == "run" and r.get("log") else None
+        if log is None or str(log) in seen or r.get("peer") not in ADAPTERS:
+            continue
+        try:                                     # 3.11-3.13 let EPERM out of is_file / is_dir: not re-scorable
+            if not log.is_file():
+                continue
+            seen.add(str(log))
+            raw = log.read_text(errors="replace")
+            stem = log.name.split(".")[0]
+            prompt_file = log.with_name(f"{stem}.prompt.txt")
+            saved = prompt_file.read_text(errors="replace") if prompt_file.is_file() else ""
+            m = re.search(r"Working directory: (.+)", saved) or re.search(r'"cwd":\s*"([^"]+)"', raw)
+            prompt = bare_prompt(saved)  # the preamble names paths the run was not granted (Copilot's: the repo root)
+            root = r.get("dir") or (m.group(1).strip() if m else "")
+            if not (root and Path(root).is_dir()):
+                continue
+        except OSError:
+            continue
+        units.append({"stem": stem, "key": (role_of(r) or r.get("kind") or "other", r["peer"]),
+                      "texts": {"run": ADAPTERS[r["peer"]].parse(raw).result}, "root": root, "prompt": prompt,
+                      "add_dir": r.get("add_dir") or [],
+                      "slices": ["held-out" if held_out(stem) else "held-in"]
+                      + (["adjudicated"] if stem in judged_runs else [])})
+    # a verdict on a panel: the `panel` of a run verdict is the panel the run was a role in
+    for name in sorted({r["panel"] for r in verdicts if r.get("panel") and not r.get("run")}):
+        d = ledger.STATE / "panel" / name
+        try:
+            texts = json.loads((d / "findings.json").read_text())
+            if (d / "cross.json").is_file():
+                texts.update({f"{k} (cross)": v for k, v in json.loads((d / "cross.json").read_text()).items()})
+            status = json.loads((d / "status.json").read_text()) if (d / "status.json").is_file() else {}
+            head = (d / "report.md").read_text(errors="replace")[:2000] if (d / "report.md").is_file() else ""
+            m = re.search(r"· dir: (.+)", head)            # panels from before status.json carried the dir
+            root = status.get("dir") or (m.group(1).strip() if m else "")
+            if not (root and Path(root).is_dir()):
+                continue
+        except (OSError, json.JSONDecodeError):
+            continue
+        units.append({"stem": f"panel {name}", "key": None, "texts": texts, "root": root,
+                      "prompt": status.get("problem", ""), "add_dir": status.get("add_dir") or [],
+                      "slices": ["adjudicated"]})
+    return units
+
+
+def replay(rows: list[dict], rev: str, days: int, base: types.ModuleType | None = None) -> int:
+    """Re-score the saved answers' citations with `rev`'s resolver and the working tree's, both against today's files:
+    drift since a run hits both alike, so the difference is the change. Held-out answers show counts, never examples.
+    Proposes nothing, writes nothing — the ledger keeps what each run scored when it ran."""
+    try:
+        base = base or load_resolver(rev)
+    except ValueError as e:
+        print(f"bridge-plan: {e}", file=sys.stderr)
+        return 2
+    units = replay_units(rows)
+    if not units:
+        print(f"bridge-plan: no saved answer with its log on disk in the last {days} days")
+        return 0
+
+    def score(mod, u: dict) -> tuple[int, int]:
+        named = mod.named_roots(u["prompt"], u["add_dir"], u["root"]) if hasattr(mod, "named_roots") else None
+        got = (mod.verify_citations(u["root"], u["texts"], named) if named is not None
+               else mod.verify_citations(u["root"], u["texts"]))
+        return sum(c["status"] == "ok" for c in got), len(got)
+
+    def frac(ok: int, total: int) -> str:
+        return f"{ok}/{total} ({round(100 * ok / total)}%)" if total else "-"
+
+    slices = {s: {"n": 0, "base": [0, 0], "cand": [0, 0], "fixed": 0, "regressed": 0}
+              for s in ("held-in", "held-out", "adjudicated")}
+    per: dict[tuple[str, str], list[int]] = {}
+    moved: list[str] = []
+    walks = [(m, m.find_named) for m in (base, evidence) if hasattr(m, "find_named")]
+    for m, f in walks:                     # one replay asks the same few roots for the same names thousands of times
+        m.find_named = functools.lru_cache(maxsize=None)(f)
+    skipped = 0
+    try:
+        for u in units:
+            try:
+                b, c = score(base, u), score(evidence, u)
+            except (OSError, RuntimeError):    # a resolver before rev 2 lets EPERM out on Python 3.11-3.13
+                skipped += 1
+                continue
+            for s in u["slices"]:
+                t = slices[s]
+                t["n"] += 1
+                t["base"] = [t["base"][0] + b[0], t["base"][1] + b[1]]
+                t["cand"] = [t["cand"][0] + c[0], t["cand"][1] + c[1]]
+                t["fixed"] += max(0, c[0] - b[0])
+                t["regressed"] += max(0, b[0] - c[0])
+            if "held-in" in u["slices"] and b != c:
+                moved.append(f"  {u['stem']}  {b[0]}/{b[1]} → {c[0]}/{c[1]}")
+            if u["key"]:
+                p = per.setdefault(u["key"], [0, 0])
+                p[0], p[1] = p[0] + c[0], p[1] + c[1]
+    finally:
+        for m, f in walks:
+            m.find_named = f
+    print(f"replay — {len(units)} saved answers (last {days} days): the citation resolver at {rev} vs the working "
+          "tree, both against today's files; nothing is written")
+    if skipped:
+        print(f"skipped {skipped} answer(s): a resolver could not stat or resolve a path one cites — not counted below")
+    print(f"{'slice':12} {'answers':>7}  {'base':>18}  {'candidate':>18}  {'fixed':>5}  {'regressed':>9}")
+    for s, t in slices.items():
+        if t["n"]:
+            print(f"{s:12} {t['n']:7}  {frac(*t['base']):>18}  {frac(*t['cand']):>18}  {t['fixed']:5}  "
+                  f"{t['regressed']:9}")
+    print("fixed / regressed: per answer, how many more / fewer of its citations resolve than with the base")
+    if moved:
+        print("\nanswers whose count moved (held-in only — read the held-out slice as counts, never tune on it):")
+        print("\n".join(moved[:10]) + (f"\n  … {len(moved) - 10} more" if len(moved) > 10 else ""))
+    if per:
+        print("\nper (role|kind, peer) with the working tree's resolver:")
+        for (role, peer), (ok, total) in sorted(per.items()):
+            if total:
+                print(f"  {role[:22]:22} {peer[:8]:8} {frac(ok, total):>18}")
+    return 0
+
+
 def learn(o) -> int:
+    if getattr(o, "replay", False) and (o.backfill or getattr(o, "team", False)):
+        print("bridge-plan: --replay only reads the ledger and the logs — run it without --backfill and --team",
+              file=sys.stderr)
+        return 2
     if o.backfill:
         n_runs, n_panels = ledger.backfill()
         print(f"bridge-plan: ledger rebuilt from disk — {n_runs} runs, {n_panels} panels\n")
     rows = ledger.rows()
     cutoff = time.time() - o.days * 86400
     rows = [r for r in rows if r.get("ts", 0) >= cutoff]
+    if getattr(o, "replay", False):
+        return replay(rows, o.base, o.days)
     if getattr(o, "team", False):
         return team(rows, o.days)
     if not rows:
@@ -587,6 +769,10 @@ def main() -> int:
     ln.add_argument("--backfill", action="store_true")
     ln.add_argument("--days", type=int, default=30)
     ln.add_argument("--team", action="store_true", help="the scorecard per (role|kind, peer) instead of the kind table")
+    ln.add_argument("--replay", action="store_true",
+                    help="re-score the citations of the answers still on disk with --base's resolver and the working "
+                         "tree's (held-in / held-out / adjudicated slices); reads only")
+    ln.add_argument("--base", default="HEAD", help="git revision whose bin/bridgelib/evidence.py is the base (HEAD)")
     mk = sub.add_parser("mark", help="record findings kept / rejected after verifying a panel or run")
     mk.add_argument("target", help="panel name, or the log= path (or its file name) from the [bridge] line")
     mk.add_argument("-r", "--role", help="panel role the counts belong to (default: the whole panel / the run's own role)")
