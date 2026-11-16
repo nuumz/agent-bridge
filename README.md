@@ -235,7 +235,7 @@ skill packs in `work-skills.local/` (also ignored).
 | Variable | Effect |
 |---|---|
 | `AGENT_BRIDGE_LANG` | reply language when no request text is at hand (default `English`); otherwise the reply follows the request — Thai script → Thai, anything else → English |
-| `BRIDGE_DOC_ROOTS` | `os.pathsep`-separated markdown trees that `bridge-plan learn` scans for peer-review rows |
+| `BRIDGE_DOC_ROOTS` | `os.pathsep`-separated markdown trees that `bridge-plan learn` scans for peer-review rows; unset → the directories the window's runs ran in (`dir` on run rows) and the repository `learn` is called from |
 
 ## Development
 

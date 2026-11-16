@@ -41,9 +41,16 @@ from bridgelib.core import (  # noqa: E402
     ROOT, find_session_card, session_card_form_home, session_card_path,
 )
 
-def doc_roots() -> list[Path]:
-    """Markdown trees scanned by `learn` for `peer review:` rows. Set `BRIDGE_DOC_ROOTS` (os.pathsep)."""
-    return [Path(p).expanduser() for p in os.environ.get("BRIDGE_DOC_ROOTS", "").split(os.pathsep) if p.strip()]
+def doc_roots(rows: list[dict]) -> list[Path]:
+    """Markdown trees scanned by `learn` for `peer review:` rows: `BRIDGE_DOC_ROOTS` (os.pathsep) when set, else the
+    directories the window's runs ran in and the repository `learn` is called from — one root per tree."""
+    named = [p for p in os.environ.get("BRIDGE_DOC_ROOTS", "").split(os.pathsep) if p.strip()]
+    if named:
+        return [Path(p).expanduser() for p in named]
+    top = subprocess.run(["git", "-C", os.getcwd(), "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    dirs = [r["dir"] for r in rows if r.get("dir")] + ([top.stdout.strip()] if top.returncode == 0 else [])
+    found = {Path(d).resolve() for d in dirs if Path(d).is_dir()}
+    return sorted(p for p in found if not any(q in p.parents for q in found))
 
 
 def slug(s: str) -> str:
@@ -270,17 +277,18 @@ def kinds(o) -> int:
     return 0
 
 
-def citations() -> dict[str, int]:
-    """`peer review: panel <name>` / `peer review: <peer>` rows in the docs — the only quality signal the ledger has."""
+def citations(roots: list[Path]) -> dict[str, int]:
+    """`peer review: panel <name>` / `peer review: <peer>` rows in the docs under `roots`, a panel name with or without
+    backticks. No root is nothing read, not a count of zero: the caller says so."""
     out: dict[str, int] = {}
-    for root in doc_roots():
+    for root in roots:
         if not root.is_dir():
             continue
         r = subprocess.run(["rg", "-o", "-I", "--no-heading", "-g", "*.md",
-                            r"peer review:\s*(panel\s+[\w.-]+|claude|cursor|copilot|codex|a2a|ask-\w+)", str(root)],
+                            r"peer review:\s*(panel\s+`?[\w.-]+`?|claude|cursor|copilot|codex|a2a|ask-\w+)", str(root)],
                            capture_output=True, text=True)
         for line in r.stdout.splitlines():
-            key = re.sub(r"^peer review:\s*", "", line.strip())
+            key = " ".join(re.sub(r"^peer review:\s*", "", line.strip()).replace("`", "").split())
             out[key] = out.get(key, 0) + 1
     return out
 
@@ -640,7 +648,8 @@ def learn(o) -> int:
         print("bridge-plan: ledger empty — run `bridge-plan learn --backfill` once")
         return 0
     books = ledger.load_playbooks()
-    cites = citations()
+    roots = doc_roots(rows)
+    cites = citations(roots)
     print(f"ledger: {len(rows)} rows in the last {o.days} days ({ledger.LEDGER})\n")
     print("runs = direct runs of that kind (panel workers are counted under their panel); cited = `peer review: panel <name>` "
           "rows in specs/memory for the kind's panels; direct-run citations cannot be attributed to a kind\n")
@@ -667,7 +676,8 @@ def learn(o) -> int:
                     role_use[role][0] += 1
         cited = sum(n for k, n in cites.items() if k.startswith("panel ") and any(k == f"panel {p['name']}" for p in ps))
         print(f"{kind:18} {len(rs):4} {round(100 * ok / len(rs)) if rs else 0:3}% {len(ps):6} {aborts:5} "
-              f"{statistics.median(durs) if durs else 0:7.1f} {statistics.median(costs) if costs else 0:6.2f}  {cited:5}  "
+              f"{statistics.median(durs) if durs else 0:7.1f} {statistics.median(costs) if costs else 0:6.2f}  "
+              f"{cited if roots else '-':>5}  "
               + " ".join(f"{p}={n}" for p, n in peers.items())
               + ("  roles: " + " ".join(f"{r}={a}/{t}" for r, (a, t) in role_use.items()) if role_use else ""))
         for role, (a, t) in role_use.items():
@@ -675,7 +685,7 @@ def learn(o) -> int:
                 suggestions.append(f"{kind}: role {role} answered {a}/{t} panels — give it a fallback_peer or drop it from panel_roles")
         if ps and aborts / len(ps) > 0.3:
             suggestions.append(f"{kind}: {aborts}/{len(ps)} panels aborted — require a case file / smaller role set (see playbook body)")
-        if ps and cited == 0 and len(ps) >= 3 and kind != "review-change":
+        if roots and ps and cited == 0 and len(ps) >= 3 and kind != "review-change":
             suggestions.append(f"{kind}: {len(ps)} panels, none cited as `peer review: panel …` — check whether a direct run would do")
         if len(rs) >= 5 and ok / len(rs) < 0.8:
             suggestions.append(f"{kind}: only {ok}/{len(rs)} direct runs ended rc=0 — look at the .err lines before running more")
@@ -734,6 +744,12 @@ def learn(o) -> int:
                   f"{statistics.median(turns) if turns else '-':>9} {round(statistics.median(cw)) if cw else '-':>15}")
     verdicts = [r for r in rows if r.get("type") == "verdict"]
     if verdicts:
+        panels = {r["name"] for r in rows if r.get("type") == "panel" and r.get("rc") in (0, None)}
+        direct = {Path(r["log"]).name.split(".")[0] for r in rows
+                  if r.get("type") == "run" and not r.get("panel") and r.get("log")}
+        marked_runs = {v["run"].split(".")[0] for v in verdicts if v.get("run")}
+        print(f"\nmarked: {len(panels & {v.get('panel') for v in verdicts})}/{len(panels)} panels, "
+              f"{len(direct & marked_runs)}/{len(direct)} direct runs — the kept rates below rest on these")
         tally: dict[str, list[int]] = {}
         for v in verdicts:
             key = f"role {v['role']}" if v.get("role") else f"peer {v.get('peer') or '?'}"
@@ -745,7 +761,12 @@ def learn(o) -> int:
         for k, (a, t) in tally.items():
             if t >= 10 and a / t < 0.5:
                 suggestions.append(f"{k}: only {a}/{t} findings survived verification — tighten its prompt or stop using it")
-    print("\ncitations in docs: " + ", ".join(f"{k}={n}" for k, n in sorted(cites.items(), key=lambda x: -x[1])[:8]))
+    if roots:
+        print(f"\ncitations in docs (scanned: {', '.join(map(str, roots))}): "
+              + (", ".join(f"{k}={n}" for k, n in sorted(cites.items(), key=lambda x: -x[1])[:8]) or "none"))
+    else:
+        print("\ncitations in docs: not scanned — no run in the window recorded its directory and `learn` was not "
+              "called inside a repository; set BRIDGE_DOC_ROOTS")
     print("\nsuggestions (edit the playbook, the tool never changes it):")
     for s in suggestions or ["- none"]:
         print("- " + s if not s.startswith("- ") else s)

@@ -29,6 +29,8 @@ rc=<n> — <meaning>
 [bridge] <the bridge line from stdout, verbatim>
 [bridge] running <identity> — watch it live: bridge-watch -f <pid>   (from stderr, verbatim: the caller passes it to the user)
 [bridge] error: <the error line from stderr, if any>
+mark: bridge-plan mark <the log= path from the [bridge] line> --kept N --rejected M   (rc 0 or 1 with findings only;
+      N and M stay as letters — the caller counts them after opening every cited file:line)
 
 <the peer's answer, verbatim, untrimmed>
 ```

@@ -597,7 +597,10 @@ Claude run rows also carry `turns` and `cache_write` (context the run pulled in)
 from them. `cost` is the run's own cost: Claude reports `total_cost_usd` cumulatively over a resumed session (`--conv`,
 cross-examination, synthesis), so the row keeps that as `cost_session` and subtracts the total the run resumed from. Quality: after verifying a peer's findings, `bridge-plan mark <panel|log> [-r role] --kept N --rejected M`
 appends a `type: verdict` row; `learn` prints kept-rate per peer/role and suggests dropping one below 50% over ≥10
-findings. `learn --backfill` rebuilds run/panel rows from disk; it carries over every row it cannot rebuild: work, fix,
+findings, under a `marked: P/N panels, R/M direct runs` line — how much of the work those rates rest on. The `cited`
+column counts `peer review: panel <name>` rows (the name with or without backticks) in `BRIDGE_DOC_ROOTS`, or, when
+that is unset, in the directories the window's runs ran in and the repository `learn` is called from; `learn` names
+the roots it read, and with none to read it prints `-` and `not scanned` and makes no "none cited" suggestion. `learn --backfill` rebuilds run/panel rows from disk; it carries over every row it cannot rebuild: work, fix,
 verdict, blocked and shape_miss rows, `bridge-live` turns, and every row of a run or panel whose log or dir gc
 already deleted or pruned to its card (until 2026-11-16 it dropped those, most of a month's rows) — a panel name
 run twice keeps both attempts. A rebuilt row keeps from the live one its exit status and every field the
