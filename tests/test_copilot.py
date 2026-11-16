@@ -16,7 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 import boardlib  # noqa: E402
-from bridgelib import ledger, runner  # noqa: E402
+from bridgelib import adapters, ledger, runner  # noqa: E402
 from bridgelib.adapters import Copilot  # noqa: E402
 
 
@@ -44,6 +44,98 @@ def fixture() -> str:
     )
 
 
+class CopilotRunSurface(unittest.TestCase):
+    """What a Copilot run carries besides the prompt: the board, the MCP servers, the usage file."""
+
+    def opts(self, **kw):
+        return argparse.Namespace(**{"mode": "ask", "deny": [], "model": "", "add_dir": [], "session": "",
+                                     "cont": False, "board": False, "kind": "", **kw})
+
+    def test_the_board_rides_on_the_run_and_is_allowed_by_name(self):
+        for mode in ("ask", "plan", "write"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as d, \
+                    mock.patch.object(adapters, "HOME", Path(d)):                 # not the real ~/.copilot
+                argv = Copilot().argv(self.opts(mode=mode, board=True), "q")
+                config = json.loads(argv[argv.index("--additional-mcp-config") + 1])["mcpServers"]["bridge_board"]
+                self.assertEqual(config["args"], ["serve"])
+                self.assertTrue(config["command"].endswith("bin/bridge-board"))
+                self.assertEqual(config["env"], {"AGENT_BRIDGE_AGENT": "copilot", "AGENT_BRIDGE_HOP": "1"})
+                self.assertIn("--allow-tool=bridge_board", argv)
+        argv = Copilot().argv(self.opts(board=False), "q")
+        self.assertNotIn("--additional-mcp-config", argv)
+        self.assertNotIn("--allow-tool=bridge_board", argv)
+
+    def test_no_mcp_server_but_the_board_loads(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(adapters, "HOME", Path(d)):
+            (Path(d) / ".copilot").mkdir()
+            (Path(d) / ".copilot/mcp-config.json").write_text(json.dumps({"mcpServers": {
+                "chrome-bot-mcp": {}, "microsoft/markitdown": {}, "bridge_board": {}}}))
+            argv = Copilot().argv(self.opts(mode="write", board=True), "q")
+            self.assertIn("--disable-builtin-mcps", argv)
+            self.assertIn("--disable-mcp-server=chrome-bot-mcp", argv)
+            self.assertIn("--disable-mcp-server=microsoft/markitdown", argv)
+            self.assertNotIn("--disable-mcp-server=bridge_board", argv)
+            argv = Copilot().argv(self.opts(board=False), "q")            # --no-board: the user's own entry goes too
+            self.assertIn("--disable-mcp-server=bridge_board", argv)
+            (Path(d) / ".copilot/mcp-config.json").write_text("{not json")       # unreadable: the built-ins still go
+            argv = Copilot().argv(self.opts(), "q")
+            self.assertIn("--disable-builtin-mcps", argv)
+            self.assertFalse([a for a in argv if a.startswith("--disable-mcp-server")])
+
+    def test_usage_file_gives_the_sessions_tokens_and_the_model_that_ran(self):
+        argv = Copilot().argv(self.opts(usage_file="/r/x.usage.json"), "q")
+        self.assertIn("--usage-output-file=/r/x.usage.json", argv)
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "run-copilot.json"
+            parsed = Copilot().parse(fixture())
+            Copilot().read_usage(parsed, log)                       # no usage file: nothing changes
+            self.assertNotIn("model", parsed.metrics)
+            log.with_suffix(".usage.json").write_text(json.dumps({"modelMetrics": {}}))
+            Copilot().read_usage(parsed, log)                       # no count: unknown, not zero
+            self.assertNotIn("tokens_session_in", parsed.metrics)
+            log.with_suffix(".usage.json").write_text(json.dumps({"modelMetrics": {
+                "a": {"usage": {}}, "b": {"usage": {"inputTokens": True}}}}))
+            Copilot().read_usage(parsed, log)                       # a model with no count, a bool: neither counts
+            self.assertNotIn("tokens_session_in", parsed.metrics)
+            # the shape --usage-output-file wrote on 1.0.112 (trimmed to the fields read)
+            log.with_suffix(".usage.json").write_text(json.dumps({"currentModel": "gpt-6-luna", "modelMetrics": {
+                "gpt-6-luna": {"usage": {"inputTokens": 58184, "outputTokens": 41}},
+                "gpt-6.1-sol": {"usage": {"inputTokens": 100, "outputTokens": 9}}}}))
+            Copilot().read_usage(parsed, log)
+            self.assertEqual(parsed.metrics["tokens_session_in"], 58284)
+            self.assertEqual(parsed.metrics["tokens_session_out"], 50)
+            self.assertEqual(parsed.metrics["model"], "gpt-6-luna")
+            self.assertIn("model=gpt-6-luna", parsed.extra)
+
+    def test_read_only_preamble_steers_git_off_dash_c_and_off_graphify(self):
+        text = Copilot().preamble(argparse.Namespace(dir=".", add_dir=[], mode="ask"))
+        self.assertIn("never `git -C`", text)
+        self.assertIn("do not load the graphify skill", text)
+
+    def test_a_remote_family_gets_the_plain_protocol_on_a_board_thread(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "run.json"
+            agent = mock.Mock(remote=True)
+            agent.name, agent.env_keep = "a2a", ()
+            agent.preamble.return_value = ""
+            agent.prepare.return_value = []
+            agent.resolve.return_value = None                          # stop right after the prompt is built
+            conv = mock.Mock(topic=1, topic_name="conv:t")
+            seen = []
+            quiet = contextlib.redirect_stderr(io.StringIO())             # the not-on-PATH line
+            with quiet, mock.patch.object(runner, "protocol", side_effect=lambda c, r: seen.append(r) or ""):
+                runner._execute(agent, argparse.Namespace(ignore_quota=True, depth="standard", dir=d), "q", None, conv)
+            self.assertEqual(seen, [True])
+            agent.remote = False
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(runner, "protocol", side_effect=lambda c, r: seen.append(r) or ""):
+                runner._execute(agent, argparse.Namespace(ignore_quota=True, depth="standard", dir=d), "q", None, conv)
+            self.assertEqual(seen, [True, False])
+        board_thread = mock.Mock(topic=1, topic_name="conv:t")
+        self.assertEqual(runner.protocol(board_thread, True), runner.PROTOCOL)
+        self.assertIn("board_read", runner.protocol(board_thread))
+
+
 class CopilotRuntime(unittest.TestCase):
     def opts(self, **kw):
         return argparse.Namespace(**{
@@ -65,7 +157,13 @@ class CopilotRuntime(unittest.TestCase):
                         self.assertIn("--deny-tool=shell(git commit)", argv)
                     else:
                         self.assertIn("--deny-tool=write", argv)
-                        self.assertIn("--deny-tool=shell", argv)
+                        # read-only git runs (the CLI's own read-only check), history verbs never do
+                        self.assertNotIn("--deny-tool=shell", argv)
+                        self.assertIn("--deny-tool=shell(git commit)", argv)
+                        self.assertIn("--deny-tool=shell(git push:*)", argv)
+                        # no -C deny either: the CLI refuses `git -C` even for a read, and the preamble says so
+                        self.assertNotIn("--deny-tool=shell(git -C)", argv)
+                        self.assertFalse([t for t in argv if t.startswith("--allow-tool")], argv)
                         self.assertNotIn("--allow-all-tools", argv)
 
     def test_recovers_from_tool_errors_without_calling_them_successful_tools(self):
@@ -95,7 +193,7 @@ class CopilotRuntime(unittest.TestCase):
             self.assertIn(str(cwd / "CLAUDE.md"), prompt)
             self.assertNotIn(str(root / "GEMINI.md"), prompt)
             self.assertIn(str(root / "docs"), prompt)
-            self.assertIn("shell and file writes are denied", prompt)
+            self.assertIn("file writes are denied. The shell runs read-only commands only", prompt)
             self.assertIn("[[ASK]]", prompt)
             argv = agent.argv(self.opts(), "q")
             self.assertNotIn("--trust-folder", argv)

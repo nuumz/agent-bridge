@@ -69,8 +69,8 @@ marketplace file):
 
 The plugin puts `bin/` on the PATH of Claude's Bash tool, ships the `peer-*` subagents (as `agent-bridge:peer-ask` and
 so on) and a `UserPromptSubmit` hook that shows open cards. Then run `bridge-sync` once from that Bash tool to mirror
-your rules into Cursor/Copilot and register the board MCP; run it again after a plugin update (it re-points the MCP
-entry at the new plugin directory). For `ask-agent` from your own terminal, add the plugin's `bin/` to your shell PATH
+your rules into Cursor/Copilot and register the board MCP for Claude and Cursor (Copilot and Codex carry it on each
+run); run it again after a plugin update (it re-points the MCP entry at the new plugin directory). For `ask-agent` from your own terminal, add the plugin's `bin/` to your shell PATH
 or use the clone below.
 
 **As a clone** (any shell, contributors):
@@ -127,7 +127,7 @@ cannot read itself rather than guess, and never to stall on a checklist. Three c
 | Channel | How the peer uses it | How you (or the calling agent) answer |
 |---|---|---|
 | Live question while it runs | `board_ask_user` (a fact card) on the thread's topic, then `board_wait` | `bridge-board cards` shows it as seq N; `bridge-board post conv:<name> "<answer>" -k answer --reply-to N` — the run continues and the card closes |
-| Ask-back at the end | the reply ends with one line `[[ASK]] <question>`; `ask-agent` exits **5** and prints how to resume | `ask-agent <peer> --conv <name> "<answer>"` (or `--session <id>` for a run without a thread) — same session, nothing is re-sent |
+| Ask-back at the end (an access or a permission it lacks: at once) | the reply ends with one line `[[ASK]] <question>`; `ask-agent` exits **5** to the caller and prints how to resume — nothing is posted to the user | `ask-agent <peer> --conv <name> "<answer>"` (or `--session <id>` for a run without a thread) — same session, nothing is re-sent; to grant an access, add it to that run (`--add-dir`, `-m write`) |
 | A decision only a human can make | a **card** (`board_ask_user`): question · options · recommendation · default if nobody answers | `bridge-board cards` lists every open card; `bridge-board post <topic> "…" -k decision --reply-to N` |
 
 `bridge-fix` stops at the same kind of card before it changes anything (exit 3), and every `bridge-panel` report carries
@@ -157,8 +157,9 @@ paths outside HOME, grant the root yourself with `--add-dir`. Copilot also loads
 take the same `--add-dir` and pass it to every peer run they start.
 
 Give analysis tasks a bounded question, source paths/logs, expected versus actual behavior and the output needed
-(evidence, root cause, smallest safe fix, remaining uncertainty). In `ask`/`plan`, shell and writes stay denied:
-native search/read tools work inside permitted roots, but git/build/test evidence must be supplied by the caller.
+(evidence, root cause, smallest safe fix, remaining uncertainty). In `ask`/`plan`, file writes stay denied and the shell runs
+only what the CLI's own read-only check allows (git log/show/diff/grep/status/blame, cat, sed -n) inside permitted
+roots; build/test evidence must be supplied by the caller.
 The bootstrap directs Copilot not to retry denied tools or guess paths, and to ask back if essential access is missing.
 
 For implementation or a targeted improvement, use the existing isolated pipeline:
