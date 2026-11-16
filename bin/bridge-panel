@@ -21,7 +21,8 @@ What is shared and what is not — a debate is only worth its independence:
 
 Degraded runs: a role whose peer fails (quota, crash) is retried once on its `fallback_peer` (role frontmatter) when
 that peer is in -p; below two answering roles the panel ABORTS with exit 4 and writes no report (`--allow-single`
-overrides) — findings.json / status.json are still saved. A failed synthesis also exits 4; `synth` re-runs it alone.
+overrides) — findings.json / status.json are still saved. A failed synthesis also exits 4; `synth` re-runs it alone,
+under the same two-role gate.
 A role's `timeout:` frontmatter raises -t for that role's runs (as-built-realist needs ~300–455 s; 420 killed it 3 times).
 """
 from __future__ import annotations
@@ -347,6 +348,10 @@ def directed_questions(text: str) -> dict[str, list[str]]:
     return out
 
 
+RUN_OUTPUTS = ("report.md", "plan.json", "findings.json", "status.json", "cross.json", "citations.json", "case.md",
+               "patch.md")      # what one run writes; agreement.md is the session card and stays
+
+
 def clear_rc(name: str, *, report: bool = False) -> None:
     """Drop a prior run's done signal. Only `run` clears report.md — fix/synth need it."""
     d = PANELS / name
@@ -427,6 +432,8 @@ def run(o) -> int:
             print(f"WARNING: {warn}", file=sys.stderr)
 
     out = PANELS / o.name
+    for f in RUN_OUTPUTS:              # only once every input check passed: a typo must not cost the earlier record,
+        (out / f).unlink(missing_ok=True)      # but this run must not leave synth an earlier run's cross.json either
     out.mkdir(parents=True, exist_ok=True)
     topic = f"panel:{o.name}"
     post(topic, f"Panel `{o.name}` started — leader {leader_peer}, roles {chosen}.\n\n{o.problem}")
@@ -559,7 +566,10 @@ def run(o) -> int:
                      synth_prompt(o.name, o.problem, findings, cross, cite_md, low), o)
     if rc not in (0, 5):
         print(f"[panel] ABORT — synthesis failed ({report[:200]}); findings/cross are saved — "
-              f"`bridge-panel synth {o.name} -p {leader_peer}` re-runs just this step", file=sys.stderr)
+              f"`bridge-panel synth {o.name} -p {leader_peer}"
+              f"{f' --leader {leader_peer}' if leader_peer != 'claude' else ''}"
+              f"{' --allow-single' if o.allow_single else ''}` re-runs "
+              f"just this step", file=sys.stderr)
         (out / "report.md").unlink(missing_ok=True)
         ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start, cites, first, passed, requested)
         return 4
@@ -796,6 +806,11 @@ def synth(o) -> int:
     except (OSError, json.JSONDecodeError) as e:
         print(f"bridge-panel: no saved panel `{o.name}` to synthesise ({e})", file=sys.stderr)
         return 2
+    need = 1 if o.allow_single else 2
+    if len(findings) < need:            # the run's own gate: one voice synthesised reads like a panel and misleads
+        print(f"bridge-panel: `{o.name}` has {len(findings)} answering role(s) ({', '.join(findings) or 'none'}); need "
+              f"{need} — re-run the panel, or pass --allow-single if one role is genuinely enough", file=sys.stderr)
+        return 4
     cross = json.loads((out / "cross.json").read_text()) if (out / "cross.json").is_file() else {}
     if o.leader not in [x.strip() for x in o.peers.split(",")]:
         print(f"bridge-panel: -p must name the leader peer ({o.leader})", file=sys.stderr)
@@ -875,6 +890,7 @@ def main() -> int:
     y.add_argument("-t", "--timeout", type=int, default=420)
     y.add_argument("--leader", default="claude")
     y.add_argument("--leader-role", default="leader")
+    y.add_argument("--allow-single", action="store_true", help="synthesise from one answering role")
     y.add_argument("--detach", action="store_true")
     s = sub.add_parser("show")
     s.add_argument("name")

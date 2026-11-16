@@ -561,7 +561,11 @@ who fell back, who failed — are kept): one voice is not a panel, and five one-
 rule (2026-09-26). `--allow-single` synthesises anyway. A failed leader synthesis also exits 4 and leaves no report;
 `synth` re-runs it alone.
 `bridge-panel synth <name> -p claude` rebuilds the report from the saved record for one peer run (a failed leader
-run costs nothing else). `--fix` adds one closing run: the `implementer` role turns the agreed report into a patch
+run costs nothing else); it keeps the same gate — fewer than two saved answering roles exits 4 with no peer run
+unless `synth --allow-single`. A new `run` under an old name first deletes what the previous run wrote there
+(report.md at once; plan, findings, status, cross, citations, case, patch once its input checks pass; never
+`agreement.md`), so `synth` never mixes runs.
+`--fix` adds one closing run: the `implementer` role turns the agreed report into a patch
 sketch in `panel/<name>/patch.md` — a diff to review, still read-only, no file written; `bridge-panel fix <name>`
 re-runs that stage alone; `synth` and `fix` re-run with the run's dir, kind and granted roots (from `status.json`; `-d`
 overrides the dir; a `synth --add-dir` lets the leader read more but never widens the citation check, since

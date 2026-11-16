@@ -116,7 +116,8 @@ class Traces(unittest.TestCase):
             status = {"answered": {"critic": "claude"}, "problem": "Check it", "dir": str(ws),
                       "kind": "doc-readiness", "add_dir": [str(spec), str(root / "gone")]}   # one root removed since
             (panel / "status.json").write_text(json.dumps(status))
-            o = argparse.Namespace(name="p", leader="claude", peers="claude", dir=None, add_dir=[], timeout=420)
+            o = argparse.Namespace(name="p", leader="claude", peers="claude", dir=None, add_dir=[], timeout=420,
+                                   allow_single=True)     # one saved finding: synthesised only when asked to
             runs = []
 
             def leader(argv, *a, **k):
@@ -138,6 +139,40 @@ class Traces(unittest.TestCase):
         self.assertEqual(argv[argv.index("-d") + 1], str(ws))              # in the run's workspace
         self.assertEqual(argv[argv.index("--kind") + 1], "doc-readiness")  # under the run's kind
         self.assertIn("Problem:\n\nCheck it", argv[-1])                    # on the run's question, not the leader's
+
+    def test_synth_from_one_answering_role_needs_allow_single(self):
+        bp = _load()
+        with tempfile.TemporaryDirectory() as d:
+            panel = Path(d) / "panel" / "p"
+            panel.mkdir(parents=True)
+            (panel / "plan.json").write_text(json.dumps({"questions": [{"question": "q"}]}))
+            (panel / "findings.json").write_text(json.dumps({"critic": "one voice"}))
+            o = argparse.Namespace(name="p", leader="claude", peers="claude", dir=None, add_dir=[], timeout=420,
+                                   allow_single=False)
+            err = io.StringIO()
+            with mock.patch.object(bp, "PANELS", Path(d) / "panel"), mock.patch.object(bp, "close_panel_topics"), \
+                    mock.patch.object(bp, "ask", return_value=(0, "synthesis")) as ask, \
+                    redirect_stdout(io.StringIO()), redirect_stderr(err):
+                self.assertEqual(bp.synth(o), 4)
+            self.assertFalse((panel / "report.md").exists())
+        ask.assert_not_called()
+        self.assertIn("1 answering role(s) (critic); need 2", err.getvalue())
+
+    def test_a_run_refused_at_its_input_checks_keeps_the_earlier_record(self):
+        bp = _load()
+        with tempfile.TemporaryDirectory() as d:
+            panel = Path(d) / "panel" / "p"
+            panel.mkdir(parents=True)
+            for f in ("findings.json", "status.json", "cross.json"):
+                (panel / f).write_text("{}")
+            argv = ["bridge-panel", "run", "p", "Check it", "-p", "claude", "-r", "no-such-role", "-d", d]
+            with mock.patch.object(bp, "PANELS", Path(d) / "panel"), mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(bp, "hop_active", return_value=False), mock.patch.object(bp, "ask") as ask, \
+                    redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(bp.main(), 2)
+            left = sorted(f.name for f in panel.iterdir())
+        ask.assert_not_called()
+        self.assertEqual(left, ["cross.json", "findings.json", "rc", "status.json"])
 
     def test_fix_rechecks_the_patch_in_the_runs_workspace(self):
         bp = _load()
@@ -185,6 +220,10 @@ class Traces(unittest.TestCase):
             # (bridge-fix grants its roots through the environment, never as --add-dir)
             argv = ["bridge-panel", "run", "p", "Check it", "-p", "claude,cursor", "-r", "root-cause", "-d", str(ws),
                     "--add-dir", "../spec", "--kind", "doc-readiness"]
+            earlier = root / "panel" / "p"            # an earlier run under this name, and the session card
+            earlier.mkdir(parents=True)
+            for f in ("cross.json", "report.md", "patch.md", "agreement.md"):
+                (earlier / f).write_text("from before")
             with mock.patch.object(bp, "PANELS", root / "panel"), mock.patch.object(sys, "argv", argv), \
                     mock.patch.object(bp, "hop_active", return_value=False), \
                     mock.patch.object(bp, "ask", side_effect=peer), mock.patch.object(bp, "ledger_row"), \
@@ -193,6 +232,11 @@ class Traces(unittest.TestCase):
                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 self.assertEqual(bp.main(), 4)                       # below two answering roles
             status = json.loads((root / "panel" / "p" / "status.json").read_text())
+            left = sorted(f.name for f in earlier.iterdir())
+        # synth after this run must not read the earlier run's cross-examination; the session card stays
+        self.assertNotIn("cross.json", left)
+        self.assertNotIn("patch.md", left)
+        self.assertIn("agreement.md", left)
         roots = [str(given), str(spec)]
         self.assertEqual({k: status[k] for k in ("problem", "dir", "add_dir", "kind")},
                          {"problem": "Check it", "dir": str(ws), "add_dir": roots, "kind": "doc-readiness"})
