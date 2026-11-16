@@ -198,6 +198,11 @@ def plan(o) -> int:
             print(f"bridge-plan: no role of playbook {kind} can run on -p {peers} — name another peer with -p",
                   file=sys.stderr)
             return 3
+        lead = role_peers().get("leader", (None, None))[0] or "claude"      # bridge-panel's own default
+        if lead not in [p.strip() for p in peers.split(",")]:
+            print(f"bridge-plan: the panel leader runs on {lead}, which -p {peers} does not name — add it to -p",
+                  file=sys.stderr)
+            return 3
         cmd = (f"bridge-panel run {name} -p {peers} -r {roles} -d {o.dir} -t 420 --kind {kind}"
                + (f" --agreement {card}" if level != "routine" else "") + ' "<problem>"')
         via = (f'Agent(subagent_type="{SUBAGENT}peer-panel", prompt="name={name} peers={peers} roles={roles} '
@@ -374,7 +379,7 @@ def roster(role_names: list[str], allowed: list[str], rows: list[dict],
             continue
         pick, why = base, "its own peer" if base == own else f"its fallback — {own} is not in -p"
         mine = measured(role, base)
-        rivals = [(p, c) for p in allowed if p != base and (c := measured(role, p))]
+        rivals = [(p, c) for p in allowed if p != base and not blocked(p) and (c := measured(role, p))]
         best = max(rivals, key=lambda x: _rate(x[1], "kept", "verdicts"), default=None)
         if mine and best and clears_margin(best[1], mine):
             pick, why = best[0], f"measured: {kept(best[1])} vs {base} {kept(mine)}"

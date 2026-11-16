@@ -544,11 +544,13 @@ and the log carries `[panel] WARNING no cross-model view` — the run still exit
   cross-examination), one question per role; an unparsable plan adds none. An added role runs like any other
   (`panel-<name>-<role>[-<peer>]`, fallback, cross, citations); `status.json` `requested` and the ledger row name it,
   the report head lists it under *Roles the leader added*, and the Voices line marks it `added`.
-- *Pass*: a worker whose question is outside its role replies with only `[[PASS]] <reason>`. A pass is not a
+- *Pass*: a worker whose question is outside its role replies with one line, `[[PASS]] <reason>` (backticks, bold
+  or a quote around it are ignored; a reply that goes on past that line is an answer). A pass is not a
   finding: it is left out of `findings.json`, `answered`, the cross-examination and the citations, goes to
   `status.json` `passed` and the ledger row, is named under *Roles that passed* and as `passed:` in Voices, makes the
   run `degraded`, and counts as no answer for the two-role minimum (exit 4). `bridge-plan mark -r` refuses a role
-  that passed. A pass is not retried on the fallback peer.
+  that passed. A pass is not retried on the fallback peer. `synth` rebuilds both head blocks and the no-cross-model
+  warning from `status.json`.
 
 **What the panel shares and what it keeps apart** — a debate is only worth its independence:
 
@@ -567,7 +569,7 @@ reads like three.
 **Below two answering roles the panel aborts** (exit 4, no `report.md`; `findings.json` + `status.json` — who answered,
 who fell back, who failed — are kept): one voice is not a panel, and five one-role "reports" reached the user before this
 rule (2026-09-26). `--allow-single` synthesises anyway. A failed leader synthesis also exits 4 and leaves no report;
-`synth` re-runs it alone.
+`synth` re-runs it alone, and a failed `synth` exits 4 leaving the earlier `report.md` as it was.
 `bridge-panel synth <name> -p claude` rebuilds the report from the saved record for one peer run (a failed leader
 run costs nothing else); it keeps the same gate — fewer than two saved answering roles exits 4 with no peer run
 unless `synth --allow-single`. A new `run` under an old name first deletes what the previous run wrote there
@@ -654,7 +656,8 @@ output inlined in the brief, or claude for a review pinned to a git ref (its rea
 20 points more often on that kind over 3+ runs — a lead; `-p` stays the human's choice. For a panel it prints a
 **roster** — one `roster   <role> -> <peer> — <why>` line per role of the playbook's `panel_roles` — and the command
 carries it as `-r role=peer,…` with `--kind`: the role's own peer when `-p` names it, else its `fallback_peer` when
-`-p` names that, else the role is not run and the line says so (no role left → exit 3, no command). Another peer in `-p` takes a role only when both
+`-p` names that, else the role is not run and the line says so (no role left → exit 3, no command; a `-p` without
+the leader's peer, `roles/leader.md`, also exits 3 with no command). Another peer in `-p` takes a role only when both
 cells hold ≥5 marked findings (`verdict` rows) from ≥3 panels over the last 60 days and its kept rate is ≥0.10
 higher; a peer marked out of quota is passed over while another stands. When no role would run outside the leader's
 family the card prints a `WARNING` line; for `design-decision` the session card also gets an open

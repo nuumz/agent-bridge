@@ -152,7 +152,7 @@ class Bench(unittest.TestCase):
         worker = self.bp.worker_prompt(
             "p", roles["design-critic"], {"question": "q"}, "problem", "", ""
         )
-        self.assertIn("reply with only `[[PASS]] <one-line reason>`", worker)
+        self.assertIn("reply with one line only: [[PASS]] <reason>", worker)
 
 
 class LeaderOutput(unittest.TestCase):
@@ -185,6 +185,32 @@ class LeaderOutput(unittest.TestCase):
         )
         self.assertEqual([q["role"] for q in qs], ["as-built-realist", "design-critic"])
         self.assertEqual(requested, {"design-critic": "7"})
+
+    def test_questions_that_are_not_a_list_are_an_unparsable_plan(self):
+        for questions in (None, 3, "q"):
+            text = "```json\n" + json.dumps({"hypothesis": "h", "questions": questions}) + "\n```"
+            qs, _, requested = self.bp.parse_plan(text, ["as-built-realist"], "the problem", {})
+            self.assertEqual(([(q["role"], q["question"]) for q in qs], requested),
+                             ([("as-built-realist", "the problem")], {}))
+
+    def test_a_pass_is_one_line_with_or_without_the_markup_a_model_adds(self):
+        reason = self.bp.pass_reason
+        self.assertEqual(reason("[[PASS]] no spec in scope"), "no spec in scope")
+        self.assertEqual(reason("`[[PASS]] no spec in scope`"), "no spec in scope")
+        self.assertEqual(reason("**[[PASS]]** — no spec in scope\n"), "no spec in scope")
+        self.assertEqual(reason("> [[PASS]] no spec"), "no spec")
+        self.assertEqual(reason("> `[[PASS]] no spec`"), "no spec")
+        self.assertEqual(reason("> **[[PASS]]** no spec"), "no spec")
+        self.assertEqual(reason("[[PASS]]"), "(no reason given)")
+        self.assertIsNone(reason("[[PASS]] partly outside\n\nFINDING: the gate at x.py:3 ..."))   # it answered
+        self.assertIsNone(reason("FINDING: [[PASS]] is parsed at x.py:3"))
+
+    def test_the_added_mark_follows_a_role_into_every_bucket(self):
+        line = self.bp.contribution_line({"a": ".", "b": "."}, {"a": "claude", "b": "claude"},
+                                         {"b": "copilot → claude (quota)"}, {"c": "(run failed)"}, {},
+                                         {"d": "off-topic"}, {"b": "w", "c": "w", "d": "w"})
+        self.assertEqual(line, "contributed: a (claude) · degraded: b (copilot → claude, added) · "
+                               "failed: c (added) · passed: d (added)")
 
     def test_a_plan_of_bench_roles_only_is_not_a_plan(self):
         qs, _, requested = self.bp.parse_plan(
@@ -341,7 +367,7 @@ class Run(unittest.TestCase):
                     "as-built-realist", "design-critic", "reliability-critic"
                 )
             return (
-                (0, "[[PASS]] outside my role")
+                (0, "`[[PASS]] outside my role`")       # the markup a model adds is not part of the marker
                 if "design-critic" in conv
                 else (0, "a finding")
             )

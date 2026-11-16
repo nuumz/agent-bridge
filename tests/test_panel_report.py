@@ -174,6 +174,46 @@ class Traces(unittest.TestCase):
         ask.assert_not_called()
         self.assertEqual(left, ["cross.json", "findings.json", "rc", "status.json"])
 
+    def saved_panel(self, d, status):
+        panel = Path(d) / "panel" / "p"
+        panel.mkdir(parents=True)
+        (panel / "plan.json").write_text(json.dumps({"questions": [{"question": "q"}]}))
+        (panel / "findings.json").write_text(json.dumps({"a": "answer a", "b": "answer b"}))
+        (panel / "status.json").write_text(json.dumps(status))
+        return panel
+
+    def synth(self, bp, d, leader_reply):
+        o = argparse.Namespace(name="p", leader="claude", peers="claude", dir=d, add_dir=[], timeout=420,
+                               allow_single=False)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(bp, "PANELS", Path(d) / "panel"), mock.patch.object(bp, "close_panel_topics"), \
+                mock.patch.object(bp, "ask", return_value=leader_reply), redirect_stdout(out), redirect_stderr(err):
+            rc = bp.synth(o)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_a_failed_re_synthesis_keeps_the_earlier_report(self):
+        bp = _load()
+        with tempfile.TemporaryDirectory() as d:
+            panel = self.saved_panel(d, {"answered": {"a": "claude", "b": "copilot"}, "dir": d})
+            (panel / "report.md").write_text("the earlier report\n")
+            rc, _, err = self.synth(bp, d, (1, "(run failed rc=1) boom"))
+            self.assertEqual((rc, (panel / "report.md").read_text()), (4, "the earlier report\n"))
+        self.assertIn("synthesis failed", err)
+
+    def test_a_re_synthesised_report_names_who_was_added_who_passed_and_the_missing_cross_model_view(self):
+        bp = _load()
+        with tempfile.TemporaryDirectory() as d:
+            panel = self.saved_panel(d, {"answered": {"a": "claude", "b": "claude"}, "dir": d,
+                                         "requested": {"b": "nobody checks the contract"},
+                                         "passed": {"c": "no spec in scope"}})
+            rc, _, _ = self.synth(bp, d, (0, "synthesis"))
+            report = (panel / "report.md").read_text()
+        self.assertEqual(rc, 0)
+        self.assertIn("> Roles the leader added (not in -r):\n> - b (claude): nobody checks the contract", report)
+        self.assertIn("> Roles that passed (declined their question — not evidence):\n"
+                      "> - c: no spec in scope", report)
+        self.assertIn("**No cross-model view** — every answering role ran on claude", report)
+
     def test_fix_rechecks_the_patch_in_the_runs_workspace(self):
         bp = _load()
         imp = bp.load_roles()["implementer"]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """bridge-panel — role-based panel of peer agents with a leader that frames and synthesises.
 
-    bridge-panel run <name> -p claude,cursor [-r role,role] [-d DIR] [-t SEC] [--leader claude] [--no-cross]
+    bridge-panel run <name> -p claude,cursor [-r role[=peer],…] [-d DIR] [-t SEC] [--leader claude] [--no-cross]
                      [--parallel N] "<problem>"
     bridge-panel roles                 list the roles in ~/.agent-bridge/roles
     bridge-panel show <name>           print ~/.agent-bridge/state/panel/<name>/report.md
@@ -243,7 +243,8 @@ def parse_plan(text: str, roles: list[str], problem: str,
         try:
             plan = json.loads(m.group(1))
             qs, requested = [], {}
-            for q in plan.get("questions", []):     # the leader's reply is model output: skip what is malformed
+            listed = plan.get("questions")
+            for q in listed if isinstance(listed, list) else []:   # model output: skip what is malformed
                 r = q.get("role") if isinstance(q, dict) else None
                 if not isinstance(r, str) or not q.get("question") or r in {x["role"] for x in qs}:
                     continue
@@ -285,7 +286,7 @@ def worker_prompt(name: str, role: dict, q: dict, problem: str, hypothesis: str,
             f"Your question: {q['question']}\nWhy it matters: {q.get('why', '')}\n\n"
             "Other roles are answering other questions in parallel; you will see their answers in the next round. "
             "Answer yours from the files, not from what you expect them to say. If the question is outside what your "
-            f"role can answer from the material given, reply with only `{PASS} <one-line reason>` instead of "
+            f"role can answer from the material given, reply with one line only: {PASS} <reason> — instead of "
             "padding an answer — a pass is recorded, a padded answer misleads.\n\n"
             "Reply in the body with these sections: FINDING · EVIDENCE (file:line per claim) · CONFIDENCE (high/medium/low "
             "with the reason) · ROOT-CAUSE HYPOTHESIS (or N/A) · QUESTION FOR <role>: <text> (optional, only when another "
@@ -484,7 +485,7 @@ def run(o) -> int:
     with ThreadPoolExecutor(max_workers=o.parallel) as ex:
         results = list(ex.map(work, plan))
     failed = {r: t for r, rc, t in results if rc not in (0, 5)}
-    passed = {r: t.strip()[len(PASS):].strip() for r, rc, t in results if rc == 0 and t.strip().startswith(PASS)}
+    passed = {r: why for r, rc, t in results if rc == 0 and (why := pass_reason(t)) is not None}
     for r in passed:                   # a pass declines the question: not evidence, not `answered`
         used.pop(r, None)
         print(f"[panel] {r} passed — {passed[r][:160]}", file=sys.stderr)
@@ -492,7 +493,7 @@ def run(o) -> int:
     needs_input = {r: t for r, rc, t in results if rc == 5}
     for r in failed:
         print(f"[panel] {r} FAILED — excluded from the shared record: {failed[r][:160]}", file=sys.stderr)
-    (out / "findings.json").write_text(json.dumps(findings, ensure_ascii=False, indent=2))
+    # status.json first: findings.json without the status beside it would let synth re-run in the wrong dir and roots
     (out / "status.json").write_text(json.dumps({"answered": used, "fallbacks": fallbacks, "failed": failed,
                                                  "asked_back": list(needs_input), "passed": passed,
                                                  "requested": requested,
@@ -502,6 +503,7 @@ def run(o) -> int:
                                                  "problem": o.problem, "dir": str(Path(o.dir).resolve()),
                                                  "add_dir": o.add_dir, "kind": kind},
                                                 ensure_ascii=False, indent=2))
+    (out / "findings.json").write_text(json.dumps(findings, ensure_ascii=False, indent=2))
     need = 1 if o.allow_single else 2
     if len(findings) < need:
         # A "panel" of one voice (or none) reads like a panel and misleads — 5 such reports shipped before 2026-09-26.
@@ -582,16 +584,7 @@ def run(o) -> int:
     head += f"> **Voices** — {contrib}\n\n"
     if fallbacks or failed or needs_input or passed:
         print(f"[panel] DEGRADED — {contrib}", file=sys.stderr)
-    if requested:
-        head += ("> Roles the leader added (not in -r):\n"
-                 + "".join(f"> - {r} ({used.get(r, assigned[r])}): {w}\n" for r, w in requested.items()) + "\n")
-    if passed:
-        head += ("> Roles that passed (declined their question — not evidence):\n"
-                 + "".join(f"> - {r}: {t[:200]}\n" for r, t in passed.items()) + "\n")
-    if all(used.get(r) == leader_peer for r in findings):
-        head += (f"> **No cross-model view** — every answering role ran on {leader_peer}, the leader's own peer: "
-                 "agreement between them is one model family agreeing with itself.\n\n")
-        print(f"[panel] WARNING no cross-model view — every answering role ran on {leader_peer}", file=sys.stderr)
+    head += role_blocks(findings, {**assigned, **used}, requested, passed, leader_peer)
     if any(r in findings for r in fallbacks):
         head += ("> Roles answered by their fallback peer (the role's own peer failed):\n"
                  + "".join(f"> - {r}: {t}\n" for r, t in fallbacks.items() if r in findings) + "\n")
@@ -626,24 +619,60 @@ def run(o) -> int:
     return 0
 
 
+def pass_reason(text: str) -> str | None:
+    """The reason of a `[[PASS]]` reply, else None. A pass is one line, so a reply that goes on to answer is an answer;
+    markup a model wraps the marker in (backticks, bold, a quote) is not part of it."""
+    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+    if len(lines) != 1:
+        return None
+    line = lines[0].strip(" \t`*_>")
+    if not line.startswith(PASS):
+        return None
+    return line[len(PASS):].strip(" `*_—-:") or "(no reason given)"
+
+
+def role_blocks(findings: dict, peer_of: dict, requested: dict, passed: dict, leader_peer: str, *,
+                warn: bool = True) -> str:
+    """The report-head blocks `run` and `synth` share: roles the leader added, roles that passed, and the warning when
+    every answering role ran on the leader's own peer."""
+    head = ""
+    if requested:
+        head += ("> Roles the leader added (not in -r):\n"
+                 + "".join(f"> - {r} ({peer_of.get(r, '?')}): {w}\n" for r, w in requested.items()) + "\n")
+    if passed:
+        head += ("> Roles that passed (declined their question — not evidence):\n"
+                 + "".join(f"> - {r}: {t[:200]}\n" for r, t in passed.items()) + "\n")
+    if findings and all(peer_of.get(r) == leader_peer for r in findings):
+        head += (f"> **No cross-model view** — every answering role ran on {leader_peer}, the leader's own peer: "
+                 "agreement between them is one model family agreeing with itself.\n\n")
+        if warn:
+            print(f"[panel] WARNING no cross-model view — every answering role ran on {leader_peer}", file=sys.stderr)
+    return head
+
+
 def contribution_line(findings: dict, used: dict, fallbacks: dict, failed: dict, needs_input: dict,
                       passed: dict | None = None, requested: dict | None = None) -> str:
     """One line a reader checks before trusting a report: who really answered, who answered through a fallback peer,
     who failed, who passed, who asked back, and which roles the leader added. A panel of one real voice and two
     fallbacks must not read like three."""
     passed, requested = passed or {}, requested or {}
+
+    def added(r: str) -> str:
+        return " (added)" if r in requested else ""
+
     real = [f"{r} ({used.get(r, '?')}{', added' if r in requested else ''})" for r in findings
             if r not in fallbacks and r not in needs_input]
     parts = [f"contributed: {', '.join(real) or 'none'}"]
     degraded = {r: t for r, t in fallbacks.items() if r in findings and r not in needs_input}   # fallback that answered
     if degraded:
-        parts.append("degraded: " + ", ".join(f"{r} ({t.split(' (')[0]})" for r, t in degraded.items()))
+        parts.append("degraded: " + ", ".join(f"{r} ({t.split(' (')[0]}{', added' if r in requested else ''})"
+                                              for r, t in degraded.items()))
     if failed:
-        parts.append("failed: " + ", ".join(failed))
+        parts.append("failed: " + ", ".join(r + added(r) for r in failed))
     if passed:
-        parts.append("passed: " + ", ".join(passed))
+        parts.append("passed: " + ", ".join(r + added(r) for r in passed))
     if needs_input:
-        parts.append("asked back: " + ", ".join(needs_input))
+        parts.append("asked back: " + ", ".join(r + added(r) for r in needs_input))
     return " · ".join(parts)
 
 
@@ -827,9 +856,14 @@ def synth(o) -> int:
     low = low_evidence(cites, list(findings))
     print(f"[panel] re-synthesising `{o.name}` from {len(findings)} saved findings …", file=sys.stderr)
     rc, report = ask(o.leader, f"panel-{o.name}-leader", synth_prompt(o.name, problem, findings, cross, cite_md, low), o)
+    if rc not in (0, 5):                  # as in run: an error is not a report, and the earlier report stays
+        print(f"[panel] ABORT — synthesis failed ({report[:200]}); report.md left as it was", file=sys.stderr)
+        return 4
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     head = (f"# Panel `{o.name}` — re-synthesised {stamp}\n\nLeader: {o.leader} · roles: {', '.join(findings)}\n\n"
             f"> **Voices** — {voices_from_status(findings, status)}\n\n"
+            + role_blocks(findings, status.get("answered", {}), status.get("requested", {}),
+                          status.get("passed", {}), o.leader, warn=False)
             + (f"> {low_evidence_line(low)}\n\n" if low else ""))
     (out / "report.md").write_text(head + report + ("\n\n" + cite_md if cite_md else "") + "\n")
     print(head + report)

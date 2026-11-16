@@ -95,6 +95,17 @@ class Roster(unittest.TestCase):
         self.assertEqual(peer, "copilot")
         self.assertIn("out of quota now, and neither its own peer nor its fallback can stand in", why)
 
+    def test_a_measured_rival_out_of_quota_is_no_rival(self):
+        rows = (marks("design-critic", "claude", 5, 10, 3) + marks("design-critic", "copilot", 10, 10, 3)
+                + marks("design-critic", "codex", 8, 10, 3))
+
+        def out(p):
+            return "monthly quota" if p == "copilot" else None
+
+        peer, why = self.pick("design-critic", ["claude", "copilot", "codex"], rows, out)
+        self.assertEqual(peer, "codex")                         # the best rival standing, not the blocked one
+        self.assertIn("measured: 8/10 kept over 3 panels vs claude 5/10", why)
+
     def test_the_gap_is_named_only_when_every_running_role_is_the_leaders_family(self):
         gap = self.plan.cross_model_gap
         self.assertIn("no worker role runs outside claude", gap([("a", "claude", ""), ("b", None, ""), ("c", "claude", "")]))
@@ -148,6 +159,10 @@ class Card(unittest.TestCase):
         self.assertIn("WARNING  no worker role runs outside claude", out)
         self.assertNotIn("Cross-model view", out)
         self.assertEqual(grill.open_field_todos(card), [])
+
+    def test_a_card_whose_leader_is_not_in_minus_p_prints_no_command(self):
+        out, _ = self.plan_card("design-decision", "copilot", "confirm", rc=3)   # reliability-critic runs on copilot
+        self.assertNotIn("bridge-panel run", out)
 
     def test_no_role_left_under_the_peers_allowed_prints_no_command(self):
         out, _ = self.plan_card("review-change", "codex", "routine", rc=3)    # no role's peer or fallback is codex
