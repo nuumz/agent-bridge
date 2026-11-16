@@ -218,7 +218,8 @@ def backfill() -> tuple[int, int]:
         ranked = classify(prob, books)
         out.append({"ts": ts, "type": "panel", "name": d.name, "kind": ranked[0][0] if ranked else "other",
                     "roles": roles, "answered": st.get("answered", {}), "fallbacks": list(st.get("fallbacks", {})),
-                    "failed": list(st.get("failed", {})), "rc": 0 if rep.is_file() else 4,
+                    "failed": list(st.get("failed", {})), "passed": list(st.get("passed", {})),
+                    "requested": list(st.get("requested", {})), "rc": 0 if rep.is_file() else 4,
                     "fix": (d / "patch.md").is_file(), "backfilled": True})
         _with_live(out[-1], known.get(("panel", d.name)))
     # rows of other types (work, fix, verdict, blocked, shape_miss) and bridge-live turns have no source on disk to

@@ -552,6 +552,10 @@ def mark(o) -> int:
     panel = next((r for r in reversed(rows) if r.get("type") == "panel" and r.get("name") == o.target), None)
     if panel:
         answered = panel.get("answered") or {}
+        if o.role and o.role in (panel.get("passed") or []):
+            print(f"bridge-plan: role {o.role!r} passed on panel {o.target!r} — a pass has no findings to mark",
+                  file=sys.stderr)
+            return 2
         if o.role and answered and o.role not in answered:
             print(f"bridge-plan: role {o.role!r} did not answer panel {o.target!r} (answered: {', '.join(answered)})",
                   file=sys.stderr)
@@ -768,7 +772,7 @@ def learn(o) -> int:
             peers[r.get("peer")] = peers.get(r.get("peer"), 0) + 1
         role_use: dict[str, list[int]] = {}
         for p in ps:
-            for role in set(p.get("roles", [])) | set(p.get("failed", [])):
+            for role in set(p.get("roles", [])) | set(p.get("failed", [])):   # a pass is the question, not the peer
                 role_use.setdefault(role, [0, 0])
                 role_use[role][1] += 1
                 if role in p.get("roles", []):

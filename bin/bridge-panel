@@ -52,6 +52,9 @@ ASK = ROOT / "bin" / "ask-agent"
 BOARD = ROOT / "bin" / "bridge-board"
 DEFAULT_ROLES = ["root-cause", "contract-checker", "design-critic", "spec-reader"]  # spec-reader settled 4 disputes by
                                                                                     # running the code (measured 2026-09-12)
+MAX_REQUESTED = 2    # bench roles the leader may add to one panel: each costs a first pass and a cross-examination
+NOT_ON_BENCH = ("leader", "implementer")   # the leader frames and synthesises; the implementer runs only under --fix
+PASS = "[[PASS]]"    # a worker's whole reply when its question is outside what its role can answer
 MAX_SHARE = 6000     # chars of one finding shown to another worker / the leader
 MAX_CASE = 14000     # chars of the shared case file
 MAX_FILE_LINES = 260  # lines quoted per file in the case file
@@ -216,23 +219,55 @@ def tree_delta(before: str, after: str) -> list[str]:
     return sorted(set(after.splitlines()) - set(before.splitlines()))
 
 
-def parse_plan(text: str, roles: list[str], problem: str) -> tuple[list[dict], str]:
+def bench(roles: dict, chosen: list[str], peers: list[str]) -> dict[str, str]:
+    """Roles the leader may add, each with the peer that would run it: its own when -p names it, else its fallback —
+    so a bench role never runs outside -p."""
+    out = {}
+    for name, role in roles.items():
+        if name in chosen or name in NOT_ON_BENCH:
+            continue
+        peer = next((p for p in (role.get("peer"), role.get("fallback_peer")) if p and p in peers), None)
+        if peer:
+            out[name] = peer
+    return out
+
+
+def parse_plan(text: str, roles: list[str], problem: str,
+               benched: dict[str, str] | None = None) -> tuple[list[dict], str, dict[str, str]]:
+    """The leader's questions for the chosen roles, plus up to MAX_REQUESTED bench roles it asked for (role → why);
+    one question per role. An unparsable plan asks every chosen role the full problem and adds no bench role."""
+    benched = benched or {}
     m = re.search(r"```json\s*(\{.*?\})\s*```", text, re.S)
     if m:
         try:
             plan = json.loads(m.group(1))
-            qs = [q for q in plan.get("questions", []) if q.get("role") in roles and q.get("question")]
-            if qs:
-                return qs, plan.get("hypothesis", "")
-        except json.JSONDecodeError:
+            qs, requested = [], {}
+            for q in plan.get("questions", []):     # the leader's reply is model output: skip what is malformed
+                r = q.get("role") if isinstance(q, dict) else None
+                if not isinstance(r, str) or not q.get("question") or r in {x["role"] for x in qs}:
+                    continue
+                if r in roles:
+                    qs.append(q)
+                elif r in benched and len(requested) < MAX_REQUESTED:
+                    qs.append(q)
+                    requested[r] = str(q.get("why") or "")
+            if any(q["role"] in roles for q in qs):  # a bench role is added to the chosen ones, never instead of them
+                return qs, plan.get("hypothesis", ""), requested
+        except (json.JSONDecodeError, AttributeError):
             pass
-    return [{"role": r, "question": problem, "why": "leader plan unparsable — full problem"} for r in roles], ""
+    return [{"role": r, "question": problem, "why": "leader plan unparsable — full problem"} for r in roles], "", {}
 
 
-def frame_prompt(name: str, problem: str, roles: dict, chosen: list[str], leader: dict) -> str:
-    menu = "\n".join(f"- {r}: {roles[r]['summary']} (peer: {roles[r].get('peer')})" for r in chosen)
+def frame_prompt(name: str, problem: str, roles: dict, chosen: list[str], leader: dict,
+                 benched: dict[str, str] | None = None, assigned: dict[str, str] | None = None) -> str:
+    assigned = assigned or {}
+    menu = "\n".join(f"- {r}: {roles[r]['summary']} (peer: {assigned.get(r) or roles[r].get('peer')})" for r in chosen)
+    extra = ("\n\nRoles you may add (at most " + str(MAX_REQUESTED) + "), only when the problem needs an angle the "
+             "roles above cannot cover — give an added role a question in the same list, and say in `why` what it "
+             "covers that the others cannot:\n"
+             + "\n".join(f"- {r}: {roles[r]['summary']} (peer: {p})" for r, p in benched.items())) if benched else ""
     return (f"{leader['prompt']}\n\nPanel `{name}`. Problem from the user:\n\n{problem}\n\n"
-            f"Available roles:\n{menu}\n\n"
+            f"Available roles:\n{menu}{extra}\n\n"
             "Write ONE fenced ```json block: {\"hypothesis\": \"<your best first guess of the root cause, one sentence>\", "
             "\"questions\": [{\"role\": \"<role>\", \"question\": \"<one specific question that role must answer, naming the "
             "files/values to look at and what evidence would settle it>\", \"why\": \"<what this answer decides>\"}]}. "
@@ -248,7 +283,9 @@ def worker_prompt(name: str, role: dict, q: dict, problem: str, hypothesis: str,
             f"{case}\n\n{hyp}"
             f"Your question: {q['question']}\nWhy it matters: {q.get('why', '')}\n\n"
             "Other roles are answering other questions in parallel; you will see their answers in the next round. "
-            "Answer yours from the files, not from what you expect them to say.\n\n"
+            "Answer yours from the files, not from what you expect them to say. If the question is outside what your "
+            f"role can answer from the material given, reply with only `{PASS} <one-line reason>` instead of "
+            "padding an answer — a pass is recorded, a padded answer misleads.\n\n"
             "Reply in the body with these sections: FINDING · EVIDENCE (file:line per claim) · CONFIDENCE (high/medium/low "
             "with the reason) · ROOT-CAUSE HYPOTHESIS (or N/A) · QUESTION FOR <role>: <text> (optional, only when another "
             "panel role must answer something before you can be sure). Do not narrate. " + PEER_TALK_RULE + " "
@@ -353,6 +390,7 @@ def run(o) -> int:
               file=sys.stderr)
         return 2
     leader_peer = o.leader or leader.get("peer", "claude")
+    named = list(chosen)               # every role in -r: a skipped one is the user's to opt into, not the bench's
     skipped = [r for r in chosen if (assigned.get(r) or roles[r].get("peer")) not in peers]
     chosen = [r for r in chosen if r not in skipped]
     if leader_peer not in peers or not chosen:
@@ -363,7 +401,8 @@ def run(o) -> int:
         again = [f"{r}={roles[r]['fallback_peer']}" for r in skipped if roles[r].get("fallback_peer") in peers]
         if again:
             print(f"[panel] to run them on their fallback peer, name it: -r {','.join(again)}", file=sys.stderr)
-    if o.parallel is None:
+    parallel_default = o.parallel is None
+    if parallel_default:
         o.parallel = max(1, min(6, len(chosen)))
 
     agreement = ""
@@ -403,11 +442,19 @@ def run(o) -> int:
         print(f"[panel] shared case file: {', '.join(case_files)} ({len(case)} chars)", file=sys.stderr)
 
     print(f"[panel] framing with {leader_peer} …", file=sys.stderr)
+    benched = bench(roles, named, peers)
     rc, framed = ask(leader_peer, f"panel-{o.name}-leader",
-                     frame_prompt(o.name, o.problem, roles, chosen, leader) + (f"\n\n{case}" if case else ""), o)
-    plan, hypothesis = parse_plan(framed, chosen, o.problem)
-    (out / "plan.json").write_text(json.dumps({"hypothesis": hypothesis, "questions": plan, "raw": framed},
-                                              ensure_ascii=False, indent=2))
+                     frame_prompt(o.name, o.problem, roles, chosen, leader, benched, assigned)
+                     + (f"\n\n{case}" if case else ""), o)
+    plan, hypothesis, requested = parse_plan(framed, chosen, o.problem, benched)
+    for r in requested:                # the bench peer is an assignment: it is in -p by construction
+        assigned[r] = benched[r]
+        print(f"[panel] leader added {r} ({benched[r]}): {requested[r][:160]}", file=sys.stderr)
+    if parallel_default:
+        o.parallel = max(1, min(6, len(plan)))
+    ran = list(dict.fromkeys(chosen + list(requested)))
+    (out / "plan.json").write_text(json.dumps({"hypothesis": hypothesis, "questions": plan, "requested": requested,
+                                               "raw": framed}, ensure_ascii=False, indent=2))
     post(topic, "Plan:\n" + "\n".join(f"- {q['role']}: {q['question']}" for q in plan))
 
     used: dict[str, str] = {}          # role → peer that actually answered (fallback may differ from the role's peer)
@@ -430,14 +477,19 @@ def run(o) -> int:
     with ThreadPoolExecutor(max_workers=o.parallel) as ex:
         results = list(ex.map(work, plan))
     failed = {r: t for r, rc, t in results if rc not in (0, 5)}
-    findings = {r: t for r, rc, t in results if r not in failed}     # a crashed run is not evidence — never synthesise it
+    passed = {r: t.strip()[len(PASS):].strip() for r, rc, t in results if rc == 0 and t.strip().startswith(PASS)}
+    for r in passed:                   # a pass declines the question: not evidence, not `answered`
+        used.pop(r, None)
+        print(f"[panel] {r} passed — {passed[r][:160]}", file=sys.stderr)
+    findings = {r: t for r, rc, t in results if r not in failed and r not in passed}   # never synthesise a crash
     needs_input = {r: t for r, rc, t in results if rc == 5}
     for r in failed:
         print(f"[panel] {r} FAILED — excluded from the shared record: {failed[r][:160]}", file=sys.stderr)
     (out / "findings.json").write_text(json.dumps(findings, ensure_ascii=False, indent=2))
     (out / "status.json").write_text(json.dumps({"answered": used, "fallbacks": fallbacks, "failed": failed,
-                                                 "asked_back": list(needs_input),
-                                                 "degraded": bool(fallbacks or failed or needs_input),
+                                                 "asked_back": list(needs_input), "passed": passed,
+                                                 "requested": requested,
+                                                 "degraded": bool(fallbacks or failed or needs_input or passed),
                                                  # what `bridge-plan learn --replay` needs once gc took the run logs,
                                                  # and what `synth` / `fix` re-run with
                                                  "problem": o.problem, "dir": str(Path(o.dir).resolve()),
@@ -448,13 +500,14 @@ def run(o) -> int:
         # A "panel" of one voice (or none) reads like a panel and misleads — 5 such reports shipped before 2026-09-26.
         msg = (f"only {len(findings)} role(s) answered ({', '.join(findings) or 'none'}); need {need} — no synthesis. "
                f"Failed: " + ("; ".join(f"{r}: {t[:160]}" for r, t in failed.items()) or "none") +
+               (f". Passed: {'; '.join(f'{r}: {t[:160]}' for r, t in passed.items())}" if passed else "") +
                (". Re-run when the peer is back (`ask-agent --list` shows quota marks), or pass --allow-single "
                 "to synthesise from one role." if not o.allow_single else ""))
         print(f"[panel] ABORT — {msg}", file=sys.stderr)
         post(topic, f"Panel `{o.name}` aborted — {msg}")
         (out / "report.md").unlink(missing_ok=True)      # a stale report from an earlier run must not pass as this one's
-        ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start)
-        close_panel_topics(o.name, chosen)
+        ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start, passed=passed, requested=requested)
+        close_panel_topics(o.name, ran)
         return 4
     roots = named_roots(o.problem, o.add_dir, o.dir)
     cites = first = verify_citations(o.dir, findings, roots)      # first: the pass before cross-examination
@@ -508,24 +561,30 @@ def run(o) -> int:
         print(f"[panel] ABORT — synthesis failed ({report[:200]}); findings/cross are saved — "
               f"`bridge-panel synth {o.name} -p {leader_peer}` re-runs just this step", file=sys.stderr)
         (out / "report.md").unlink(missing_ok=True)
-        ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start, cites, first)
+        ledger_row(o, kind, findings, used, fallbacks, failed, 4, t_start, cites, first, passed, requested)
         return 4
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     roles_line = ", ".join(f"{r} ({used[r]})" if used.get(r) and used[r] != roles[r]["peer"] else r for r in findings)
     head = (f"# Panel `{o.name}` — {stamp}\n\nLeader: {leader_peer} · roles: {roles_line} · "
             f"cross-examination: {'no' if o.no_cross else 'yes'} · first pass "
             f"{'saw' if o.hypothesis else 'blind to'} the leader's hypothesis · dir: {o.dir}\n\n")
-    contrib = contribution_line(findings, used, fallbacks, failed, needs_input)
+    contrib = contribution_line(findings, used, fallbacks, failed, needs_input, passed, requested)
     head += f"> **Voices** — {contrib}\n\n"
-    if fallbacks or failed or needs_input:
+    if fallbacks or failed or needs_input or passed:
         print(f"[panel] DEGRADED — {contrib}", file=sys.stderr)
+    if requested:
+        head += ("> Roles the leader added (not in -r):\n"
+                 + "".join(f"> - {r} ({used.get(r, assigned[r])}): {w}\n" for r, w in requested.items()) + "\n")
+    if passed:
+        head += ("> Roles that passed (declined their question — not evidence):\n"
+                 + "".join(f"> - {r}: {t[:200]}\n" for r, t in passed.items()) + "\n")
     if all(used.get(r) == leader_peer for r in findings):
         head += (f"> **No cross-model view** — every answering role ran on {leader_peer}, the leader's own peer: "
                  "agreement between them is one model family agreeing with itself.\n\n")
         print(f"[panel] WARNING no cross-model view — every answering role ran on {leader_peer}", file=sys.stderr)
-    if fallbacks:
+    if any(r in findings for r in fallbacks):
         head += ("> Roles answered by their fallback peer (the role's own peer failed):\n"
-                 + "".join(f"> - {r}: {t}\n" for r, t in fallbacks.items()) + "\n")
+                 + "".join(f"> - {r}: {t}\n" for r, t in fallbacks.items() if r in findings) + "\n")
     if failed:
         head += ("> Roles whose run failed and were left out of the report:\n"
                  + "".join(f"> - {r}: {t[:200]}\n" for r, t in failed.items()) + "\n")
@@ -550,23 +609,29 @@ def run(o) -> int:
         print(f"[panel] {verdict.strip()}", file=sys.stderr)
         print(f"[panel] patch={out / 'patch.md'}", file=sys.stderr)
     post(topic, f"Report written: {out / 'report.md'}\n\n" + report[:3000])
-    ledger_row(o, kind, findings, used, fallbacks, failed, 0, t_start, cites, first)
-    close_panel_topics(o.name, chosen)
+    ledger_row(o, kind, findings, used, fallbacks, failed, 0, t_start, cites, first, passed, requested)
+    close_panel_topics(o.name, ran)
     print(head + report)
     print(f"\n[panel] report={out / 'report.md'} board={topic} threads=panel-{o.name}-*", file=sys.stderr)
     return 0
 
 
-def contribution_line(findings: dict, used: dict, fallbacks: dict, failed: dict, needs_input: dict) -> str:
+def contribution_line(findings: dict, used: dict, fallbacks: dict, failed: dict, needs_input: dict,
+                      passed: dict | None = None, requested: dict | None = None) -> str:
     """One line a reader checks before trusting a report: who really answered, who answered through a fallback peer,
-    who failed, who asked back. A panel of one real voice and two fallbacks must not read like three."""
-    real = [f"{r} ({used.get(r, '?')})" for r in findings if r not in fallbacks and r not in needs_input]
+    who failed, who passed, who asked back, and which roles the leader added. A panel of one real voice and two
+    fallbacks must not read like three."""
+    passed, requested = passed or {}, requested or {}
+    real = [f"{r} ({used.get(r, '?')}{', added' if r in requested else ''})" for r in findings
+            if r not in fallbacks and r not in needs_input]
     parts = [f"contributed: {', '.join(real) or 'none'}"]
-    degraded = {r: t for r, t in fallbacks.items() if r not in failed and r not in needs_input}   # fallback that answered
+    degraded = {r: t for r, t in fallbacks.items() if r in findings and r not in needs_input}   # fallback that answered
     if degraded:
         parts.append("degraded: " + ", ".join(f"{r} ({t.split(' (')[0]})" for r, t in degraded.items()))
     if failed:
         parts.append("failed: " + ", ".join(failed))
+    if passed:
+        parts.append("passed: " + ", ".join(passed))
     if needs_input:
         parts.append("asked back: " + ", ".join(needs_input))
     return " · ".join(parts)
@@ -575,14 +640,17 @@ def contribution_line(findings: dict, used: dict, fallbacks: dict, failed: dict,
 def voices_from_status(findings: dict, status: dict) -> str:
     """The Voices line for a report rebuilt by `synth`, from the status.json the run left behind."""
     return contribution_line(findings, status.get("answered", {}), status.get("fallbacks", {}), status.get("failed", {}),
-                             {r: "" for r in status.get("asked_back", [])})
+                             {r: "" for r in status.get("asked_back", [])}, status.get("passed", {}),
+                             status.get("requested", {}))
 
 
 def ledger_row(o, kind: str, findings: dict, used: dict, fallbacks: dict, failed: dict, rc: int, t_start: float,
-               cites: list[dict] | None = None, first: list[dict] | None = None) -> None:
+               cites: list[dict] | None = None, first: list[dict] | None = None, passed: dict | None = None,
+               requested: dict | None = None) -> None:
     try:
         ledger.record({"type": "panel", "name": o.name, "kind": kind, "peers": o.peers, "roles": list(findings),
                        "answered": used, "fallbacks": list(fallbacks), "failed": list(failed), "rc": rc,
+                       "passed": list(passed or {}), "requested": list(requested or {}),
                        "fix": bool(o.fix), "cross": not o.no_cross, "agreement": bool(o.agreement),
                        "citations": {r: list(cite_score(cites or [], r)) for r in findings},
                        # before cross-examination, where each role was handed its own misses to correct
@@ -751,7 +819,8 @@ def synth(o) -> int:
     (out / "report.md").write_text(head + report + ("\n\n" + cite_md if cite_md else "") + "\n")
     print(head + report)
     if rc in (0, 5):                      # the run's abort left its threads open for exactly this re-synthesis
-        close_panel_topics(o.name, list(findings))
+        close_panel_topics(o.name, list(dict.fromkeys([*findings, *status.get("passed", {}),
+                                                       *status.get("failed", {})])))
     return rc
 
 

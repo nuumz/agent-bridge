@@ -529,6 +529,19 @@ A bare `role` behaves as before — skipped when its own peer is not in `-p`, an
 was assigned, and a role whose run failed (its fallback too) is in `failed`, not `answered`. When every answering role ran on the leader's own peer the report opens with **No cross-model view**
 and the log carries `[panel] WARNING no cross-model view` — the run still exits 0.
 
+**Self-nomination** — the leader may add a role, and a worker may decline its question:
+- *Bench*: every role not in `-r` (except `leader` and `implementer`) whose own peer is in `-p`, else whose
+  `fallback_peer` is — that peer runs it. The framing prompt lists the bench; the leader adds a role by giving it a
+  question in the same `questions` list with a `why`. At most 2 bench roles per panel (each costs a first pass and a
+  cross-examination), one question per role; an unparsable plan adds none. An added role runs like any other
+  (`panel-<name>-<role>[-<peer>]`, fallback, cross, citations); `status.json` `requested` and the ledger row name it,
+  the report head lists it under *Roles the leader added*, and the Voices line marks it `added`.
+- *Pass*: a worker whose question is outside its role replies with only `[[PASS]] <reason>`. A pass is not a
+  finding: it is left out of `findings.json`, `answered`, the cross-examination and the citations, goes to
+  `status.json` `passed` and the ledger row, is named under *Roles that passed* and as `passed:` in Voices, makes the
+  run `degraded`, and counts as no answer for the two-role minimum (exit 4). `bridge-plan mark -r` refuses a role
+  that passed. A pass is not retried on the fallback peer.
+
 **What the panel shares and what it keeps apart** — a debate is only worth its independence:
 
 | | Content | Why |

@@ -58,6 +58,7 @@ report: ~/.agent-bridge/state/panel/<name>/report.md   (or "none")
 status: <status.json verbatim>
 [panel] lines from the log that start with WARNING, FAILED, ABORT, or "retrying on fallback" (verbatim)
 asked back: <role>: <its question verbatim>   (one line per asked_back role, or "none")
+added / passed: <status.json `requested` and `passed`, verbatim, or "none">
 mark: bridge-plan mark <name> -r <role> --kept N --rejected M   (one line per role in status.json `answered`;
       N and M stay as letters — the caller counts them after opening every cited file:line)
 
