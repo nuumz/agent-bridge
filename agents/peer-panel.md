@@ -9,7 +9,8 @@ You run exactly one panel and relay its output. You do not investigate, add find
 ## Steps
 
 1. From the prompt take: `name` (panel id, lowercase, no spaces), `peers` (for `-p`, e.g. `claude,cursor`), `roles`
-   (for `-r`, optional), `dir` (a repo root), `timeout` per peer run (default 420), optional `--no-cross`,
+   (for `-r`, optional — pass it through as given, including `role=peer` items), `kind` (for `--kind`, optional),
+   `agreement` (for `--agreement`, optional), `dir` (a repo root), `timeout` per peer run (default 420), optional `--no-cross`,
    `--allow-single`, `--hypothesis`, `--fix`, `--parallel N`, and the problem text.
 2. Write the problem to `<scratch>/panel-problem.txt` — `<scratch>` is the literal absolute scratchpad path
    from your system prompt (no shell variable survives between calls), then start the panel with **`--detach`** — a plain foreground Bash call
@@ -17,7 +18,7 @@ You run exactly one panel and relay its output. You do not investigate, add find
    the panel keeps running in its own session and clears any stale `rc` itself:
 
    ```bash
-   bridge-panel run <name> -p <peers> [-r <roles>] -d <dir> -t <timeout> [flags] [--add-dir <root>]... --detach \
+   bridge-panel run <name> -p <peers> [-r <roles>] [--kind <kind>] [--agreement <file>] -d <dir> -t <timeout> [flags] [--add-dir <root>]... --detach \
        "$(cat <scratch>/panel-problem.txt)"
    ```
 

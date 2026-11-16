@@ -495,7 +495,7 @@ a timed-out turn was abandoned at 15 s and the respawned peer still held the ear
 
 ## 9. Panel — role-based peers with a leader (`bridge-panel`)
 
-`bridge-panel run <name> -p <peers> [-r roles] [-d DIR] [-t SEC] [--leader claude] [--no-cross] [--parallel N] [--detach] "<problem>"`
+`bridge-panel run <name> -p <peers> [-r role[=peer],…] [-d DIR] [-t SEC] [--leader claude] [--no-cross] [--parallel N] [--detach] "<problem>"`
 (`--parallel` defaults to every worker role at once, cap 6 — the old cap of 3 made a 4-role panel serialise one role in each round, +1.5 min of 6.3 measured 2026-09-27; lower it only when a vendor rate-limits concurrent runs)
 runs the orchestrator-workers + evaluator pattern over the bridge (Anthropic, *Building effective agents*): the
 **leader** decomposes the problem into one question per role and says what evidence would settle each, the **workers** answer
@@ -520,6 +520,14 @@ Cursor and Copilot roles carry `fallback_peer: claude`: when the role's own peer
 is in `-p`, the same question runs once more on Claude (its default model; thread `panel-<name>-<role>-claude`) and the
 report header names the substitution. `implementer` has no fallback — a patch sketch from the same family as the
 critics is not worth a second run.
+
+**Assigning a role by name** — `-r role=peer` runs that role on `peer` instead of its own (the peer's default model);
+its thread is `panel-<name>-<role>-<peer>` for the first pass, the cross-examination and an ask-back alike. `-p` stays
+the egress gate: an assignment to a peer `-p` does not name, or a role named twice, is exit 2 before anything runs.
+A bare `role` behaves as before — skipped when its own peer is not in `-p`, and the skip line names the
+`-r role=<fallback>` form that would run it. `status.json` `answered` and the ledger record who answered, never who
+was assigned, and a role whose run failed (its fallback too) is in `failed`, not `answered`. When every answering role ran on the leader's own peer the report opens with **No cross-model view**
+and the log carries `[panel] WARNING no cross-model view` — the run still exits 0.
 
 **What the panel shares and what it keeps apart** — a debate is only worth its independence:
 
@@ -618,7 +626,15 @@ Board rows carry a peer family, no role, so they sit under `board`. Suggestions 
 (≥3 runs) or the role's `fallback_peer`: under half the citations resolving (≥3), two shape misses, asked back in
 more than half the runs; two or more access ask-backs suggest the grant instead — `--add-dir`, the diff or `git show`
 output inlined in the brief, or claude for a review pinned to a git ref (its read-only mode runs git). `bridge-plan "<request>"` prints one `scorecard` line when another peer ended rc=0 at least
-20 points more often on that kind over 3+ runs — a lead; `-p` stays the human's choice. Never the peer's own word:
+20 points more often on that kind over 3+ runs — a lead; `-p` stays the human's choice. For a panel it prints a
+**roster** — one `roster   <role> -> <peer> — <why>` line per role of the playbook's `panel_roles` — and the command
+carries it as `-r role=peer,…` with `--kind`: the role's own peer when `-p` names it, else its `fallback_peer` when
+`-p` names that, else the role is not run and the line says so (no role left → exit 3, no command). Another peer in `-p` takes a role only when both
+cells hold ≥5 marked findings (`verdict` rows) from ≥3 panels over the last 60 days and its kept rate is ≥0.10
+higher; a peer marked out of quota is passed over while another stands. When no role would run outside the leader's
+family the card prints a `WARNING` line; for `design-decision` the session card also gets an open
+`## Cross-model view` field, so the run refuses until the user writes `accepted` or plans again with another peer in
+`-p` (a card that already exists is not rewritten — `--force`). Never the peer's own word:
 tool calls and tokens say how much it did, citations and verdicts whether it was any good.
 **Replay** (`bridge-plan learn --replay [--base REV] [--days N]`): re-scores the citations of every answer whose log is
 still on disk, plus the panel dirs a verdict names, with `REV`'s `bin/bridgelib/evidence.py` (default HEAD) and the

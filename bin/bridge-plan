@@ -38,7 +38,7 @@ SUBAGENT = "agent-bridge:" if "/.claude/plugins/" in str(Path(__file__).resolve(
 from bridgelib import evidence, ledger  # noqa: E402
 from bridgelib import grill as grill_plan  # noqa: E402
 from bridgelib.core import (  # noqa: E402
-    ROOT, find_session_card, session_card_form_home, session_card_path,
+    ROOT, find_session_card, quota_block, session_card_form_home, session_card_path,
 )
 
 def doc_roots(rows: list[dict]) -> list[Path]:
@@ -85,7 +85,7 @@ def missing_inputs(book: dict, request: str) -> list[str]:
 
 
 def agreement_text(name: str, book: dict, request: str, peers: str, gaps: list[str],
-                   card: Path, level: str, grill: dict | None = None) -> str:
+                   card: Path, level: str, grill: dict | None = None, who: str = "", gap: str = "") -> str:
     """Session card body. negotiate keeps open fields (literal TODO); confirm is prefilled with none."""
     grill = grill or grill_plan.recommend(book, gaps, request, level)
     if level == "negotiate":
@@ -138,7 +138,7 @@ role argues the same question and returns the same shape.
 ## Participants
 - decides: {decides}
 - main agent: frames, verifies every file:line, writes the decision row; runs grilling when Grill plan says who=main-agent
-- peers ({peers}): {book.get('panel_roles') or book.get('peers')} — gather and argue, never decide
+- peers ({peers}): {who or book.get('panel_roles') or book.get('peers')} — gather and argue, never decide
 - data leaving the machine: the prompt and every file read go to the vendor of each peer ({peers})
 
 ## Inputs still missing from the request
@@ -150,7 +150,10 @@ role argues the same question and returns the same shape.
 {grill_plan.card_section(grill)}
 ## Out of scope
 {out_of_scope}
-"""
+""" + (f"""
+## Cross-model view
+TODO: {gap}. Replace this line with `accepted` to run without one, or plan again with another peer in -p (--force).
+""" if gap else "")
 
 
 
@@ -179,13 +182,26 @@ def plan(o) -> int:
     gplan = grill_plan.recommend(book, gaps, o.request, level)
     form = book.get("form", "direct")
     card = None
+    picks, roles, gap = [], "", ""
     if form == "panel" or (adjud and book.get("panel_roles")):
         form = "panel"
-        roles = book.get("panel_roles", "")
+        cutoff = time.time() - ROSTER_DAYS * 86400
+        picks = roster([r.strip() for r in book.get("panel_roles", "").split(",") if r.strip()],
+                       [p.strip() for p in peers.split(",") if p.strip()],
+                       [r for r in ledger.rows() if r.get("ts", 0) >= cutoff])
+        roles = ",".join(f"{r}={p}" for r, p, _ in picks if p)
+        gap = cross_model_gap(picks)
         card = session_card_path("panel", name)
-        cmd = (f"bridge-panel run {name} -p {peers} -r {roles} -d {o.dir} -t 420"
+        if not roles:
+            for role, _, why in picks:
+                print(f"  roster   {role} -> (not run) — {why}")
+            print(f"bridge-plan: no role of playbook {kind} can run on -p {peers} — name another peer with -p",
+                  file=sys.stderr)
+            return 3
+        cmd = (f"bridge-panel run {name} -p {peers} -r {roles} -d {o.dir} -t 420 --kind {kind}"
                + (f" --agreement {card}" if level != "routine" else "") + ' "<problem>"')
-        via = f'Agent(subagent_type="{SUBAGENT}peer-panel", prompt="name={name} peers={peers} roles={roles} dir={o.dir} — <problem>")'
+        via = (f'Agent(subagent_type="{SUBAGENT}peer-panel", prompt="name={name} peers={peers} roles={roles} '
+               f'kind={kind}' + (f" agreement={card}" if level != "routine" else "") + f' dir={o.dir} — <problem>")')
     elif form == "fix-flow":
         card = session_card_path("fix-flow", name)
         cmd = (f"bridge-fix run {name} -d {o.dir} -p {peers} "
@@ -209,6 +225,10 @@ def plan(o) -> int:
         "negotiate": "fill the session card first; the run refuses while a TODO remains"}[level])
     print(f"who        {form}: {book.get('panel_roles') if form == 'panel' or adjud else book.get('peers')} on {peers}"
           f"{'  (data leaves the machine — cursor)' if 'cursor' in peers else ''}")
+    for role, peer, why in picks:
+        print(f"  roster   {role} -> {peer or '(not run)'} — {why}")
+    if gap:
+        print(f"  WARNING  {gap}")
     if book.get("alt_peers") and not o.peers:
         print(f"alt peers  {book['alt_peers']}  (opt in with -p; each named peer receives the repo content)")
     hint = scorecard_hint(kind, peers.split(",")[0])
@@ -228,14 +248,20 @@ def plan(o) -> int:
         card.parent.mkdir(parents=True, exist_ok=True)
         if card.exists() and not o.force:
             print(f"agreement  {card} (exists — not overwritten; --force to redo)")
+            if gap and kind == "design-decision" and "## Cross-model view" not in card.read_text():
+                print("  WARNING  that card was written for another roster and has no Cross-model view field "
+                      "— --force")
             on_disk = grill_plan.parse_card(card.read_text())
             if on_disk:
                 gplan = on_disk
         else:
-            card.write_text(agreement_text(name, book, o.request, peers, gaps, card, level, gplan))
+            card.write_text(agreement_text(name, book, o.request, peers, gaps, card, level, gplan, roles,
+                                           gap if kind == "design-decision" else ""))
             suffix = ("  ← fill every TODO, then `bridge-plan agree " + name + "`" if level == "negotiate"
                       else "  (prefilled; edit if the plan above is wrong)")
             print(f"agreement  {card}{suffix}")
+            if gap and kind == "design-decision":
+                print("  open     ## Cross-model view — the run refuses until it reads `accepted`")
     elif level != "routine":
         print("agreement  (none — form:direct never writes a session card; depth is informational only)")
     print(grill_plan.print_line(gplan))
@@ -298,14 +324,85 @@ def family(identity: str | None) -> str:
     return re.split(r"[#@:]", identity or "")[0] or "?"
 
 
-def role_fallbacks() -> dict[str, str]:
-    """role → fallback_peer from roles/*.md frontmatter (what a suggestion can point at)."""
+def role_peers() -> dict[str, tuple[str | None, str | None]]:
+    """role → (peer, fallback_peer) from roles/*.md frontmatter."""
     out = {}
     for f in sorted((ledger.ROOT / "roles").glob("*.md")):
-        m = re.search(r"^fallback_peer:\s*(\S+)", f.read_text(), re.M)
-        if m:
-            out[f.stem] = m.group(1)
+        head = f.read_text().split("\n---", 1)[0]
+        own, fb = (re.search(rf"^{key}:\s*(\S+)", head, re.M) for key in ("peer", "fallback_peer"))
+        out[f.stem] = (own.group(1) if own else None, fb.group(1) if fb else None)
     return out
+
+
+def role_fallbacks() -> dict[str, str]:
+    """role → fallback_peer (what a suggestion can point at)."""
+    return {role: fb for role, (_, fb) in role_peers().items() if fb}
+
+
+# A roster is measured over a longer window than a hint: marks are sparse (25 marked panels in 60 days, 2026-11-16).
+ROSTER_DAYS = 60
+# What a (role, peer) cell needs before its kept rate may move a role (user ruling 2026-11-16: 5 marked findings; the
+# 3 distinct panels keep one heavily marked panel from deciding it — peer review: panel roster-design, 2026-11-16).
+ROSTER_MIN_FINDINGS, ROSTER_MIN_PANELS, ROSTER_MARGIN = 5, 3, 0.10
+
+
+def roster(role_names: list[str], allowed: list[str], rows: list[dict],
+           blocked=None) -> list[tuple[str, str | None, str]]:
+    """Who runs each panel role among the peers `-p` allows: (role, peer or None when dropped, why).
+
+    The role's own peer when allowed, else its fallback when allowed, else the role is dropped. Another allowed peer
+    takes the role only on evidence — both cells hold ROSTER_MIN_FINDINGS marked findings from ROSTER_MIN_PANELS
+    panels and its kept rate is ROSTER_MARGIN above. A peer marked out of quota is passed over while another stands."""
+    sc = scorecard([r for r in rows if r.get("type") == "verdict"])
+    meta = role_peers()
+    blocked = blocked or quota_block
+
+    def measured(role: str, peer: str) -> dict | None:
+        c = sc.get((role, peer))
+        return c if c and c["verdicts"] >= ROSTER_MIN_FINDINGS and len(c["panels"]) >= ROSTER_MIN_PANELS else None
+
+    def kept(c: dict) -> str:
+        return f"{c['kept']}/{c['verdicts']} kept over {len(c['panels'])} panels"
+
+    out = []
+    for role in role_names:
+        own, fb = meta.get(role, (None, None))
+        base = own if own in allowed else fb if fb in allowed else None
+        if base is None:
+            out.append((role, None, f"dropped — its peer {own}" + (f" and fallback {fb} are" if fb else " is")
+                        + f" not in -p; name one with -r {role}=<peer> to run it there"))
+            continue
+        pick, why = base, "its own peer" if base == own else f"its fallback — {own} is not in -p"
+        mine = measured(role, base)
+        rivals = [(p, c) for p in allowed if p != base and (c := measured(role, p))]
+        best = max(rivals, key=lambda x: _rate(x[1], "kept", "verdicts"), default=None)
+        if mine and best and clears_margin(best[1], mine):
+            pick, why = best[0], f"measured: {kept(best[1])} vs {base} {kept(mine)}"
+        elif mine:
+            why += f" ({kept(mine)})"
+        else:
+            why += " (not enough marked findings to compare)"
+        if blocked(pick):
+            alt = next((p for p in (base, fb) if p in allowed and p != pick and not blocked(p)), None)
+            pick, why = ((alt, f"{pick} is out of quota now") if alt
+                         else (pick, why + " — out of quota now, and neither its own peer nor its fallback can "
+                                             "stand in"))
+        out.append((role, pick, why))
+    return out
+
+
+def clears_margin(challenger: dict, holder: dict) -> bool:
+    """kept/total of the challenger ≥ the holder's + ROSTER_MARGIN, in integers so the edge is exact."""
+    a, n, b, m = challenger["kept"], challenger["verdicts"], holder["kept"], holder["verdicts"]
+    return round(1 / ROSTER_MARGIN) * (a * m - b * n) >= n * m
+
+
+def cross_model_gap(picks: list[tuple[str, str | None, str]], leader: str = "claude") -> str:
+    """The line a card carries when no worker role would run outside the leader's family — else ''."""
+    running = [p for _, p, _ in picks if p]
+    if not running or any(family(p) != leader for p in running):
+        return ""
+    return f"no worker role runs outside {leader} — agreement between them is one model family agreeing with itself"
 
 
 # An ask-back that asks for access — a path outside the run's roots, a shell or an MCP its mode denies — is a gap in the
@@ -324,7 +421,7 @@ def scorecard(rows: list[dict]) -> dict[tuple[str, str], dict]:
     def cell(key):
         return sc.setdefault(key, {"runs": 0, "ok": 0, "asked_back": 0, "asked_access": 0, "cost": [], "tools": [],
                                    "cites_ok": 0, "cites_total": 0, "shape_miss": 0, "blocked": 0, "declined": 0,
-                                   "kept": 0, "verdicts": 0})
+                                   "kept": 0, "verdicts": 0, "panels": set()})
     misses: dict[tuple[str, str, int], set] = {}
     for r in rows:
         t = r.get("type")
@@ -351,6 +448,8 @@ def scorecard(rows: list[dict]) -> dict[tuple[str, str], dict]:
             c = cell((r.get("role") or r.get("kind") or "verdict", r.get("peer") or "?"))
             c["kept"] += r.get("kept", 0)
             c["verdicts"] += r.get("kept", 0) + r.get("rejected", 0)
+            if r.get("panel"):                   # how many panels the rate rests on: one marked panel is one sample
+                c["panels"].add(r["panel"])
     for (fam, _, _), bodies in misses.items():
         if len(bodies) >= 2:
             cell(("board", fam))["declined"] += 1

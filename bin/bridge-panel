@@ -40,6 +40,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridgelib import grill as grill_plan, ledger  # noqa: E402
+from bridgelib.adapters import ADAPTERS  # noqa: E402
 from bridgelib.evidence import (RESOLVER_REV, cite_score, citation_table, low_evidence, named_roots,  # noqa: E402
                                 verify_citations)
 from bridgelib.core import (BOARD_PROTOCOL, PEER_TALK_RULE, ROOT, STATE, add_dirs_from_env, detach,  # noqa: E402
@@ -107,21 +108,46 @@ def run_error(stderr: str) -> str:
     return m.group(1).strip() if m else stderr.strip()[-300:]
 
 
-def ask_with_fallback(role: dict, conv: str, prompt: str, o, peers: list[str], used: dict[str, str],
-                      fallbacks: dict[str, str]) -> tuple[int, str]:
-    """Run on the role's peer; when that run fails (quota, crash) and the role names a `fallback_peer` the user allowed,
-    run once more there — on the fallback's default model, since `model` ids are peer-specific."""
-    primary = used.get(role["name"]) or role["peer"]
+def role_conv(panel: str, role: dict, peer: str) -> str:
+    """The thread of one role on the peer that runs it: the bare name on the role's own peer, `-<peer>` on any other —
+    one spelling for an assigned peer, a fallback, the cross-examination and an ask-back, so each resumes one thread."""
+    return f"panel-{panel}-{role['name']}" + ("" if peer == role["peer"] else f"-{peer}")
+
+
+def parse_roles(spec: str) -> tuple[list[str], dict[str, str]]:
+    """`-r role[=peer],…` → the roles in order, and the peer each `role=peer` assigns in place of the role's own."""
+    chosen, assigned = [], {}
+    for item in spec.split(","):
+        role, _, peer = (x.strip() for x in item.partition("="))
+        if not role:
+            continue
+        if role in chosen:
+            raise ValueError(f"role {role!r} is named twice in -r")
+        chosen.append(role)
+        if peer:
+            assigned[role] = peer
+    return chosen, assigned
+
+
+def ask_with_fallback(role: dict, panel: str, prompt: str, o, peers: list[str], assigned: dict[str, str],
+                      used: dict[str, str], fallbacks: dict[str, str]) -> tuple[int, str]:
+    """Run on the peer `-r role=peer` assigned, else the role's own; when that run fails (quota, crash) and the role
+    names a `fallback_peer` the user allowed, run once more there — on the fallback's default model, since `model` ids
+    are peer-specific. `used` records who answered, never who was asked."""
+    primary = assigned.get(role["name"]) or role["peer"]
     model = role.get("model") if primary == role["peer"] else None
-    rc, text = ask(primary, conv, prompt, o, model or None, role.get("mode") or "ask", role_timeout(role))
+    rc, text = ask(primary, role_conv(panel, role, primary), prompt, o, model or None, role.get("mode") or "ask",
+                   role_timeout(role))
     fb = role.get("fallback_peer")
     if rc in (0, 5) or not fb or fb == primary or fb not in peers:
-        used[role["name"]] = primary
+        if rc in (0, 5):
+            used[role["name"]] = primary
         return rc, text
     reason = text[:160]
     print(f"[panel] {role['name']}: {primary} failed ({reason}) — retrying on fallback peer {fb}", file=sys.stderr)
-    rc, text = ask(fb, f"{conv}-{fb}", prompt, o, None, role.get("mode") or "ask", role_timeout(role))
-    used[role["name"]] = fb
+    rc, text = ask(fb, role_conv(panel, role, fb), prompt, o, None, role.get("mode") or "ask", role_timeout(role))
+    if rc in (0, 5):
+        used[role["name"]] = fb
     fallbacks[role["name"]] = f"{primary} → {fb} ({reason})"
     return rc, text
 
@@ -136,7 +162,7 @@ def close_panel_topics(name: str, roles: list[str]) -> None:
     if not BOARD.is_file():
         return
     threads = [f"panel:{name}", f"conv:panel-{name}-leader", f"conv:panel-{name}-implementer"]
-    threads += [f"conv:panel-{name}-{r}{tail}" for r in roles for tail in ("", "-claude")]
+    threads += [f"conv:panel-{name}-{r}{tail}" for r in roles for tail in ["", *(f"-{p}" for p in ADAPTERS)]]
     for t in threads:
         subprocess.run([str(BOARD), "close", t], capture_output=True, text=True)   # "not open" is fine
 
@@ -312,19 +338,31 @@ def run(o) -> int:
     roles = load_roles()
     leader = roles.get(o.leader_role)
     peers = [p.strip() for p in o.peers.split(",") if p.strip()]
-    chosen = [r.strip() for r in (o.roles or ",".join(DEFAULT_ROLES)).split(",") if r.strip()]
+    try:
+        chosen, assigned = parse_roles(o.roles or ",".join(DEFAULT_ROLES))
+    except ValueError as e:
+        print(f"bridge-panel: {e}", file=sys.stderr)
+        return 2
     missing = [r for r in chosen + [o.leader_role] if r not in roles]
     if missing:
         print(f"bridge-panel: unknown role(s) {missing}; see `bridge-panel roles`", file=sys.stderr)
         return 2
+    outside = [f"{r}={p}" for r, p in assigned.items() if p not in peers]
+    if outside:                                    # -p is the egress gate: an assignment never widens it
+        print(f"bridge-panel: -r assigns a peer that -p ({o.peers}) does not name: {', '.join(outside)}",
+              file=sys.stderr)
+        return 2
     leader_peer = o.leader or leader.get("peer", "claude")
-    skipped = [r for r in chosen if roles[r].get("peer") not in peers]
+    skipped = [r for r in chosen if (assigned.get(r) or roles[r].get("peer")) not in peers]
     chosen = [r for r in chosen if r not in skipped]
     if leader_peer not in peers or not chosen:
         print(f"bridge-panel: -p must name the leader peer ({leader_peer}) and at least one worker peer", file=sys.stderr)
         return 2
     if skipped:
         print(f"[panel] skipped roles whose peer is not in -p: {skipped}", file=sys.stderr)
+        again = [f"{r}={roles[r]['fallback_peer']}" for r in skipped if roles[r].get("fallback_peer") in peers]
+        if again:
+            print(f"[panel] to run them on their fallback peer, name it: -r {','.join(again)}", file=sys.stderr)
     if o.parallel is None:
         o.parallel = max(1, min(6, len(chosen)))
 
@@ -377,11 +415,11 @@ def run(o) -> int:
 
     def work(q):
         role = roles[q["role"]]
-        print(f"[panel] {q['role']} ({role.get('peer')}) …", file=sys.stderr)
+        print(f"[panel] {q['role']} ({assigned.get(q['role']) or role.get('peer')}) …", file=sys.stderr)
         before = tree_state(o.dir)
-        rc, text = ask_with_fallback(role, f"panel-{o.name}-{q['role']}",
+        rc, text = ask_with_fallback(role, o.name,
                                      worker_prompt(o.name, role, q, o.problem, hypothesis if o.hypothesis else "", case),
-                                     o, peers, used, fallbacks)
+                                     o, peers, assigned, used, fallbacks)
         delta = tree_delta(before, tree_state(o.dir))
         if delta:
             edited[q["role"]] = delta
@@ -438,9 +476,9 @@ def run(o) -> int:
             others = {k: v for k, v in findings.items() if k != r}
             before = tree_state(o.dir)
             peer = used.get(r, role["peer"])
-            conv = f"panel-{o.name}-{r}" + (f"-{peer}" if peer != role["peer"] else "")
-            rc, text = ask(peer, conv, cross_prompt(o.name, role, others, asked.get(r, []), cite_md, first),
-                           o, (role.get("model") if peer == role["peer"] else None) or None, role.get("mode") or "ask",
+            rc, text = ask(peer, role_conv(o.name, role, peer),
+                           cross_prompt(o.name, role, others, asked.get(r, []), cite_md, first), o,
+                           (role.get("model") if peer == role["peer"] else None) or None, role.get("mode") or "ask",
                            role_timeout(role))
             if rc not in (0, 5):
                 print(f"[panel] cross-examination: {r} FAILED ({text[:160]}) — its first-pass finding stands unchallenged",
@@ -481,6 +519,10 @@ def run(o) -> int:
     head += f"> **Voices** — {contrib}\n\n"
     if fallbacks or failed or needs_input:
         print(f"[panel] DEGRADED — {contrib}", file=sys.stderr)
+    if all(used.get(r) == leader_peer for r in findings):
+        head += (f"> **No cross-model view** — every answering role ran on {leader_peer}, the leader's own peer: "
+                 "agreement between them is one model family agreeing with itself.\n\n")
+        print(f"[panel] WARNING no cross-model view — every answering role ran on {leader_peer}", file=sys.stderr)
     if fallbacks:
         head += ("> Roles answered by their fallback peer (the role's own peer failed):\n"
                  + "".join(f"> - {r}: {t}\n" for r, t in fallbacks.items()) + "\n")
@@ -492,7 +534,9 @@ def run(o) -> int:
                  "you did not ask for):\n" + "".join(f"> - {r}: {', '.join(d)}\n" for r, d in edited.items()) + "\n")
     if needs_input:
         head += "> Roles that asked back (exit 5) — answer in their thread and re-run:\n" + "".join(
-            f"> - {r}: `ask-agent {roles[r]['peer']} --conv panel-{o.name}-{r} \"<answer>\"`\n" for r in needs_input) + "\n"
+            f"> - {r}: `ask-agent {used.get(r, roles[r]['peer'])} "
+            f"--conv {role_conv(o.name, roles[r], used.get(r, roles[r]['peer']))} \"<answer>\"`\n"
+            for r in needs_input) + "\n"
     if low:
         head += f"> {low_evidence_line(low)}\n\n"
     (out / "report.md").write_text(head + report + ("\n\n" + cite_md if cite_md else "") + "\n")
@@ -718,7 +762,8 @@ def main() -> int:
     r.add_argument("name")
     r.add_argument("problem")
     r.add_argument("-p", "--peers", required=True, help="peers the user allows, e.g. claude,cursor (egress control)")
-    r.add_argument("-r", "--roles", help=f"worker roles (default: {','.join(DEFAULT_ROLES)})")
+    r.add_argument("-r", "--roles", help=f"worker roles, `role` or `role=peer` to run it on a peer in -p other than "
+                                         f"its own (default: {','.join(DEFAULT_ROLES)})")
     r.add_argument("-d", "--dir", default=os.getcwd())
     r.add_argument("--add-dir", action="append", default=[],
                    help="extra root every peer run may read, e.g. a spec repo the case cites (repeatable)")
