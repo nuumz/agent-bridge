@@ -196,6 +196,31 @@ Delegate when the peer adds something this session cannot cheaply produce:
 Do **not** delegate when: the answer needs ≤2 local tool calls; the peer would need the whole
 conversation restated to be useful; or the task is already in flight in another session.
 
+**Handing work to a live session** (a `SendMessage` to another interactive Claude Code session, user ruling
+2026-11-17). A session's name comes from its working directory, so it says nothing about its topic. Run
+`bridge-plan target "<request>" [--key QC-740 --key 740] -d <dir>` first. It reads the session registry
+(`~/.claude/sessions/*.json`), each transcript (the prompts it received and the closing line of its last reply) and
+the claims under `<dir>/pipeline/*.md` (`session:`, matched on the file name, `code`, `qcweb` and `jira`), and classes
+every live session except the caller and headless runs (`entrypoint: sdk-cli` — a bridged run that resumes a thread is
+not named `bridge ·`). A bare-number key (`740`) counts only as `#740` or a slash-command argument; pass the full
+ticket key too. A handoff message names its ticket or topic on its first line (a bare label line such as `Task from the
+user:` is skipped): that line is what makes the receiver the topic's owner; a key cited further down is an example, not
+ownership. It never sends anything itself.
+
+| Class | Meaning | Send? |
+|---|---|---|
+| `SAME` | the session owns a claim on a key, or its open task (the prompts since its last `Done`) names one or a claim's alias of it — anywhere in a prompt the user typed, in the first line of a relayed peer message | yes, even while busy (messages queue) |
+| `RELATED` | no key match; its open task shares two identifiers with the request and, when the request names a key, names no other ticket | yes, as concurrent work |
+| `FREE` | idle, nothing queued, nothing asked since its last `Done` (or it never had a task) | unrelated work only, and only in the same dir (a FREE line outside it says so); one that handled the key before goes first |
+| `OCCUPIED` | busy, or idle with an open task on another topic | never |
+
+A claim outranks a prompt: a session that only heard of the topic (a misrouted message) never beats the claim's owner.
+It prints one target with its evidence and exits 0, or prints `spawn fresh` (start a worker with `ask-agent` or
+`bridge-live start`) and exits 0, or `yourself` when the claim names the caller. It exits 3 and prints `ask user` when
+several sessions claim, match or relate to the topic, or when no live session owns a claim and a claim names a session
+that is not live. A transcript that is missing or unreadable makes the session `OCCUPIED`. `--json` returns the same
+data.
+
 **Data egress.** Every bridged call sends the prompt and the files the peer reads to that vendor's cloud.
 Which vendors may see which code is the machine owner's policy — keep it in your own rules (`CLAUDE.md`, the
 `agent-bridge` skill). A peer that policy has not cleared for the code at hand runs **only when the user asks for

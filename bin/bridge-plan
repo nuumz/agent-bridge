@@ -9,6 +9,9 @@
     bridge-plan learn --replay [--base REV] [--days N]               re-score the saved answers' citations: REV's
                                                                      resolver vs the working tree (writes nothing)
     bridge-plan mark <panel|run-log> [-r role] --kept N --rejected M  after verifying a peer's findings: what survived
+    bridge-plan target "<request>" [--key K]... [-d DIR] [--json]    before a SendMessage handoff: which live session
+                                                                     is on this topic (SAME / RELATED / FREE / OCCUPIED);
+                                                                     exit 0 = send, spawn fresh or yourself, 3 = ask
 
 Session depth (frontmatter `level:` of each playbook — not a third agreement level; edit the file to change a default):
     routine    run with the playbook defaults; no session card
@@ -35,7 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # Installed as a Claude Code plugin, the subagents in agents/ are namespaced `agent-bridge:peer-*`
 SUBAGENT = "agent-bridge:" if "/.claude/plugins/" in str(Path(__file__).resolve()) else ""
-from bridgelib import evidence, ledger  # noqa: E402
+from bridgelib import evidence, ledger, sessions  # noqa: E402
 from bridgelib import grill as grill_plan  # noqa: E402
 from bridgelib.core import (  # noqa: E402
     ROOT, find_session_card, quota_block, session_card_form_home, session_card_path,
@@ -908,10 +911,21 @@ def main() -> int:
     mk.add_argument("--kept", type=int, required=True, help="findings that held up when you opened the cited file:line")
     mk.add_argument("--rejected", type=int, required=True, help="findings that did not (wrong, stale, unreachable, unsupported)")
     mk.add_argument("--note", help="one line: why the rejected ones failed")
+    tg = sub.add_parser("target", help="before a SendMessage handoff: which live session should get this request")
+    tg.add_argument("request")
+    tg.add_argument("--key", action="append", default=[],
+                    help="a topic key (QC-740, 740, KESC-10249); ticket-shaped keys in the request count too")
+    tg.add_argument("-d", "--dir", default=os.getcwd(), help="the workspace the work is in (claims: DIR/pipeline/*.md)")
+    tg.add_argument("--self", dest="self_name", help="the caller's session name (default: found from the process tree)")
+    tg.add_argument("--json", action="store_true")
     argv = sys.argv[1:]
-    if argv and argv[0] not in ("plan", "kinds", "agree", "learn", "mark", "-h", "--help"):
+    if argv and argv[0] not in ("plan", "kinds", "agree", "learn", "mark", "target", "-h", "--help"):
         argv = ["plan", *argv]
     o = ap.parse_args(argv)
+    if o.cmd == "target":
+        res = sessions.target(o.request, o.key, o.dir, o.self_name)
+        print(json.dumps(res, ensure_ascii=False, indent=2) if o.json else sessions.render(res))
+        return 3 if res["recommend"]["action"] == "ask" else 0
     if o.cmd == "kinds":
         return kinds(o)
     if o.cmd == "agree":

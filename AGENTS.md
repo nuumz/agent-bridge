@@ -10,7 +10,8 @@ change checklist. This file is the short version.
   `core` (paths, constants, hop guard, quota), `adapters` (one class per peer CLI), `runner` (execute a peer run, threads,
   board registration), `ledger` (outcome ledger, playbook loader), `grill`, `evidence`, `workskills`, `protocol` (the
   message envelope of `docs/PROTOCOL.md`: export and schema check), `a2a` (the A2A transport behind `bridge-a2a`: the
-  mapping of an A2A task onto a board request, the server handler, the client). `bin/boardlib.py` is the SQLite board
+  mapping of an A2A task onto a board request, the server handler, the client), `sessions` (live Claude Code sessions
+  classed against a request for `bridge-plan target`; reads only). `bin/boardlib.py` is the SQLite board
   behind `bridge-board`.
 - `roles/`, `playbooks/`, `work-skills/` — markdown with a flat `key: value` frontmatter; loaded at run time, no code change
   needed to add one. `work-skills.local/` is git-ignored but loaded too, so a test that passes only because of a local
@@ -29,7 +30,7 @@ change checklist. This file is the short version.
 
 ## Working rules
 
-- Run `python3 -m unittest discover -s tests` before and after a change; every command must still answer `--help`.
+- Run `python3 -m unittest discover -s tests` before and after a change.
 - A behaviour change in `bin/bridgelib/` or in a pipeline gate (`bridge-work`, `bridge-fix`, `bridge-panel`) comes with a
   test that is red without it. Exercise failure paths through a stub peer binary, never a real CLI (cost, egress).
 - A change to an exit code, a rule, a prompt protocol string or a file layout updates `SHARED-RULES.md` in the same change.
@@ -38,6 +39,6 @@ change checklist. This file is the short version.
   `tests/test_protocol.py` holds them to the board and fails on drift.
 - Do not add a dependency, a build step, a daemon, or a second place for state. Extend the existing adapter / loader before
   adding a layer; see "Adding a peer adapter" in CONTRIBUTING.md for the contract.
-- Scripts stay LF and executable. Commits follow Conventional Commits and are never made without the maintainer asking.
+- Commits follow Conventional Commits and are never made without the maintainer asking.
 - Never run `bridge-sync` (other than `--help`, which exits before any write) or a real `ask-agent` call as part of a
   test: both write to the user's `~/.cursor`, `~/.copilot` and `~/.claude` configuration or send data to a vendor.

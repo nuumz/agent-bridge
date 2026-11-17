@@ -201,7 +201,7 @@ A client sees only its own topic, never chooses the directory, and gets `write` 
 | Command | Purpose |
 |---|---|
 | `ask-agent`, `ask-claude`, `ask-cursor`, `ask-copilot`, `ask-codex` | run one task on a peer; `--conv` threads, `-w` worktree, `--dry-run` |
-| `bridge-plan` | pick a playbook for a request, prepare its session card, learn from the outcome ledger |
+| `bridge-plan` | pick a playbook for a request, prepare its session card, learn from the outcome ledger; `target`: which live session a handoff goes to, by topic |
 | `bridge-panel` | role-based multi-peer review with a leader and cross-examination |
 | `bridge-work` | implement → verify → review → fix loop in an isolated worktree; the reviewer's `BRIDGE_VERDICT=APPROVE\|REVISE` line decides the loop |
 | `bridge-fix` | analyze → human decision → fix, as one resumable flow |
