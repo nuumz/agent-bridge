@@ -425,11 +425,13 @@ MSG_COLS = 'm.seq, m.author, m.kind, m.body, m.reply_to, m.created_at, m.address
 
 
 def read(conn: sqlite3.Connection, tid: int, reader: str, after_seq: int | None, limit: int = 50,
-         mine: bool = False, open_requests: bool = False, roles: list[str] | None = None) -> tuple[list, int]:
+         mine: bool = False, open_requests: bool = False, roles: list[str] | None = None,
+         peek: bool = False) -> tuple[list, int]:
     """Messages after `after_seq` (explicit wins; None = after the reader's unread cursor, or from the start for
     open_requests). A plain or `mine` read advances the cursor (what `mine` skips was never for the reader);
-    `open_requests` is a view and leaves it alone."""
-    filtered = open_requests
+    `open_requests` is a view and leaves it alone, and so does `peek` — a watcher (the menu-bar app showing a
+    topic the user is not part of) reads without marking anything read."""
+    filtered = open_requests or peek
     if after_seq is None:
         row = conn.execute("SELECT seq FROM cursors WHERE agent=? AND topic_id=?", (reader, tid)).fetchone()
         after_seq = 0 if open_requests else (row["seq"] if row else 0)

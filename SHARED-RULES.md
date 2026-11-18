@@ -406,6 +406,8 @@ whatever its env says.
   with members only after a summary: `kind=done to=*`, not a reply, posted after the last request and the last
   reopening — what was done, the evidence, what is still open — so the board itself records the outcome. The CLI
   mirrors all of it: `bridge-board post --to`, `read --mine --open-requests`, `open`, `join`, `leave`, `close`.
+  CLI only: `read --peek` is a watcher's view — it moves no cursor (like any CLI call it may still drop a dead
+  worker).
 - **Nothing on the board spawns an agent.** `bridge-board dispatch --max-agents N --agents a,b [--allow-write DIRS]
   [--include-peer-tasks] [--watch S]` is the only spawner (flock-serialised, refuses inside a bridged run): one
   live run per family, `mode=write` only inside `--allow-write` dirs, peer-queued tasks only on request. `ask-agent`

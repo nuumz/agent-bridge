@@ -201,6 +201,23 @@ class Waiting(Board):
 
 
 class Reading(Board):
+    def test_a_peek_reads_from_the_cursor_and_leaves_it_where_it_is(self):
+        tid = self.room("room:r", CURSOR, COPILOT)
+        r1 = boardlib.post(self.conn, tid, COPILOT, "first")
+        boardlib.read(self.conn, tid, USER, None)                                        # the user has read r1
+        r2 = boardlib.post(self.conn, tid, CURSOR, "second")
+        cursor = "SELECT seq FROM cursors WHERE agent=?"
+        for _ in range(2):                                                               # the same answer twice
+            seen, nxt = boardlib.read(self.conn, tid, USER, None, peek=True)
+            self.assertEqual(([m["seq"] for m in seen], nxt), ([r2], r2))
+        self.assertEqual(self.conn.execute(cursor, (USER,)).fetchone()[0], r1)
+        seen, _ = boardlib.read(self.conn, tid, USER, 0, peek=True)                      # an explicit --after wins
+        self.assertEqual([m["seq"] for m in seen], [r1, r2])
+        self.assertEqual(self.conn.execute(cursor, (USER,)).fetchone()[0], r1)
+        self.assertIsNone(self.conn.execute(cursor, ("user:watcher",)).fetchone())
+        boardlib.read(self.conn, tid, "user:watcher", None, peek=True)                   # no cursor row is made
+        self.assertIsNone(self.conn.execute(cursor, ("user:watcher",)).fetchone())
+
     def test_mine_and_open_requests_filter_without_moving_the_cursor(self):
         tid = self.room("room:r", CURSOR, COPILOT)
         r1 = boardlib.post(self.conn, tid, USER, REQUEST, "request", to=CURSOR)

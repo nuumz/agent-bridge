@@ -4,8 +4,9 @@
     bridge-board serve                         MCP server over stdio (each CLI spawns its own; state is one SQLite file)
     bridge-board status                        who is online, open topics, queue, running workers
     bridge-board post   <topic> "<text>" [-k kind] [--to X]   post as user:$USER (opens the topic if needed)
-    bridge-board read   <topic> [--after N] [-n 50] [--mine] [--open-requests] [--json]   print messages
-                                                          (--json: one protocol envelope per line, docs/PROTOCOL.md)
+    bridge-board read   <topic> [--after N] [-n 50] [--mine] [--open-requests] [--peek] [--json]   print messages
+                                                          (--json: one protocol envelope per line, docs/PROTOCOL.md;
+                                                           --peek: leave your unread cursor where it is)
     bridge-board tail   <topic>                           follow a topic (Ctrl-C to stop)
     bridge-board open   dm:<a>+<b> | room:<name>          a 1:1 thread (both sides members) or a room (opener leads)
     bridge-board join   <topic> <agent> [-r leader|member|observer|<role>] | leave <topic> [agent]
@@ -460,6 +461,7 @@ def main() -> int:
     p = sub.add_parser("read"); p.add_argument("topic"); p.add_argument("--after", type=int); p.add_argument("-n", type=int, default=50)
     p.add_argument("--mine", action="store_true", help="only what reaches you")
     p.add_argument("--open-requests", action="store_true", help="requests their owner has not closed")
+    p.add_argument("--peek", action="store_true", help="a view: your unread cursor stays where it is")
     p.add_argument("--json", action="store_true", help="one envelope per line (docs/protocol/envelope.schema.json)")
     p = sub.add_parser("tail"); p.add_argument("topic")
     p = sub.add_parser("open"); p.add_argument("name", help="dm:<a>+<b> or room:<name>")
@@ -532,7 +534,8 @@ def main() -> int:
                   "--reply-to N")
         elif o.cmd == "read":
             tid = B.topic_id(conn, o.topic, None)
-            msgs, nxt = B.read(conn, tid, me, o.after, o.n, o.mine, o.open_requests, B.my_roles(conn, tid, me))
+            msgs, nxt = B.read(conn, tid, me, o.after, o.n, o.mine, o.open_requests, B.my_roles(conn, tid, me),
+                               o.peek)
             if o.json:                  # JSON Lines of envelopes, nothing else: a script reads the stream as-is
                 for m in msgs:
                     print(json.dumps(protocol.envelope(o.topic, m), ensure_ascii=False))
