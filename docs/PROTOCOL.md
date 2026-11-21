@@ -268,8 +268,9 @@ The direct channel (§10.2) and the pipelines read these from a reply body; each
 | Marker | Where | Meaning |
 |---|---|---|
 | `[[ASK]] <question>` | last line of a peer's reply | the peer needs one fact or one access only the caller has; `ask-agent` exits 5 to the caller, which answers or grants it — nothing is posted to the user |
-| `[[AGREE]]` / `[[DONE]]` | a dialog or live-room reply | nothing left to dispute — not "verified". Both sides ending on it ends a dialog; a live peer is not woken by replies that only agree back |
+| `[[AGREE]]` / `[[DONE]]` | a dialog or live-room reply | nothing left to dispute — not "verified". Both sides ending on it ends a dialog; a live peer is not woken by replies that only agree back. From a live peer `[[DONE]]` also says its task is complete: its `left:` reason ends `; work done` unless work was still queued |
 | `[[STOP]]` | a `user:*` `decision` | ends a running dialog before its next turn, or every live peer the decision reaches |
+| `[[EXTEND]]` / `[[EXTEND turns=N]]` | a `user:*` `decision`, or a `user:*` reply to a peer's extend card | raises the turn cap (by `--extend`, or N ≥ 1): of the card's peer when it answers a card, else of every live peer it reaches; a peer paused at its cap carries on |
 | `BRIDGE_VERDICT=APPROVE` / `BRIDGE_VERDICT=REVISE` | last line of a `bridge-work` review | decides the fix loop; `REVISE` without a finding row is itself a must-fix |
 | `QUESTION FOR <role>: …` | a panel finding | a question another role answers in cross-examination |
 

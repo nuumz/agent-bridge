@@ -13,6 +13,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -338,6 +340,173 @@ class CardsBrief(Board):
         self.assertNotIn("shape:", out[0])
         self.assertIn("--reply-to N", out[1])
 
+
+# a streaming `claude -p --input-format stream-json` stand-in: one init + one result per stdin line; it echoes what it
+# was fed (so a test can see what reached the peer) and ends with [[DONE]] when asked to finish
+FAKE_STREAM = """#!/usr/bin/env python3
+import json, sys
+n = 0
+for line in sys.stdin:
+    n += 1
+    fed = json.loads(line)["message"]["content"]
+    text = f"answer {n} <<{fed}>>" + (" [[DONE]]" if "finish" in fed else "")
+    print(json.dumps({"type": "system", "subtype": "init", "session_id": "s1"}), flush=True)
+    print(json.dumps({"type": "result", "result": text, "total_cost_usd": 0.5 * n, "session_id": "s1",
+                      "usage": {}}), flush=True)
+"""
+
+
+class LiveCap(Board):
+    """A peer at its turn cap pauses and asks the user to extend instead of leaving; [[EXTEND]] grants more turns;
+    nobody answering within --idle ends the room marked not finished."""
+
+    def wait_for(self, cond, what: str, timeout: float = 20.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            got = cond()
+            if got:
+                return got
+            time.sleep(0.1)
+        self.fail(f"timed out waiting for {what}")
+
+    def broker(self, max_turns: int, peer: str = "p", live=None):
+        if live is None:
+            live = _load("bridge-live")
+            fake = self.home / "claude"
+            fake.write_text(FAKE_STREAM)
+            fake.chmod(0o755)
+            for p in (mock.patch.object(live, "LIVE", self.home / "live"),
+                      mock.patch.object(live.ADAPTERS["claude"], "resolve", return_value=str(fake)),
+                      mock.patch.object(live.signal, "signal")):
+                p.start()
+                self.addCleanup(p.stop)
+        (self.home / "live" / peer).mkdir(parents=True)
+        tid, _ = boardlib.open_topic(self.conn, "live:r", USER, False)
+        boardlib.member_add(self.conn, tid, live.identity(peer), "member")
+        o = argparse.Namespace(peer=peer, room="r", mode="ask", model="", add_dir=[], dir=str(self.home), role=None,
+                               max_turns=max_turns, budget=None, idle=3, turn_timeout=30, extend=10)
+        live.save_state(peer, {"status": "starting", "turns": 0, "cost": 0.0, "spent": 0.0, "room": "r"})
+        done = threading.Event()
+        threading.Thread(target=lambda: (live.broker(o, 0, 0, None, 0.0), done.set()), daemon=True).start()
+        return live, tid, done
+
+    def rows(self, tid):
+        return [dict(r) for r in self.conn.execute(
+            "SELECT seq, author, kind, addressee, reply_to, body FROM messages WHERE topic_id=? ORDER BY seq", (tid,))]
+
+    def answers(self, tid, peer: str = "p"):
+        return [r["body"] for r in self.rows(tid) if r["kind"] == "answer" and r["author"] == f"claude@live:{peer}"]
+
+    def send(self, live, msg: str, kind: str) -> tuple[int, str, float]:
+        o = argparse.Namespace(room="r", message=msg, to=None, kind=kind, wait=15, until_quiet=False, no_wait=False)
+        err, t0 = io.StringIO(), time.time()
+        with redirect_stderr(err), mock.patch("sys.stdout"):
+            rc = live.send(o)
+        return rc, err.getvalue(), time.time() - t0
+
+    def test_cap_pauses_asks_extends_then_idles_out_not_finished(self):
+        live, tid, done = self.broker(max_turns=1)
+        me = live.identity("p")
+        cards = lambda: [r for r in self.rows(tid) if r["kind"] == "request"]  # noqa: E731
+
+        boardlib.post(self.conn, tid, USER, "first")
+        self.wait_for(lambda: self.answers(tid), "turn 1")
+        boardlib.post(self.conn, tid, USER, "second")                           # over the 1-turn cap
+        card = self.wait_for(lambda: cards() and cards()[0], "the extend card")
+        self.assertEqual((card["author"], card["addressee"]), (me, live.USER_AUTHOR))   # import-time user
+        self.assertIn("[[EXTEND]]", card["body"])
+        self.assertEqual([c["seq"] for c in boardlib.user_cards(self.conn)], [card["seq"]])
+        self.assertEqual(live.load_state("p")["status"], "paused")
+        self.assertTrue(live.running(live.load_state("p")))                     # paused is still in the room
+        rc, err, _ = self.send(live, "more", "note")                            # a note waits on nobody paused
+        self.assertEqual(rc, 1)
+        self.assertIn("[[EXTEND]]", err)
+        rc, _, took = self.send(live, "[[EXTEND]]", "note")                     # not a ruling: no grant, no 124 wait
+        self.assertEqual(rc, 1)
+        self.assertLess(took, 5)
+        boardlib.post(self.conn, tid, USER, "why?", "question", reply_to=card["seq"])   # does not close the card
+        time.sleep(1.5)
+        self.assertEqual([c["seq"] for c in boardlib.user_cards(self.conn)], [card["seq"]])
+        self.assertEqual(len(cards()), 1)
+
+        # answering the card the board's way without a ruling closes it: the peer asks again, never hangs
+        boardlib.post(self.conn, tid, USER, "yes please", "answer", reply_to=card["seq"])
+        self.wait_for(lambda: len(cards()) == 2, "the card re-posted")
+        self.assertEqual([c["seq"] for c in boardlib.user_cards(self.conn)], [cards()[1]["seq"]])   # one open card
+        boardlib.post(self.conn, tid, USER, "ok", "done", reply_to=cards()[1]["seq"])    # done closes it too
+        self.wait_for(lambda: len(cards()) == 3, "the card re-posted after done")
+        self.assertEqual([c["seq"] for c in boardlib.user_cards(self.conn)], [cards()[2]["seq"]])
+
+        rc, err, _ = self.send(live, "[[EXTEND turns=1]]", "decision")          # the card's own instruction
+        self.assertEqual(rc, 0, err)                                            # awaited the grant, not "paused"
+        self.assertNotIn("paused at the turn cap", err)
+        self.wait_for(lambda: len(self.answers(tid)) == 2, "turn 2 after the extension")
+        self.assertEqual(boardlib.user_cards(self.conn), [])                    # the card closed with the grant
+        self.assertFalse(any("[[EXTEND turns=1]]" in a for a in self.answers(tid)))   # a ruling is never fed
+        self.assertIn("[[EXTEND]]", self.answers(tid)[1])                       # a note saying it is just a note
+        self.assertIn("second", self.answers(tid)[1])
+
+        boardlib.post(self.conn, tid, USER, "third")                            # cap again; nobody extends
+        self.wait_for(lambda: len(cards()) == 4, "the next card")
+        self.wait_for(done.is_set, "the broker to leave after --idle")
+        left = [r["body"] for r in self.rows(tid) if r["kind"] == "system" and " left: " in r["body"]]
+        self.assertEqual(len(left), 1)
+        self.assertIn("nobody extended", left[0])
+        self.assertIn("not finished", left[0])
+        self.assertEqual(boardlib.user_cards(self.conn), [])                    # no card left open for a gone peer
+        self.assertEqual(len(self.answers(tid)), 2)                             # "third" never ran past the cap
+
+    def test_done_marks_the_work_and_stop_ends_a_paused_peer(self):
+        live, tid, done = self.broker(max_turns=1)
+        boardlib.post(self.conn, tid, USER, "please finish")
+        self.wait_for(lambda: self.answers(tid), "turn 1")
+        self.assertIn("[[DONE]]", self.answers(tid)[0])
+        boardlib.post(self.conn, tid, USER, "one more")                         # [[DONE]], then queued work at the cap
+        self.wait_for(lambda: boardlib.user_cards(self.conn), "the extend card")
+        rc, err, _ = self.send(live, "[[STOP]]", "decision")                    # sees the peer it stopped leave
+        self.assertEqual(rc, 0, err)
+        self.wait_for(done.is_set, "the broker to stop")
+        left = [r["body"] for r in self.rows(tid) if r["kind"] == "system" and " left: " in r["body"]][0]
+        self.assertIn("stopped by", left)
+        self.assertIn("not finished", left)                                     # the queued post never ran
+        self.assertEqual(boardlib.user_cards(self.conn), [])
+
+    def test_a_cards_grant_extends_only_its_peer(self):
+        live, tid, done_p = self.broker(max_turns=1, peer="p")
+        _, _, done_q = self.broker(max_turns=1, peer="q", live=live)
+        boardlib.post(self.conn, tid, USER, "first")
+        self.wait_for(lambda: self.answers(tid, "p") and self.answers(tid, "q"), "turn 1 of both")
+        boardlib.post(self.conn, tid, USER, "second")                           # both over the cap: two cards
+        self.wait_for(lambda: len(boardlib.user_cards(self.conn)) == 2, "two cards")
+        q_card = next(c["seq"] for c in boardlib.user_cards(self.conn) if c["author"] == live.identity("q"))
+        boardlib.post(self.conn, tid, USER, "[[EXTEND turns=1]]", "answer", reply_to=q_card)
+        self.wait_for(lambda: len(self.answers(tid, "q")) == 2, "q's turn 2")
+        time.sleep(1.5)
+        self.assertEqual(len(self.answers(tid, "p")), 1)                       # p stays paused
+        grants = [r["author"] for r in self.rows(tid) if r["kind"] == "system" and r["body"].startswith("extended")]
+        self.assertEqual(grants, [live.identity("q")])
+        self.assertEqual([c["author"] for c in boardlib.user_cards(self.conn)], [live.identity("p")])
+        rc, err, _ = self.send(live, "[[STOP]]", "decision")                    # one STOP ends the room, awaited
+        self.assertEqual(rc, 0, err)
+        self.wait_for(lambda: done_p.is_set() and done_q.is_set(), "both brokers to stop")
+        self.assertEqual(boardlib.user_cards(self.conn), [])
+
+    def test_done_with_nothing_queued_is_work_done(self):
+        live, tid, done = self.broker(max_turns=5)
+        boardlib.post(self.conn, tid, USER, "please finish")
+        self.wait_for(lambda: self.answers(tid), "turn 1")
+        boardlib.post(self.conn, tid, USER, "[[STOP]]", "decision")
+        self.wait_for(done.is_set, "the broker to stop")
+        left = [r["body"] for r in self.rows(tid) if r["kind"] == "system" and " left: " in r["body"]][0]
+        self.assertIn("; work done", left)
+
+    def test_extend_marker_and_done_wording(self):
+        live = _load("bridge-live")
+        self.assertEqual(live.extension("[[EXTEND]]", 10), 10)
+        self.assertEqual(live.extension("ok [[EXTEND turns=4]]", 10), 4)
+        self.assertIsNone(live.extension("[[EXTEND turns=0]]", 10))
+        self.assertIsNone(live.extension("extend please", 10))
+        self.assertIn("[[DONE]]", live.intro("a", "r", ""))
 
 if __name__ == "__main__":
     unittest.main()
